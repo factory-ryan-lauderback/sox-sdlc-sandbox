@@ -3,6 +3,7 @@
 
   verify_evidence.py --bundle FILE [--predicate NAME] [--expect commit:<sha> ...]
   verify_evidence.py fetch  --subject jira:FRQ-12 [--predicate NAME] [--json]
+  verify_evidence.py fetch  --subject image:sha256:<hex> --predicate release-approval
   verify_evidence.py rounds --story FRQ-12 [--predicate review-verdict] [--outcome changes_requested]
   verify_evidence.py policy-check
 
