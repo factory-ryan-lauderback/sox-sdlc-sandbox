@@ -8,6 +8,7 @@ import urllib.parse
 import urllib.request
 
 API = "https://api.github.com"
+ATTESTATIONS_RE = re.compile(r"^/repos/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/attestations/sha256:[0-9a-f]{64}$")
 
 
 class APIError(RuntimeError):
@@ -23,6 +24,7 @@ class GitHub:
         self.token = token if token is not None else os.environ.get("SOX_GITHUB_TOKEN")
         self.retries = retries
         self.calls = 0
+        self._reachable = set()
 
     def _request(self, method, url, body=None, accept="application/vnd.github+json"):
         if not url.startswith("http"):
@@ -92,9 +94,13 @@ class GitHub:
         m = re.search(r'<([^>]+)>;\s*rel="next"', link)
         return m.group(1) if m else None
 
+    @staticmethod
+    def _first_url(path):
+        return path + ("&" if "?" in path else "?") + "per_page=100" if "per_page" not in path else path
+
     def paginate(self, path, key=None, limit=100000):
         out = []
-        url = path + ("&" if "?" in path else "?") + "per_page=100" if "per_page" not in path else path
+        url = self._first_url(path)
         while url:
             _, headers, raw = self._request("GET", url)
             data = json.loads(raw) if raw else []
@@ -106,4 +112,25 @@ class GitHub:
         return out
 
     def paginate_attestations(self, path):
-        return self.paginate(path, key="attestations")
+        """Attestations for one subject key. GitHub answers 404 both for a subject with no
+        attestations and for a repository the token cannot see, so a 404 counts as "none" only
+        on this endpoint and only after the repository itself has been read with this token."""
+        try:
+            return self.paginate(path, key="attestations")
+        except APIError as e:
+            m = ATTESTATIONS_RE.match(path.split("?", 1)[0].replace(API, "", 1))
+            first = self._first_url(path)
+            first = first if first.startswith("http") else API + first
+            # A 404 on a later page means the listing changed or broke mid-read: never "none".
+            if e.status != 404 or not m or e.url != first:
+                raise
+            self.require_repo(m.group(1))
+            return []
+
+    def require_repo(self, repo):
+        """Raise unless the repository is readable with this token (a 404/403/401 raises)."""
+        if repo not in self._reachable:
+            data = self.get(f"/repos/{repo}")
+            if not isinstance(data, dict) or str(data.get("full_name", "")).lower() != repo.lower():
+                raise APIError(0, f"/repos/{repo}", f"repository lookup returned {str(data)[:200]}")
+            self._reachable.add(repo)
