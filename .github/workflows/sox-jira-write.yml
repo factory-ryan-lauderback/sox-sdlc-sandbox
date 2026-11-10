@@ -14,6 +14,11 @@ on:
       artifact-pattern:
         type: string
         required: true
+      ops-digest:
+        description: "Optional sha256:<hex> of the single ops file the caller's compose job wrote; anything else is refused"
+        type: string
+        required: false
+        default: ""
 permissions: {}
 jobs:
   write:
@@ -46,6 +51,7 @@ jobs:
       - name: Apply operations
         env:
           ROLE: ${{ inputs.role }}
+          OPS_DIGEST: ${{ inputs.ops-digest }}
           SOX_JIRA_BACKEND: ${{ vars.SOX_JIRA_BACKEND || 'cloud' }}
           SOX_JIRA_EMAIL: ${{ vars.SOX_JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
@@ -58,6 +64,10 @@ jobs:
           shopt -s nullglob globstar
           files=("$RUNNER_TEMP"/ops/**/*.json)
           echo "${#files[@]} operation file(s)"
+          if [ -n "$OPS_DIGEST" ]; then
+            [ "${#files[@]}" -eq 1 ] || { echo "expected exactly one operation file"; exit 1; }
+            [ "sha256:$(sha256sum "${files[0]}" | cut -d' ' -f1)" = "$OPS_DIGEST" ] || { echo "operation file does not match the compose job's digest"; exit 1; }
+          fi
           for f in "${files[@]}"; do
             python3 .sox/agents/jira_cli.py apply --ops "$f" --role "$ROLE" --message "$(basename "$(dirname "$f")")"
           done

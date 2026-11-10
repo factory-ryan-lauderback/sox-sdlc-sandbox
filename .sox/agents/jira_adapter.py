@@ -16,6 +16,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -103,6 +104,7 @@ class JiraAdapter:
     def attach(self, key, filename, content, actor): raise NotImplementedError
     def attachment_content(self, key, attachment_id): raise NotImplementedError
     def set_fix_version(self, key, version, actor): raise NotImplementedError
+    def add_labels(self, key, labels, actor): raise NotImplementedError
     def versions(self): raise NotImplementedError
     def changelog(self, key): raise NotImplementedError
     def comments(self, key): raise NotImplementedError
@@ -268,6 +270,14 @@ class FileJira(JiraAdapter):
         if issue["fixVersions"] != [version]:
             self._log(issue, actor.account, [{"field": "Fix Version", "from": issue["fixVersions"], "to": [version]}])
             issue["fixVersions"] = [version]
+
+    def add_labels(self, key, labels, actor):
+        actor = _as_actor(actor)
+        issue = self._issue(key)
+        new = sorted(set(issue["labels"]) | set(labels))
+        if new != issue["labels"]:
+            self._log(issue, actor.account, [{"field": "labels", "from": " ".join(issue["labels"]), "to": " ".join(new)}])
+            issue["labels"] = new
 
     def versions(self):
         return [{"id": v["id"], "name": v["name"], "released": v.get("released", False), "archived": False,
@@ -592,6 +602,11 @@ class CloudJira(JiraAdapter):
             self._req("POST", "/rest/api/3/version", {"name": version, "projectId": int(self._project_id)})
         self._req("PUT", f"/rest/api/3/issue/{key}", {"update": {"fixVersions": [{"set": [{"name": version}]}]}})
 
+    def add_labels(self, key, labels, actor):
+        actor = _as_actor(actor)
+        self._check_agent_token()
+        self._req("PUT", f"/rest/api/3/issue/{key}", {"update": {"labels": [{"add": l} for l in sorted(set(labels))]}})
+
 
 def _run_url():
     s, r, i = os.environ.get("GITHUB_SERVER_URL"), os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_RUN_ID")
@@ -622,7 +637,9 @@ def apply_ops(jira, ops, role):
     """Apply a list of write operations as one agent role. `$name` references resolve to keys created
     earlier in the same list. Creates are idempotent through `idempotencyKey`. Every create gets a
     `[sox:<role>]` comment and every comment carries that prefix, so the acting role is visible in
-    Jira even though one account performs all agent writes."""
+    Jira even though one account performs all agent writes. `${name}` inside comment bodies and text
+    attachments is replaced by the key created as `name`. Labels can only be added (`labels` op), so an
+    agent can raise an Epic to risk-high but never lower it."""
     actor = _as_actor(role)
     if not actor.role:
         raise JiraError("apply_ops is for agent roles only")
@@ -632,7 +649,11 @@ def apply_ops(jira, ops, role):
     def res(v):
         return refs.get(v[1:], v) if isinstance(v, str) and v.startswith("$") else v
 
+    def subst(text):
+        return re.sub(r"\$\{([A-Za-z0-9_]+)\}", lambda m: refs.get(m.group(1), m.group(0)), text)
+
     def tagged(body):
+        body = subst(body)
         return body if body.startswith(prefix) else f"{prefix} {body}"
 
     for op in ops:
@@ -662,11 +683,15 @@ def apply_ops(jira, ops, role):
         elif kind == "comment":
             results.append({"op": "comment", "key": res(op["key"]), "id": jira.comment(res(op["key"]), tagged(op["body"]), actor)})
         elif kind == "attach":
+            content = subst(op["content"]) if isinstance(op["content"], str) else op["content"]
             results.append({"op": "attach", "key": res(op["key"]),
-                            "id": jira.attach(res(op["key"]), op["filename"], op["content"], actor)})
+                            "id": jira.attach(res(op["key"]), op["filename"], content, actor)})
         elif kind == "fixVersion":
             jira.set_fix_version(res(op["key"]), op["version"], actor)
             results.append({"op": "fixVersion", "key": res(op["key"]), "version": op["version"]})
+        elif kind == "labels":
+            jira.add_labels(res(op["key"]), list(op["add"]), actor)
+            results.append({"op": "labels", "key": res(op["key"]), "add": sorted(op["add"])})
         else:
             raise JiraError(f"unknown op {kind}")
     return results, refs

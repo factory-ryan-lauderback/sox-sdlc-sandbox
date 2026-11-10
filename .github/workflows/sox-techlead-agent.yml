@@ -1,0 +1,157 @@
+name: sox-techlead-agent
+# SDLC-03 Tech Lead Agent: one Epic per run gets a plan.md, Dev and QA stories,
+# required tests and dependencies. Re-plans on Re-plan / Planning (LOOP-R exit, human request) and
+# on a Release Approver's CHANGES_REQUESTED review of the release PR (LOOP-H). Runs only from main: a 15-minute schedule sweep (no Jira-to-GitHub push exists in the
+# sandbox) and workflow_dispatch with an optional Jira key, which is only a lookup hint.
+#
+#   jira-context (env jira-attestor: Jira read snapshot, digest output)
+#   -> select (no secrets: one work item, context directory + digest)
+#   -> think (env agent-llm: FACTORY_API_KEY only; droid exec read-only on the context as data;
+#      the proposal leaves the job only as a job output)
+#   -> compose (no secrets: fixed rules turn the proposal into Jira operations, digest output)
+#   -> jira (sox-jira-write.yml, role techlead fixed here, refuses any ops file but compose's)
+#
+# Nothing here is evidence. sox-jira-attestor.yml signs techlead-plan from its own Jira read.
+on:
+  schedule:
+    - cron: "9,24,39,54 * * * *"
+  workflow_dispatch:
+    inputs:
+      key:
+        description: "Optional Epic or story key (FRQ-n). Lookup hint only."
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: sox-techlead-agent
+  cancel-in-progress: false
+
+jobs:
+  jira-context:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sox-jira-read.yml
+    with:
+      preset: sweep
+      artifact-name: jira-snapshot-techlead
+
+  select:
+    needs: jira-context
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      mode: ${{ steps.s.outputs.mode }}
+      key: ${{ steps.s.outputs.key }}
+      context_digest: ${{ steps.s.outputs.context_digest }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: jira-snapshot-techlead
+          path: ${{ runner.temp }}/jira
+      - id: s
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          JIRA_SNAPSHOT_DIGEST: ${{ needs.jira-context.outputs.digest }}
+          HINT: ${{ inputs.key }}
+        run: python3 .sox/agents/planning_agent.py select --role techlead --snapshot "$RUNNER_TEMP/jira/snapshot.json" --out "$RUNNER_TEMP/ctx" --key "$HINT"
+      - if: steps.s.outputs.mode != 'none'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: techlead-context
+          path: ${{ runner.temp }}/ctx
+          retention-days: 30
+
+  think:
+    needs: select
+    if: needs.select.outputs.mode == 'llm'
+    runs-on: ubuntu-latest
+    environment: agent-llm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      proposal: ${{ steps.parse.outputs.proposal }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: techlead-context
+          path: ${{ runner.temp }}/ctx
+      - name: Check the context is the one select produced
+        env:
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+        run: python3 -c 'import os,sys; sys.path.insert(0,".sox/agents"); import planning_agent as p; sys.exit(p.dir_digest(os.environ["RUNNER_TEMP"]+"/ctx") != os.environ["CONTEXT_DIGEST"])'
+      - name: Install droid
+        uses: ./.github/actions/sox-droid-setup
+      - name: Tech Lead Agent (droid exec, read-only)
+        env:
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
+          MODEL: ${{ vars.SOX_TECHLEAD_MODEL }}
+        working-directory: ${{ runner.temp }}/ctx
+        run: |
+          args=(exec -o json -f "$GITHUB_WORKSPACE/.sox/agents/prompts/techlead.md")
+          if [ -n "$MODEL" ]; then args+=(-m "$MODEL"); fi
+          timeout 1200 droid "${args[@]}" > droid.json 2> droid.err || echo "droid exited $?"
+      - id: parse
+        env:
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+        run: python3 .sox/agents/planning_agent.py parse --role techlead --dir "$RUNNER_TEMP/ctx"
+
+  compose:
+    needs: [select, think]
+    if: >-
+      always() && needs.select.result == 'success' && needs.select.outputs.mode != 'none' &&
+      (needs.think.result == 'success' || (needs.think.result == 'skipped' && needs.select.outputs.mode == 'finish'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      ops_digest: ${{ steps.c.outputs.ops_digest }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: techlead-context
+          path: ${{ runner.temp }}/ctx
+      - id: c
+        env:
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+          PROPOSAL_B64: ${{ needs.think.outputs.proposal }}
+        run: python3 .sox/agents/planning_agent.py compose --role techlead --ctx "$RUNNER_TEMP/ctx" --out "$RUNNER_TEMP/ops"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jira-ops-techlead
+          path: ${{ runner.temp }}/ops/ops.json
+          retention-days: 30
+
+  jira:
+    needs: compose
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sox-jira-write.yml
+    with:
+      role: techlead
+      artifact-pattern: jira-ops-techlead
+      ops-digest: ${{ needs.compose.outputs.ops_digest }}

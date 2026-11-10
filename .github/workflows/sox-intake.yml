@@ -1,0 +1,56 @@
+name: sox-intake
+# Step 1 Requirements In. Files one requirement in Jira FRQ as role intake (work type Requirement, or
+# a Story labelled sox-requirement until that type exists). Dispatched by a person with write access
+# to the repository; the text is data only. The requirement then needs a human Product Owner's
+# Approved transition in the Jira UI (restricted to the approver's own account); sox-jira-attestor.yml
+# signs requirement-approval from the changelog. The filer (the shared automation account) can never
+# approve it: it is the reporter and creator, and it is in neverApprovers.
+on:
+  workflow_dispatch:
+    inputs:
+      summary:
+        description: "Requirement title"
+        required: true
+        type: string
+      description:
+        description: "Requirement text: the business need and acceptance criteria"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      ops_digest: ${{ steps.c.outputs.ops_digest }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: c
+        env:
+          REQ_SUMMARY: ${{ inputs.summary }}
+          REQ_DESCRIPTION: ${{ inputs.description }}
+        run: python3 .sox/agents/planning_agent.py intake --out "$RUNNER_TEMP/ops"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jira-ops-intake
+          path: ${{ runner.temp }}/ops/ops.json
+          retention-days: 30
+
+  jira:
+    needs: compose
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sox-jira-write.yml
+    with:
+      role: intake
+      artifact-pattern: jira-ops-intake
+      ops-digest: ${{ needs.compose.outputs.ops_digest }}
