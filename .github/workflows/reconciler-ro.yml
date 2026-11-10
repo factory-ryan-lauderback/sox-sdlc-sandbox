@@ -1,0 +1,56 @@
+name: reconciler-ro
+# Read-only platform snapshot as the Reconciler App, for the independent red team and the
+# reconciler baseline. Fixed GET list (.github/platform/reconciler_ro.py), no dispatch inputs.
+# The installation token is requested with read permissions only; any write the App was ever
+# granted is not in the token. The artifact is public: secret names, never values; variable
+# values only for *_APP_ID. Never a signer or a required check; no id-token or attestations.
+on:
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: reconciler-ro
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: reconciler
+    permissions:
+      contents: read
+    steps:
+      - name: Refuse non-main refs
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = "refs/heads/main" ] || { echo "reconciler-ro runs only from refs/heads/main, not $REF"; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.RECONCILER_APP_ID }}
+          private-key: ${{ secrets.RECONCILER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-actions: read
+          permission-administration: read
+          permission-attestations: read
+          permission-checks: read
+          permission-contents: read
+          permission-deployments: read
+          permission-environments: read
+          permission-pull-requests: read
+          permission-secrets: read
+          permission-statuses: read
+      - name: Snapshot
+        env:
+          SOX_APP_TOKEN: ${{ steps.app.outputs.token }}
+          SOX_APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: python3 .github/platform/reconciler_ro.py reconciler-ro.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reconciler-ro
+          path: reconciler-ro.json
+          retention-days: 30
