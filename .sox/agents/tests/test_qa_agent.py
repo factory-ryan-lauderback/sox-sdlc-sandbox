@@ -24,13 +24,14 @@ REQ = ["services.api.test_e2e_pay.PayE2E.test_pay", "services.api.test_app.T.tes
 PR = {"number": 12, "state": "open", "draft": False, "head": {"sha": HEAD, "ref": f"release/{SLUG}",
       "repo": {"full_name": qa_agent.REPO, "owner": {"login": qa_agent.REPO.split("/")[0]}}},
       "base": {"sha": BASE, "ref": "main"}}
+STORY_PR = {**PR, "number": 13, "head": {**PR["head"], "ref": "story/FRQ-2-payoff-quote"}, "base": {"sha": BASE, "ref": f"release/{SLUG}"}}
 
 
 def att(pred, t=1, digest="sha256:" + "0" * 64):
     return mock.Mock(predicate=pred, integrated_time=t, digest=digest)
 
 
-def env_att(outcome="pass", t=5, digest=ENV_D, pr=12):
+def env_att(outcome="pass", t=5, digest=ENV_D, pr=12):  # noqa: E302
     return att({"headSha": HEAD, "environment": "qa", "outcome": outcome, "prNumber": pr, "envId": "rel-r1",
                 "images": [{"service": "api", "digest": "sha256:" + "1" * 64}, {"service": "db", "digest": "sha256:" + "2" * 64}]},
                t, digest)
@@ -87,9 +88,9 @@ def patched(gh, fetch=None, runs=(), existing=None, prior=(), env=None):
         yield start, complete, out
 
 
-def do_select(**kw):
+def do_select(pr=PR, **kw):
     ctx = tempfile.mkdtemp()
-    with patched(fake_gh(runs=kw.pop("runs", ())), **kw) as (_, _, out):
+    with patched(fake_gh(runs=kw.pop("runs", ()), pr=pr), **kw) as (_, _, out):
         qa_agent.select(mock.Mock(out=ctx, pr=""))
         o = outputs(out) if os.path.exists(out) else {}
     return ctx, o
@@ -121,6 +122,25 @@ class SelectTest(unittest.TestCase):
         _, o = do_select(fetch=make_fetch(plans=[]))
         self.assertEqual(o.get("pr"), "")
 
+    def test_story_pr_uses_its_own_plan_entry_and_base(self):
+        ctx, o = do_select(pr=STORY_PR, fetch=make_fetch(envs=[env_att(pr=13)]))
+        self.assertEqual(o["pr"], "13")
+        c = json.load(open(f"{ctx}/context.json"))
+        self.assertEqual((c["scope"], c["story"], c["baseRef"], c["stories"]),
+                         ("story", "FRQ-2", f"refs/heads/release/{SLUG}", ["FRQ-2"]))
+        self.assertEqual(c["requiredTests"], REQ[:1])
+
+    def test_story_outside_manifest_or_foreign_repo_skipped(self):
+        other = {**STORY_PR, "head": {**STORY_PR["head"], "ref": "story/FRQ-9-other"}}
+        _, o = do_select(pr=other, fetch=make_fetch(envs=[env_att(pr=13)]))
+        self.assertEqual(o.get("pr"), "")
+        fork = {**PR, "head": {**PR["head"], "repo": {"full_name": "someone/fork", "owner": {"login": "someone"}}}}
+        _, o = do_select(pr=fork)
+        self.assertEqual(o.get("pr"), "")
+        wrong = {**STORY_PR, "base": {"sha": BASE, "ref": "main"}}
+        _, o = do_select(pr=wrong, fetch=make_fetch(envs=[env_att(pr=13)]))
+        self.assertEqual(o.get("pr"), "")
+
     def test_uses_latest_epic_plan(self):
         newer = att({"epicKey": "FRQ-1", "stories": [{"key": "FRQ-2", "requiredTests": ["services.api.test_x.A.test_b"]},
                                                       {"key": "FRQ-3", "requiredTests": []}]}, 8, "sha256:" + "9" * 64)
@@ -129,8 +149,8 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(json.load(open(f"{ctx}/context.json"))["requiredTests"], ["services.api.test_x.A.test_b"])
 
 
-def ctxdir():
-    ctx, o = do_select()
+def ctxdir(pr=PR, fetch=None):
+    ctx, o = do_select(pr=pr, fetch=fetch)
     return ctx, o["context_digest"]
 
 
@@ -226,13 +246,13 @@ class RunTestsTest(unittest.TestCase):
 
 
 def do_record(statuses=None, result="success", existing=None, status="in_progress", head_moved=False,
-              fetch=None, results_b64=None, prior=()):
-    ctx, digest = ctxdir()
+              fetch=None, results_b64=None, prior=(), pr=PR):
+    ctx, digest = ctxdir(pr, fetch)
     statuses = statuses if statuses is not None else {t: "passed" for t in REQ}
     f = tempfile.mktemp()
     json.dump([{"id": k, "status": v} for k, v in statuses.items()], open(f, "w"))
     b64 = qa_agent.encode_results(f) if results_b64 is None else results_b64
-    pr = {**PR, "head": {**PR["head"], "sha": "c" * 40}} if head_moved else PR
+    pr = {**pr, "head": {**pr["head"], "sha": "c" * 40}} if head_moved else pr
     gh = fake_gh({"id": 9, "app": {"id": APP}, "head_sha": HEAD, "name": qa_agent.CHECK_NAME, "status": status}, pr=pr)
     out = tempfile.mkdtemp()
     env = {"CONTEXT_DIGEST": digest, "CHECK_RUN_ID": "9", "TEST_RESULT": result, "RESULTS_B64": b64,
@@ -304,7 +324,14 @@ class RecordTest(unittest.TestCase):
             self.assertEqual((plan["attest"], plan["conclusion"]), (False, "failure"))
 
     def test_changed_env_or_moved_head_signs_nothing(self):
-        plan, pred, _, _ = do_record(fetch=make_fetch(envs=[env_att(digest="sha256:" + "4" * 64)]))
+        ctx, digest = ctxdir()
+        gh, out = fake_gh(), tempfile.mkdtemp()
+        f = tempfile.mktemp()
+        json.dump([{"id": t, "status": "passed"} for t in REQ], open(f, "w"))
+        env = {"CONTEXT_DIGEST": digest, "CHECK_RUN_ID": "9", "TEST_RESULT": "success", "RESULTS_B64": qa_agent.encode_results(f)}
+        with patched(gh, fetch=make_fetch(envs=[env_att(digest="sha256:" + "4" * 64, t=9)]), env=env):
+            qa_agent.record(mock.Mock(ctx=ctx, out=out))
+        plan = json.load(open(f"{out}/plan.json"))
         self.assertEqual((plan["attest"], plan["title"]), (False, "QA inputs changed"))
         plan, _, _, _ = do_record(head_moved=True)
         self.assertEqual((plan["attest"], plan["title"]), (False, "Superseded"))
@@ -318,6 +345,14 @@ class RecordTest(unittest.TestCase):
     def test_completed_run_left_alone(self):
         plan, _, _, _ = do_record(status="completed")
         self.assertTrue(plan["closed"])
+
+    def test_story_scope_pass(self):
+        plan, pred, subjects, _ = do_record({REQ[0]: "passed"}, pr=STORY_PR, fetch=make_fetch(envs=[env_att(pr=13)]))
+        self.assertEqual((plan["attest"], pred["outcome"], pred["scope"], pred["story"]), (True, "pass", "story", "FRQ-2"))
+        self.assertEqual((pred["baseRef"], pred["prNumber"], pred["jiraKeys"]), (f"refs/heads/release/{SLUG}", 13, ["FRQ-2"]))
+        self.assertEqual(pred["loopKey"], f"release:{SLUG}")
+        self.assertIn("sox:jira:FRQ-2", subjects)
+        self.assertNotIn("sox:jira:FRQ-3", subjects)
 
     def test_tenth_failing_round_escalates(self):
         plan, pred, _, ops = do_record({REQ[0]: "failed", REQ[1]: "passed"}, prior=[str(i) * 40 for i in range(9)])

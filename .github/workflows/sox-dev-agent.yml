@@ -1,13 +1,13 @@
 name: sox-dev-agent
-# SDLC-05 Dev Agent (and the QA Agent for `qa` stories, which the plan types). Runs only from main:
-# a 15-minute schedule sweep, workflow_dispatch with an optional story key (a lookup hint only), and
-# workflow_run after each review run so LOOP-R rework starts promptly.
+# SDLC-05 Dev Agent (and the QA Agent for `qa` stories, which the plan types, and for qa-fix branches).
+# Runs only from main: a 15-minute schedule sweep, workflow_dispatch with an optional story key (a lookup
+# hint only), and workflow_run after each review or QA run so LOOP-R / LOOP-Q rework starts promptly.
 #
 #   jira-context (env jira-attestor: Jira read snapshot, digest output)
 #   -> select (no secrets: one work item from Jira + GitHub; context directory + digest; housekeeping ops)
 #   -> code (env agent-llm: FACTORY_API_KEY only, read-only token; droid exec --auto high on a checkout of
 #      the base commit; the change leaves the job only as a patch artifact + digest)
-#   -> push-dev | push-qa (env agent-dev | agent-qa: that role's App token; never runs repository code:
+#   -> push-dev | push-qa (env agent-dev | agent-qa: that role's App token, qa for qa-fix/**; never runs repository code:
 #      re-checks the patch, git apply on the exact base, commit as the App, push, open the PR)
 #   -> jira-dev | jira-qa (sox-jira-write.yml with the role fixed here)
 #
@@ -24,7 +24,7 @@ on:
         required: false
         type: string
   workflow_run:
-    workflows: [sox-review-agent]
+    workflows: [sox-review-agent, sox-qa-agent]
     types: [completed]
 
 permissions: {}

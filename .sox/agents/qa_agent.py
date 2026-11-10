@@ -1,6 +1,6 @@
 """QA Agent (SDLC-08): select -> open -> [tests against the deployed images, no App key] -> record -> finish.
 
-  qa_agent.py select --out DIR [--pr N]        (read-only token: one release PR with a passing env-deploy)
+  qa_agent.py select --out DIR [--pr N]        (read-only token: one PR with a passing env-deploy)
   qa_agent.py open   --ctx DIR                 (env agent-qa: opens sox/qa-agent before any test runs)
   qa_agent.py runtests --ids FILE --out FILE   (test job, cwd = the release head checkout)
   qa_agent.py record --ctx DIR --out DIR       (env agent-qa: re-derives everything it signs)
@@ -12,11 +12,18 @@ with outcome pass completes it as success; a failed or cancelled test job, an at
 that moved leaves it failed, and the gate blocks that head. Recovery is a new head on the release
 branch (a qa-fix PR merged by the bundler), which then needs its own review, QA and approval.
 
-The tests run in a job with no App key and no id-token: it checks out the release head and runs the
-plan's required tests (unit tests and `test_e2e_*` against the environment re-created from the
-verified env-deploy images). The results reach `record` only as a job output. LOOP-Q: rounds are the
-distinct heads with a verified failing qa-result on pr:<n> and release:<slug>; at 10 the release is
-escalated to a human and no further QA runs.
+Two scopes, both posting `sox/qa-agent` (the bundler merges a story PR only with it):
+- release: a release/<slug> PR into main, tested against the shared QA environment with every test
+  in each Epic's latest plan (the gate's SDLC-08 rule). A failure is fixed by the QA App on a
+  qa-fix/FRQ-n-* branch into release/<slug> (dev_agent.py `qafix`).
+- story: a story/* or qa-fix/* PR into release/<slug>, tested against its story-chain environment
+  with that story's plan-required tests. A failure sends the story back to Dev rework.
+
+The tests run in a job with no App key and no id-token: it checks out the PR head and runs the
+required tests (unit tests and `test_e2e_*` against the environment re-created from the verified
+env-deploy images). The results reach `record` only as a job output. LOOP-Q: rounds are the distinct
+heads with a verified failing qa-result for the release (story and release scopes alike, loop key
+release:<slug>); at 10 the release is escalated to a human and no further QA runs.
 """
 import argparse
 import base64
@@ -35,8 +42,10 @@ import rounds  # noqa: E402
 from planning_agent import dir_digest  # noqa: E402
 
 CHECK_NAME = "sox/qa-agent"
+QA_BOT = "acme-qa-agent[bot]"
 MAX_ROUNDS = int(os.environ.get("SOX_MAX_QA_ROUNDS", "10"))
 RELEASE_BRANCH = re.compile(r"^release/([a-z0-9][a-z0-9-]{0,60})$")
+STORY_BRANCH = re.compile(r"^(?:story|qa-fix)/(FRQ-[1-9][0-9]{0,6})-[a-z0-9][a-z0-9-]{0,60}$")
 TEST_ID = re.compile(r"^services\.[a-z0-9_]+(\.[A-Za-z_][A-Za-z0-9_]*){1,4}$")
 PASSED = "passed"
 MAX_TESTS = 300
@@ -52,13 +61,26 @@ def _att_digest_ok(d):
 
 # ---------------------------------------------------------------------------------- shared derivation
 
-def release_prs(gh):
-    owner = REPO.split("/")[0]
+def scope_of(pr):
+    """{"kind": "release"|"story", "release": slug, "story": key|None} for a same-repository PR, else None."""
+    if (pr["head"].get("repo") or {}).get("full_name") != REPO:
+        return None
+    head, base = pr["head"]["ref"], pr["base"]["ref"]
+    m = RELEASE_BRANCH.match(head)
+    if m and base == "main":
+        return {"kind": "release", "release": m.group(1), "story": None}
+    s, b = STORY_BRANCH.match(head), RELEASE_BRANCH.match(base)
+    if s and b:
+        return {"kind": "story", "release": b.group(1), "story": s.group(1)}
+    return None
+
+
+def candidate_prs(gh):
     out = []
-    for pr in gh.paginate(f"/repos/{REPO}/pulls?state=open&base=main&sort=created&direction=asc", limit=100):
-        m = RELEASE_BRANCH.match(pr["head"]["ref"])
-        if m and (pr["head"].get("repo") or {}).get("full_name") == REPO and pr["head"]["repo"]["owner"]["login"] == owner:
-            out.append(pr)
+    for pr in gh.paginate(f"/repos/{REPO}/pulls?state=open&sort=created&direction=asc", limit=300):
+        sc = scope_of(pr)
+        if sc:
+            out.append((pr, sc))
     return out
 
 
@@ -74,9 +96,16 @@ def env_for_head(pr, fetch=None):
     return latest if ok else None
 
 
-def required_tests(slug, fetch=None):
-    """The plan-required tests for a release: release-manifest stories -> their Epics' latest verified
-    techlead-plan -> every story's requiredTests (the gate's refresh_plans rule)."""
+def _story_plan(key, fetch):
+    plans, _ = fetch("jira", key, "techlead-plan")
+    plans = [a for a in plans if any(s.get("key") == key for s in a.predicate.get("stories", []))]
+    return max(plans, key=lambda a: (a.integrated_time, a.digest)) if plans else None
+
+
+def required_tests(slug, story=None, fetch=None):
+    """Plan-required tests. Release scope: release-manifest stories -> their Epics' latest verified
+    techlead-plan -> every story's requiredTests (the gate's refresh_plans rule). Story scope: the
+    story's entry in its latest verified plan; the story must be in the release-manifest."""
     fetch = fetch or rounds.fetch
     mans, _ = fetch("release", slug, "release-manifest")
     mans = [a for a in mans if a.predicate.get("release") == slug]
@@ -84,12 +113,18 @@ def required_tests(slug, fetch=None):
         return None, [], {}
     man = max(mans, key=lambda a: (a.integrated_time, a.digest))
     stories = sorted({(s.get("key") if isinstance(s, dict) else s) for s in man.predicate.get("stories") or []} - {None})
+    if story is not None:
+        plan = _story_plan(story, fetch) if story in stories else None
+        if plan is None:
+            return None, [], {}
+        entry = next(s for s in plan.predicate["stories"] if s.get("key") == story)
+        return man, sorted(set(entry.get("requiredTests") or [])), {
+            "stories": [story], "plans": {plan.predicate.get("epicKey"): plan.digest}}
     epics = {}
     for key in stories:
-        plans, _ = fetch("jira", key, "techlead-plan")
-        plans = [a for a in plans if any(s.get("key") == key for s in a.predicate.get("stories", []))]
-        if plans:
-            epics.setdefault(max(plans, key=lambda a: (a.integrated_time, a.digest)).predicate.get("epicKey"), None)
+        plan = _story_plan(key, fetch)
+        if plan:
+            epics.setdefault(plan.predicate.get("epicKey"), None)
     tests, plan_digests = set(), {}
     for epic in sorted(e for e in epics if e):
         plans, _ = fetch("jira", epic, "techlead-plan")
@@ -109,11 +144,8 @@ def env_spec(env):
                         "ref": f"ghcr.io/{REPO}/{i['service']}@{i['digest']}"} for i in p.get("images", [])]}
 
 
-def failing_heads(number, slug):
-    heads = set()
-    for key in (("pr", str(number)), ("release", slug)):
-        h, _ = rounds.failing_heads(key, predicate="qa-result")
-        heads |= h
+def failing_heads(slug):
+    heads, _ = rounds.failing_heads(("release", slug), predicate="qa-result")
     return heads
 
 
@@ -123,12 +155,11 @@ def select(args):
     gh = GitHub()
     qa_slug = os.environ.get("QA_APP_SLUG", "acme-qa-agent")
     want = positive_int(args.pr, "pr") if args.pr else None
-    for pr in release_prs(gh):
-        n, head = pr["number"], pr["head"]["sha"]
+    for pr, sc in candidate_prs(gh):
+        n, head, slug = pr["number"], pr["head"]["sha"], sc["release"]
         if want and n != want:
             continue
-        slug = RELEASE_BRANCH.match(pr["head"]["ref"]).group(1)
-        if pr.get("draft"):
+        if sc["kind"] == "release" and pr.get("draft"):
             print(f"PR #{n}: draft (the bundler marks it ready once every story is merged)"); continue
         runs = gh.get(f"/repos/{REPO}/commits/{head}/check-runs?check_name={CHECK_NAME}&filter=all&per_page=100")["check_runs"]
         if any((r.get("app") or {}).get("slug") == qa_slug for r in runs) and not want:
@@ -136,18 +167,20 @@ def select(args):
         env = env_for_head(pr)
         if env is None:
             print(f"PR #{n}: no verified passing env-deploy for {head[:12]} yet"); continue
-        man, tests, chain = required_tests(slug)
+        man, tests, chain = required_tests(slug, sc["story"])
         if man is None or not tests:
-            print(f"PR #{n}: no verified release-manifest or no plan-required tests for {slug}"); continue
+            print(f"PR #{n}: no verified release-manifest, plan or plan-required tests ({sc['kind']} scope, {slug})"); continue
         os.makedirs(args.out, exist_ok=True)
         dump_json(f"{args.out}/env-spec.json", env_spec(env))
         dump_json(f"{args.out}/required-tests.json", tests)
-        dump_json(f"{args.out}/context.json", {"pr": n, "headSha": head, "baseSha": pr["base"]["sha"], "release": slug,
-                                               "envDeploy": env.digest, "manifest": man.digest, "requiredTests": tests,
-                                               **chain})
+        dump_json(f"{args.out}/context.json", {"pr": n, "headSha": head, "baseSha": pr["base"]["sha"],
+                                               "baseRef": f"refs/heads/{pr['base']['ref']}", "scope": sc["kind"],
+                                               "story": sc["story"], "release": slug, "envDeploy": env.digest,
+                                               "manifest": man.digest, "requiredTests": tests, **chain})
         set_output("pr", str(n)); set_output("head", head)
         set_output("context_digest", dir_digest(args.out))
-        print(f"qa: PR #{n} release {slug} head {head[:12]}, {len(tests)} required tests, env {env.digest[:19]}")
+        print(f"qa: PR #{n} ({sc['kind']} scope, release {slug}) head {head[:12]}, {len(tests)} required tests, "
+              f"env {env.digest[:19]}")
         return
     set_output("pr", "")
     print("qa: nothing to test")
@@ -185,8 +218,10 @@ def open_(args):
 
     if pr["state"] != "open" or pr["head"]["sha"] != head:
         return done("PR closed or head moved since select")
+    if f"refs/heads/{pr['base']['ref']}" != ctx["baseRef"]:
+        return done("PR base changed since select")
     runs = checks.app_runs(gh, head, CHECK_NAME, qa_app)
-    existing = rounds.verdict_for_head(head, "refs/heads/main", predicate="qa-result")
+    existing = rounds.verdict_for_head(head, ctx["baseRef"], predicate="qa-result")
     if existing:
         p = existing.predicate
         conclusion = "success" if p.get("outcome") == "pass" else "failure"
@@ -202,7 +237,7 @@ def open_(args):
     state = checks.head_state(runs)
     if state != "none":
         return done(f"a {CHECK_NAME} run on {head[:12]} is {state}")
-    prior = failing_heads(n, slug) - {head}
+    prior = failing_heads(slug) - {head}
     if len(prior) >= MAX_ROUNDS:
         dump_json(f"{args.out}/jira-ops.json", _escalation_ops(ctx.get("stories") or [], slug, len(prior)))
         post("failure", "loop-exhausted", f"{len(prior)} heads with a verified failing qa-result for release {slug} "
@@ -280,17 +315,20 @@ def decode_results(b64):
 
 # --------------------------------------------------------------------------------------------- record
 
-def qa_test_files(gh, slug):
-    """Test files changed by QA-authored work merged into the release: qa-fix PRs, and story PRs the QA App opened."""
+def _qa_authored(pr):
+    return pr["head"]["ref"].startswith("qa-fix/") or (pr.get("user") or {}).get("login") == QA_BOT
+
+
+def qa_test_files(gh, pr, sc):
+    """Test files changed by QA-authored work: for a release, the qa-fix PRs and QA App story PRs merged
+    into it; for a story PR, its own files when the QA App wrote it."""
+    prs = [pr] if sc["kind"] == "story" else [
+        p for p in gh.paginate(f"/repos/{REPO}/pulls?state=closed&base=release/{sc['release']}", limit=200)
+        if p.get("merged_at")]
     files = set()
-    for pr in gh.paginate(f"/repos/{REPO}/pulls?state=closed&base=release/{slug}", limit=200):
-        if not pr.get("merged_at"):
-            continue
-        if pr["head"]["ref"].startswith("qa-fix/") or (pr.get("user") or {}).get("login") == "acme-qa-agent[bot]":
-            for f in gh.pr_files(pr["number"]):
-                name = f["filename"]
-                if re.search(r"(^|/)test_[^/]*\.py$", name):
-                    files.add(name)
+    for p in prs:
+        if _qa_authored(p):
+            files |= {f["filename"] for f in gh.pr_files(p["number"]) if re.search(r"(^|/)test_[^/]*\.py$", f["filename"])}
     return sorted(files)
 
 
@@ -315,7 +353,7 @@ def record(args):
     if run["status"] == "completed":
         plan["closed"] = True
         return finish_plan("already completed", "The check run is already completed.")
-    existing = rounds.verdict_for_head(head, "refs/heads/main", predicate="qa-result")
+    existing = rounds.verdict_for_head(head, ctx["baseRef"], predicate="qa-result")
     if existing:
         plan["conclusion"] = "success" if existing.predicate.get("outcome") == "pass" else "failure"
         return finish_plan(f"QA: {existing.predicate.get('outcome')} (existing verified qa-result)",
@@ -324,8 +362,12 @@ def record(args):
     if pr["head"]["sha"] != head:
         return finish_plan("Superseded", "The release head moved during QA; the new head gets its own QA run.")
     # Re-derive what is signed; the context is only a lookup.
+    sc = scope_of(pr)
+    if sc is None or (sc["kind"], sc["story"], sc["release"]) != (ctx["scope"], ctx["story"], slug) \
+            or f"refs/heads/{pr['base']['ref']}" != ctx["baseRef"]:
+        return finish_plan("Superseded", "The PR's branches changed during QA; this head is not judged.")
     env = env_for_head(pr)
-    man, required, chain = required_tests(slug)
+    man, required, chain = required_tests(slug, sc["story"])
     if env is None or env.digest != ctx["envDeploy"] or man is None or required != ctx["requiredTests"]:
         return finish_plan("QA inputs changed", "The env-deploy, release-manifest or plan changed during QA; "
                            "this head is blocked. A new head gets a fresh QA run.")
@@ -342,21 +384,23 @@ def record(args):
     tests = [{"id": t, "status": by_id.get(t, "missing")} for t in required]
     passed = [t for t in tests if t["status"] == PASSED]
     outcome = "pass" if len(passed) == len(required) and required else "fail"
-    report = {"schema": "sox/qa-report/v1", "pr": n, "headSha": head, "release": slug, "envDeploy": env.digest,
+    report = {"schema": "sox/qa-report/v1", "pr": n, "headSha": head, "scope": sc["kind"], "story": sc["story"],
+              "release": slug, "envDeploy": env.digest,
               "envId": env.predicate.get("envId"), "images": env.predicate.get("images"), "tests": tests,
               "runner": {"workflow": ".github/workflows/sox-qa-agent.yml", "runId": run_id(), "codeSha": os.environ.get("GITHUB_SHA")}}
     raw = json.dumps(report, sort_keys=True, indent=1).encode()
     with open(f"{args.out}/qa-report.json", "wb") as f:
         f.write(raw)
     report_digest = "sha256:" + sha256_hex(raw)
-    prior = failing_heads(n, slug) - {head}
+    prior = failing_heads(slug) - {head}
     round_no = len(prior) + 1
     stories = chain["stories"]
     inputs = [{"name": "env-deploy", "digest": {"sha256": env.digest.split(":", 1)[1]}},
               {"name": "qa-report", "digest": {"sha256": report_digest.split(":", 1)[1]}}]
     predicate = {
         "schema": "sox/common/v1", "repo": REPO, "prNumber": n, "headSha": head, "baseSha": pr["base"]["sha"],
-        "baseRef": "refs/heads/main", "jiraKeys": stories, "release": slug, "step": "SDLC-08",
+        "baseRef": ctx["baseRef"], "jiraKeys": stories, "release": slug, "step": "SDLC-08",
+        "scope": sc["kind"], "story": sc["story"],
         "actor": {"type": "github_app", "login": f"{os.environ.get('QA_APP_SLUG', 'acme-qa-agent')}[bot]", "appId": qa_app,
                   "source": "installation token minted in this run"},
         "inputs": inputs, "inputsDigest": digest_of(inputs), "outcome": outcome, "round": round_no,
@@ -370,7 +414,7 @@ def record(args):
         "tests": tests, "requiredTests": required,
         # Integer, not a ratio: canonical predicates carry no floats. 1 means every required test passed.
         "requiredCoverage": 1 if outcome == "pass" else 0, "requiredPassed": len(passed),
-        "reportDigest": report_digest, "testFilesChangedByQa": qa_test_files(gh, slug), "mode": "full",
+        "reportDigest": report_digest, "testFilesChangedByQa": qa_test_files(gh, pr, sc), "mode": "full",
         "checkRunId": cid, "qaAppId": qa_app,
     }
     with open(f"{args.out}/subjects.txt", "w") as f:
@@ -379,7 +423,7 @@ def record(args):
     dump_json(f"{args.out}/predicate.json", predicate)
     plan.update(attest=True, conclusion="success" if outcome == "pass" else "failure", round=round_no)
     failed = [t for t in tests if t["status"] != PASSED]
-    ops = [{"op": "comment", "key": k, "body": f"QA Agent round {round_no} on release PR #{n} @ {head[:12]}: {outcome} "
+    ops = [{"op": "comment", "key": k, "body": f"QA Agent round {round_no} on {sc['kind']} PR #{n} @ {head[:12]}: {outcome} "
                                                 f"({len(passed)}/{len(required)} required tests passed)."} for k in stories]
     if outcome == "fail" and round_no >= MAX_ROUNDS:
         ops += _escalation_ops(stories, slug, round_no)

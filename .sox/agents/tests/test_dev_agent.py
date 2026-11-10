@@ -47,11 +47,12 @@ def entry(key, typ="dev", deps=(), services=("api",)):
 
 
 class FakeRepo:
-    def __init__(self, prs=(), branches=None, merged=(), first_push=None, runs=(), marks=(set(), 0)):
+    def __init__(self, prs=(), branches=None, merged=(), first_push=None, runs=(), marks=(set(), 0), release_prs=()):
         self.prs, self.branches, self.merged = list(prs), dict({f"release/{REL}": REL_SHA} if branches is None else branches), set(merged)
-        self.first, self.runs, self._marks = first_push, list(runs), marks
+        self.first, self.runs, self._marks, self.rprs = first_push, list(runs), marks, list(release_prs)
 
     def open_story_prs(self): return self.prs
+    def open_release_prs(self): return self.rprs
     def branch_sha(self, b): return self.branches.get(b)
     def merged_story_keys(self, base): return self.merged
     def first_push_at(self, b): return self.first
@@ -66,10 +67,26 @@ def pr(key="FRQ-15", login="acme-dev-agent[bot]", head=HEAD):
             "base": {"ref": f"release/{REL}"}, "user": {"login": login}}
 
 
-def scan(iss, repo, plans, verdict=None, rounds_done=0, now=T0 + 100):
+def release_pr(head=REL_SHA):
+    return {"number": 50, "head": {"sha": head, "ref": f"release/{REL}", "repo": {"full_name": da.REPO}},
+            "base": {"ref": "main"}, "user": {"login": "acme-release-bundler[bot]"}}
+
+
+def qa_fail(tests=(("services.api.test_app.PayoffTest.test_payoff_amount", "failed"),), keys=("FRQ-15",)):
+    return att("qa-result", {"outcome": "fail", "jiraKeys": list(keys),
+                             "tests": [{"id": i, "status": st} for i, st in tests]}, T0, 9)
+
+
+def scan(iss, repo, plans, verdict=None, rounds_done=0, now=T0 + 100, qa=None, qa_rounds=0):
     fetch = lambda kind, ident, pred: ([p for p in plans if any(s["key"] == ident for s in p.predicate["stories"])], [])
-    with mock.patch.object(da.rounds, "verdict_for_head", return_value=verdict), \
-         mock.patch.object(da.rounds, "failing_heads", return_value=({str(i) for i in range(rounds_done)}, 0)):
+
+    def vfh(head, base, predicate="review-verdict"):
+        return qa if predicate == "qa-result" else verdict
+
+    def fh(key, predicate="review-verdict"):
+        return {str(i) for i in range(qa_rounds if predicate == "qa-result" else rounds_done)}, 0
+    with mock.patch.object(da.rounds, "verdict_for_head", side_effect=vfh), \
+         mock.patch.object(da.rounds, "failing_heads", side_effect=fh):
         return da.scan(iss, repo, fetch=fetch, now=now)
 
 
@@ -155,6 +172,57 @@ class SelectLoopTest(unittest.TestCase):
                                now=da._time("2027-01-15T09:00:00Z"))[0])
         self.assertEqual(scan(self.iss, FakeRepo([pr()], first_push=T0 - 10, runs=hung), self.plans,
                               now=da._time("2027-01-15T11:00:00Z"))[0]["mode"], "rekick")
+
+
+class SelectQaLoopTest(unittest.TestCase):
+    def setUp(self):
+        self.plans = [plan([entry("FRQ-15")], t=T0 - 50)]
+        self.ok = att("review-verdict", {"outcome": "pass", "findings": []}, T0, 3)
+
+    def test_failing_story_qa_result_gets_rework(self):
+        iss = issues(story("FRQ-15", status="In Review"))
+        item, _, log = scan(iss, FakeRepo([pr()], first_push=T0 - 10), self.plans, verdict=self.ok, qa=qa_fail(), qa_rounds=4)
+        self.assertEqual((item["mode"], item["trigger"], item["round"], item["role"]), ("rework", "qa", 5, "dev"))
+        ctx, md = da._context(item, iss)
+        self.assertEqual(ctx["failingTests"], [{"id": "services.api.test_app.PayoffTest.test_payoff_amount", "status": "failed"}])
+        self.assertIn("QA failures to fix", md)
+        item, _, log = scan(iss, FakeRepo([pr()], first_push=T0 - 10), self.plans, verdict=self.ok, qa=qa_fail(), qa_rounds=10)
+        self.assertIsNone(item)
+        self.assertIn("loop exhausted", "\n".join(log))
+
+    def test_failing_release_head_gets_one_qafix_by_the_qa_app(self):
+        iss = issues(story("FRQ-15", status="Done"), story("FRQ-16", status="Done", summary="Payoff column"))
+        e16 = {**entry("FRQ-16", "qa", services=["ui"]), "requiredTests": ["services.ui.test_e2e_payoff.E.test_column"]}
+        plans = [plan([e16, entry("FRQ-15")], t=T0 - 50)]
+        q = qa_fail(keys=("FRQ-16", "FRQ-15"))
+        item, _, _ = scan(iss, FakeRepo(release_prs=[release_pr()]), plans, qa=q, qa_rounds=1)
+        self.assertEqual((item["mode"], item["role"], item["key"], item["baseSha"], item["releasePr"], item["round"]),
+                         ("qafix", "qa", "FRQ-15", REL_SHA, 50, 2))
+        self.assertEqual(item["branch"], f"qa-fix/FRQ-15-qa-{REL_SHA[:10]}")
+        ctx, md = da._context(item, iss)
+        self.assertEqual((ctx["trigger"], ctx["services"], ctx["pr"]), ("qa", ["api"], None))
+        self.assertIn("release PR #50", md)
+        # Once per head; never while a qa-fix PR is open; never for an escalated story or exhausted loop.
+        attempted = FakeRepo(release_prs=[release_pr()], branches={f"release/{REL}": REL_SHA, item["branch"]: "9" * 40})
+        self.assertIsNone(scan(iss, attempted, plans, qa=q)[0])
+        self.assertIsNone(scan(iss, FakeRepo(release_prs=[release_pr()], marks=({REL_SHA}, 0)), plans, qa=q)[0])
+        open_fix = {**pr("FRQ-15"), "head": {**pr("FRQ-15")["head"], "ref": "qa-fix/FRQ-15-qa-1111111111"}}
+        self.assertIsNone(scan(iss, FakeRepo([open_fix], release_prs=[release_pr()], first_push=T0), plans, qa=q)[0])
+        esc = issues(story("FRQ-15", status="Blocked - Human Escalation"))
+        self.assertIsNone(scan(esc, FakeRepo(release_prs=[release_pr()]), plans, qa=q)[0])
+        self.assertIsNone(scan(iss, FakeRepo(release_prs=[release_pr()]), plans, qa=q, qa_rounds=10)[0])
+        passing = att("qa-result", {"outcome": "pass", "jiraKeys": ["FRQ-15"], "tests": []}, T0, 9)
+        self.assertIsNone(scan(iss, FakeRepo(release_prs=[release_pr()]), plans, qa=passing)[0])
+
+    def test_qa_fix_pr_rework_is_pushed_by_the_qa_app(self):
+        iss = issues(story("FRQ-15", status="In Review"))
+        fix = {**pr("FRQ-15", login="acme-qa-agent[bot]"), "head": {**pr()["head"], "ref": "qa-fix/FRQ-15-qa-1111111111"}}
+        cr = att("review-verdict", {"outcome": "changes_requested", "findings": []}, T0, 7)
+        item, _, _ = scan(iss, FakeRepo([fix], first_push=T0 - 10), self.plans, verdict=cr)
+        self.assertEqual((item["mode"], item["role"], item["branch"]), ("rework", "qa", "qa-fix/FRQ-15-qa-1111111111"))
+        # A re-plan after the qa-fix branch: no rebuild onto a qa-fix branch.
+        item, _, log = scan(iss, FakeRepo([fix], first_push=T0 - 100), self.plans, verdict=cr)
+        self.assertIsNone(item)
 
 
 class PathTest(unittest.TestCase):
@@ -301,6 +369,67 @@ class ReworkPushTest(PackagePushTest):
         new = git(self.remote, "rev-parse", "refs/heads/story/FRQ-15-add-payoff")
         self.assertEqual(git(self.remote, "rev-parse", f"{new}^{{tree}}"), git(self.remote, "rev-parse", f"{sha}^{{tree}}"))
         self.assertIn(f"rekick head={sha}", app.request.call_args_list[0].args[2]["body"])
+
+
+class QaFixPushTest(PackagePushTest):
+    def push_as(self, role, patchdir, rpr, qa):
+        out = os.path.join(self.tmp, "out")
+        gh, app = mock.Mock(), mock.Mock()
+        gh.get.return_value = {"id": 778}
+        gh.pr.return_value = rpr
+        app.request.return_value = {"number": 41, "html_url": "https://github.com/x/y/pull/41"}
+        remote, repo = self.remote, FakeRepo(branches={f"release/{REL}": self.base})
+
+        def pusher(token, base, branch, patch, msg, author, allow_empty):
+            return da.commit_and_push(token, base, branch, patch, msg, author, allow_empty, remote=remote)
+        env = {"ROLE": role, "APP_TOKEN": "t", "CONTEXT_DIGEST": da.dir_digest(self.ctx), "CODE_RESULT": "success",
+               "PATCH_DIGEST": da.dir_digest(patchdir)}
+        with mock.patch.dict(os.environ, env), mock.patch.object(da, "GitHub", side_effect=[gh, app]), \
+             mock.patch.object(da, "Repo", return_value=repo), \
+             mock.patch.object(da.rounds, "verdict_for_head", return_value=qa), \
+             mock.patch.object(da.rounds, "failing_heads", return_value=({"x"}, 0)):
+            da.push(types.SimpleNamespace(ctx=self.ctx, patch=patchdir, out=out), pusher=pusher)
+        return app, da.load_json(f"{out}/jira-ops.json")
+
+    def test_qafix_branch_from_release_head_and_pr_into_release(self):
+        branch = f"qa-fix/FRQ-15-qa-{self.base[:10]}"
+        self.context.update(role="qa", mode="qafix", branch=branch, head=self.base, releasePr=50, trigger="qa",
+                            qaResult="sha256:q", round=2)
+        da.dump_json(f"{self.ctx}/context.json", self.context)
+        with open(f"{self.work}/services/api/app.py", "a") as f:
+            f.write("# fix payoff rounding\n")
+        out, meta = self.package()
+        rpr = {"state": "open", "head": {"sha": self.base, "ref": f"release/{REL}"}}
+        app, ops = self.push_as("qa", out, rpr, qa_fail())
+        sha = git(self.remote, "rev-parse", f"refs/heads/{branch}")
+        self.assertEqual(git(self.remote, "rev-parse", f"{sha}^"), self.base)
+        self.assertEqual(git(self.remote, "log", "-1", "--format=%an", sha), "acme-qa-agent[bot]")
+        self.assertIn("Sox-QA-Result: sha256:q", git(self.remote, "log", "-1", "--format=%B", sha))
+        calls = app.request.call_args_list
+        self.assertEqual(len(calls), 1)  # the PR only; the release PR is never closed
+        self.assertEqual((calls[0].args[2]["head"], calls[0].args[2]["base"]), (branch, f"release/{REL}"))
+        self.assertIn("QA fix for release PR #50", calls[0].args[2]["body"])
+        # Release head moved since select: nothing pushed.
+        self.context.update(branch=f"qa-fix/FRQ-15-qa-{'3' * 10}")
+        da.dump_json(f"{self.ctx}/context.json", self.context)
+        _, ops = self.push_as("qa", out, {**rpr, "head": {**rpr["head"], "sha": "3" * 40}}, qa_fail())
+        self.assertEqual(ops, [])
+
+    def test_qafix_refused_for_dev_role_and_story_modes_on_qa_fix_branches(self):
+        out = os.path.join(self.tmp, "nopatch"); os.makedirs(out)
+        rpr = {"state": "open", "head": {"sha": self.base, "ref": f"release/{REL}"}}
+        self.context.update(role="dev", mode="qafix", branch=f"qa-fix/FRQ-15-qa-{self.base[:10]}", head=self.base, releasePr=50)
+        da.dump_json(f"{self.ctx}/context.json", self.context)
+        with self.assertRaises(SystemExit):
+            self.push_as("dev", out, rpr, qa_fail())
+        self.context.update(role="qa", mode="build")
+        da.dump_json(f"{self.ctx}/context.json", self.context)
+        with self.assertRaises(SystemExit):
+            self.push_as("qa", out, rpr, qa_fail())
+        self.context.update(role="qa", mode="qafix", branch="story/FRQ-15-add-payoff")
+        da.dump_json(f"{self.ctx}/context.json", self.context)
+        with self.assertRaises(SystemExit):
+            self.push_as("qa", out, rpr, qa_fail())
 
 
 class GuardTest(unittest.TestCase):
