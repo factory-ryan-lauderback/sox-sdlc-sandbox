@@ -270,7 +270,8 @@ def release_approvals(ev, ctx, mr_digest, mr_predicate):
     ha = ctx.ev.latest("commit", pd.head, "human-approval",
                        where=lambda a: a.predicate.get("prNumber") == pd.number
                        and a.predicate.get("commitId") == pd.head
-                       and a.predicate.get("baseRef") == "refs/heads/main")
+                       and a.predicate.get("baseRef") == "refs/heads/main"
+                       and a.predicate.get("packetDigest") == ev.facts.get("packetDigest"))
     if ha is None:
         why.append("no verified human-approval for the merged head")
     env = ctx.ev.latest("commit", pd.head, "env-deploy",

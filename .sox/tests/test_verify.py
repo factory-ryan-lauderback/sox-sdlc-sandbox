@@ -111,6 +111,33 @@ class TestPolicyLoading(unittest.TestCase):
         with self.assertRaises(PolicyError):
             Policy(raw)
 
+    def test_rejects_push_trigger(self):
+        raw = self._mutated(lambda d: d["predicates"]["qa-result"]["signers"][0]
+                            ["allowedTriggers"].append("push"))
+        with self.assertRaises(PolicyError):
+            Policy(raw)
+
+    def test_gate_predicates_are_dispatch_only(self):
+        for extra in ("schedule", "check_run"):
+            raw = self._mutated(lambda d: d["predicates"]["gate-decision"]["signers"][0]
+                                ["allowedTriggers"].append(extra))
+            with self.assertRaises(PolicyError, msg=extra) as cm:
+                Policy(raw)
+            self.assertIn("workflow_dispatch", str(cm.exception))
+
+    def test_rejects_never_approver_in_any_role_list(self):
+        for role in ("releaseApprovers", "controlOwners", "ecab", "techLeads", "developers"):
+            raw = self._mutated(lambda d: d["humans"][role].append("factory-ryan-lauderback"))
+            with self.assertRaises(PolicyError, msg=role) as cm:
+                Policy(raw)
+            self.assertIn("neverApprovers", str(cm.exception))
+        raw = self._mutated(lambda d: d.setdefault("regulated", {}).setdefault(
+            "domainApprovers", {}).__setitem__("all", ["factory-ryan-lauderback"]))
+        with self.assertRaises(PolicyError):
+            Policy(raw)
+        # platformAdmins legitimately names the owner
+        Policy(self._mutated(lambda d: None))
+
     def test_rejects_repo_mismatch(self):
         raw = self._mutated(lambda d: d["predicates"]["qa-result"].__setitem__("repositoryId", 1))
         with self.assertRaises(PolicyError):
