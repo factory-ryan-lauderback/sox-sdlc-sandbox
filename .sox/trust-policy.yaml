@@ -121,9 +121,7 @@
         {
           "workflow": ".github/workflows/sox-gate.yml",
           "allowedTriggers": [
-            "workflow_dispatch",
-            "schedule",
-            "check_run"
+            "workflow_dispatch"
           ],
           "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
         }
@@ -228,9 +226,7 @@
         {
           "workflow": ".github/workflows/sox-gate.yml",
           "allowedTriggers": [
-            "workflow_dispatch",
-            "schedule",
-            "check_run"
+            "workflow_dispatch"
           ],
           "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
         }
@@ -245,9 +241,7 @@
         {
           "workflow": ".github/workflows/sox-gate.yml",
           "allowedTriggers": [
-            "workflow_dispatch",
-            "schedule",
-            "check_run"
+            "workflow_dispatch"
           ],
           "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
         }
@@ -262,9 +256,7 @@
         {
           "workflow": ".github/workflows/sox-gate.yml",
           "allowedTriggers": [
-            "workflow_dispatch",
-            "schedule",
-            "check_run"
+            "workflow_dispatch"
           ],
           "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
         }
@@ -279,9 +271,7 @@
         {
           "workflow": ".github/workflows/sox-gate.yml",
           "allowedTriggers": [
-            "workflow_dispatch",
-            "schedule",
-            "check_run"
+            "workflow_dispatch"
           ],
           "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
         }
@@ -296,9 +286,7 @@
         {
           "workflow": ".github/workflows/sox-gate.yml",
           "allowedTriggers": [
-            "workflow_dispatch",
-            "schedule",
-            "check_run"
+            "workflow_dispatch"
           ],
           "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
         }
@@ -313,9 +301,7 @@
         {
           "workflow": ".github/workflows/sox-gate.yml",
           "allowedTriggers": [
-            "workflow_dispatch",
-            "schedule",
-            "check_run"
+            "workflow_dispatch"
           ],
           "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
         }
@@ -390,9 +376,7 @@
         {
           "workflow": ".github/workflows/sox-gate.yml",
           "allowedTriggers": [
-            "workflow_dispatch",
-            "schedule",
-            "check_run"
+            "workflow_dispatch"
           ],
           "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
         }
@@ -568,6 +552,6 @@
     "reportsPrefix": "reports/",
     "bundlesPrefix": "bundles/"
   },
-  "$commentTriggers": "pull_request_target is never allowed: its job ref is the PR base branch, so a signer holding a main-only environment key cannot run on it, and a pull_request_target cert would name a non-main ref for story PRs. Secret-less relays (sox-gate-relay.yml, sox-review-relay.yml) turn PR events into workflow_dispatch on main.",
+  "$commentTriggers": "pull_request_target is never allowed: its job ref is the PR base branch, so a signer holding a main-only environment key cannot run on it, and a pull_request_target cert would name a non-main ref for story PRs. Secret-less relays (sox-gate-relay.yml, sox-review-relay.yml) turn PR events into workflow_dispatch on main. sox-gate.yml runs only on workflow_dispatch (one PR per run); its relay turns PR events, reviews, agent check runs and a 15-minute schedule sweep into dispatches.",
   "$commentImages": "Image digests are real artifact subjects (name <registry>/<repo>@sha256:<hex>, digest sha256 <hex>), looked up with kind image:sha256:<hex>. Every attestation that names an image must also carry at least one sox:<kind>:<id> subject, which the signature check uses; the image digest must then appear among the signed statement's subjects."
 }

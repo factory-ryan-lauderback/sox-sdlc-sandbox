@@ -1,20 +1,67 @@
 {
   "$comment": "Fields consumed by the red team harness. Gates/evidence owner maintains gate_checks, gate, verifier, reconciliation. Other owners add their own keys.",
-  "gate_checks": ["sox/evidence-gate"],
+  "gate_checks": [
+    "sox/evidence-gate"
+  ],
   "gate": {
     "check_name": "sox/evidence-gate",
     "source_app": "acme-sox-gate",
     "workflow": ".github/workflows/sox-gate.yml",
     "relay": ".github/workflows/sox-gate-relay.yml",
-    "triggers": ["workflow_dispatch (pr number only, via relay)", "schedule (every 15 min)", "check_run completed (re-read via API, review/qa Apps only)"],
-    "conclusions": ["success", "failure"],
-    "evaluates": "all open PRs whose head is the SHA; success only if every one passes",
-    "code": [".sox/gate.py", ".sox/soxlib/gate.py"]
+    "triggers": [
+      "workflow_dispatch only (pr number as lookup key), from sox-gate-relay.yml or by hand"
+    ],
+    "conclusions": [
+      "success",
+      "failure"
+    ],
+    "evaluates": "one PR per run; the check run is posted on that PR's head SHA; a head shared by another open PR fails (CC-02.unique-head)",
+    "code": [
+      ".sox/gate.py",
+      ".sox/soxlib/gate.py",
+      ".sox/soxlib/records.py"
+    ],
+    "relay_triggers": [
+      "pull_request_target (opened, synchronize, reopened, edited, ready_for_review, closed)",
+      "pull_request_review (submitted, edited, dismissed)",
+      "check_run completed (acme-review-agent, acme-qa-agent only)",
+      "schedule every 15 min: all open PRs plus PRs merged into main in the last 2 days"
+    ],
+    "check_lifecycle": "created in_progress by the Gate App before the PR is read, completed success/failure only after every record is signed; any error completes it as failure",
+    "records": {
+      "open PR": [
+        "gate-decision",
+        "dev-change (story/hotfix, once per head)",
+        "human-approval",
+        "human-changes-requested",
+        "loop-escalation"
+      ],
+      "merged PR into main": [
+        "merge-record",
+        "release-approval (job release-approval: store copy with sox subjects + registry copy via .github/actions/sox-attest-image)"
+      ]
+    },
+    "rules": {
+      "any_fail_wins": "any verified failing review-verdict or qa-result for a head blocks that head (BP-41)",
+      "rounds": "LOOP-R/LOOP-Q count distinct heads (F11)",
+      "loop_h": "per release: CHANGES_REQUESTED (incl. dismissed) on any PR from the same head branch into main, plus attested human-changes-requested for release:<slug>; cleared only by a new techlead-plan per epic with an unused digest attested after the request, and a new head (BP-39)"
+    }
   },
   "verifier": {
-    "sources": [".sox/verify_evidence.py", ".sox/soxlib/verify.py", ".sox/soxlib/policy.py", ".sox/soxlib/der.py", ".sox/soxlib/subject.py"],
+    "sources": [
+      ".sox/verify_evidence.py",
+      ".sox/soxlib/verify.py",
+      ".sox/soxlib/policy.py",
+      ".sox/soxlib/der.py",
+      ".sox/soxlib/subject.py"
+    ],
     "policy": ".sox/trust-policy.yaml",
-    "command": ["python3", ".sox/verify_evidence.py", "--bundle", "{bundle}"],
+    "command": [
+      "python3",
+      ".sox/verify_evidence.py",
+      "--bundle",
+      "{bundle}"
+    ],
     "testdata": {
       "good": ".sox/testdata/good-review-verdict.bundle.json",
       "branch_minted": ".sox/testdata/branch-minted-review-verdict.bundle.json"

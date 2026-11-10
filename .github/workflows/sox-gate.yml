@@ -1,0 +1,139 @@
+name: sox-gate
+# sox/evidence-gate (evidence spec section 6). Runs only from main, one PR per run, dispatched by
+# the secret-less sox-gate-relay.yml (PR events, reviews, agent check runs, 15-minute sweep) or
+# by hand. The PR number is a lookup key only (F6): head SHA, base, reviews, checks and evidence
+# are re-read from the API. No job checks out or executes PR code; the checkout is main.
+# The check run is created and completed through the API by the Gate App, so a job that is
+# skipped, cancelled or fails leaves the check in_progress or failed, never passing.
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number (lookup key only)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: sox-gate-${{ inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    environment: sox-gate
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      images: ${{ steps.finish.outputs.images }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.GATE_APP_ID }}
+          private-key: ${{ secrets.GATE_APP_PRIVATE_KEY }}
+      - id: run
+        env:
+          SOX_GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          PR: ${{ inputs.pr }}
+        run: python3 .sox/gate.py run --pr "$PR" --out "$RUNNER_TEMP/gate"
+      - id: gate-decision
+        if: steps.run.outputs.emit-gate-decision == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/gate/gate-decision.subjects
+          predicate-type: https://acme-lending.example/sox/gate-decision/v1
+          predicate-path: ${{ runner.temp }}/gate/gate-decision.json
+      - if: steps.run.outputs.emit-dev-change == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/gate/dev-change.subjects
+          predicate-type: https://acme-lending.example/sox/dev-change/v1
+          predicate-path: ${{ runner.temp }}/gate/dev-change.json
+      - if: steps.run.outputs.emit-human-approval == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/gate/human-approval.subjects
+          predicate-type: https://acme-lending.example/sox/human-approval/v1
+          predicate-path: ${{ runner.temp }}/gate/human-approval.json
+      - if: steps.run.outputs.emit-human-changes-requested == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/gate/human-changes-requested.subjects
+          predicate-type: https://acme-lending.example/sox/human-changes-requested/v1
+          predicate-path: ${{ runner.temp }}/gate/human-changes-requested.json
+      - if: steps.run.outputs.emit-loop-escalation == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/gate/loop-escalation.subjects
+          predicate-type: https://acme-lending.example/sox/loop-escalation/v1
+          predicate-path: ${{ runner.temp }}/gate/loop-escalation.json
+      - id: merge-record
+        if: steps.run.outputs.emit-merge-record == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/gate/merge-record.subjects
+          predicate-type: https://acme-lending.example/sox/merge-record/v1
+          predicate-path: ${{ runner.temp }}/gate/merge-record.json
+      # Completes the check only after every record above is signed. If a signing step fails,
+      # this step does not run and the check stays in_progress (blocking) until the next run.
+      - id: finish
+        env:
+          SOX_GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          GATE_DECISION_URL: ${{ steps.gate-decision.outputs.attestation-url }}
+          MERGE_RECORD_BUNDLE: ${{ steps.merge-record.outputs.bundle-path }}
+        run: python3 .sox/gate.py finish --out "$RUNNER_TEMP/gate"
+
+  # One release-approval per image of a merged release or hotfix PR (SDLC-10/11). Two copies with
+  # the same predicate: a registry copy (image subject only, OCI referrer, read by admission) and a
+  # store copy that also carries sox:commit/pr/release subjects (read by the verifier and train).
+  # Skipping this job never affects sox/evidence-gate.
+  release-approval:
+    needs: gate
+    if: needs.gate.outputs.images != '[]' && needs.gate.outputs.images != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.gate.outputs.images) }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - env:
+          RA_PREDICATE: ${{ toJSON(matrix.predicate) }}
+          RA_SUBJECTS: ${{ matrix.subjects }}
+        run: python3 .sox/gate.py stamp --out "$RUNNER_TEMP/ra"
+      - name: Store copy (sox subjects + image)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/ra/release-approval.subjects
+          predicate-type: https://acme-lending.example/sox/release-approval/v1
+          predicate-path: ${{ runner.temp }}/ra/release-approval.json
+      - name: Registry copy (OCI referrer)
+        uses: ./.github/actions/sox-attest-image
+        with:
+          image: ${{ matrix.image }}
+          digest: ${{ matrix.digest }}
+          predicate-type: https://acme-lending.example/sox/release-approval/v1
+          predicate-path: ${{ runner.temp }}/ra/release-approval.json
+          github-token: ${{ github.token }}
