@@ -50,6 +50,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/sox-jira-write.yml
+    secrets:
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
     with:
       role: intake
       artifact-pattern: jira-ops-intake
