@@ -59,7 +59,7 @@ def snapshot_issue(j, key, versions):
         "parent": n.get("parent"), "reporter": reporter, "creator": creator,
         "created": n.get("created"), "updated": n.get("updated"),
         "properties": {"sox.agent": {k: n.get(k) for k in jira_adapter.AGENT_FIELDS if n.get(k) is not None},
-                       "sox.actor": n.get("actor")},
+                       jira_adapter.ROLE_PROPERTY: {"role": n.get("actingRole")} if n.get("actingRole") else None},
         "attachments": n["attachments"],
         "comments": j.comments(key),
         "changelog": j.changelog(key),

@@ -109,7 +109,7 @@
     "automation_identity": {
       "accountId": "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
     },
-    "acting_role": "sox.actor issue property and [sox:<role>] comment prefix (workflow-asserted; one shared agent account)",
+    "acting_role": "sox.actingRole issue property and [sox:<role>] comment prefix (workflow-asserted; one shared agent account)",
     "read_snapshot": ".github/workflows/sox-jira-read.yml (artifact snapshot.json, schema sox-jira-snapshot/v1, output digest)",
     "write_path": ".github/workflows/sox-jira-write.yml",
     "test_issue": null

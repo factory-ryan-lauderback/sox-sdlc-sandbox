@@ -54,7 +54,7 @@ class FileJiraTest(unittest.TestCase):
         self.assertTrue(all(r["existing"] for r in res2))
         epic = j.get(refs["e"])
         self.assertEqual(j.attachment_content(epic["key"], epic["attachments"][0]["id"]), b"# plan")
-        self.assertEqual((epic["creator"], epic["actor"]), ("svc-techlead-agent", {"role": "techlead"}))
+        self.assertEqual((epic["creator"], epic["actingRole"]), ("svc-techlead-agent", "techlead"))
         bodies = [c["body"] for c in j.comments(refs["e"])]
         self.assertTrue(all(b.startswith("[sox:techlead] ") for b in bodies), bodies)
         self.assertEqual(len(bodies), 2)  # one create mark (not repeated on the idempotent re-run) + one comment

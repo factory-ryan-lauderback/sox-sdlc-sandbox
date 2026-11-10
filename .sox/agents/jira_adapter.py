@@ -2,7 +2,7 @@
 
 - CloudJira (default): Jira Cloud REST v3 with the single sandbox API token, which belongs to the
   automation account. Jira records that account as the author of every agent write, so the acting
-  agent role is recorded twice by the workflow: the `sox.actor` issue property set on create, and
+  agent role is recorded twice by the workflow: the `sox.actingRole` issue property set on create, and
   a `[sox:<role>]` prefix on every agent comment. Both are workflow-asserted (production: one
   Atlassian service account per agent role). Human approvals are never made through this adapter:
   `Approved`, `Approach Approved` and `ECAB Approved` are human-only transitions in the Jira UI.
@@ -36,7 +36,9 @@ HUMAN_ONLY = {"Approved", "Approach Approved", "ECAB Approved"}
 TYPES = ("Requirement", "Epic", "Story", "Task", "Bug")
 # Until the "Requirement" work type exists, a requirement is a Story carrying this label.
 REQUIREMENT_LABEL = "sox-requirement"
-AGENT_FIELDS = ("storyType", "dependsOn", "requiredTests", "services", "idempotencyKey", "release")
+# requirementKey: an Epic's source requirement (Jira cannot parent an Epic under a Story-level issue).
+AGENT_FIELDS = ("storyType", "dependsOn", "requiredTests", "services", "idempotencyKey", "release", "requirementKey")
+ROLE_PROPERTY = "sox.actingRole"
 # intake: step 1, Requirements In, when a requirement is filed through the pipeline instead of the UI.
 ROLES = ("intake", "pm", "techlead", "review", "dev", "qa", "attestor", "bundler")
 # FileJira authors (asserted). Cloud authorship is always the token's account.
@@ -90,7 +92,7 @@ def _as_actor(a):
 class JiraAdapter:
     """Normalized issue: key, type, summary, description, status, statusId, reporter, creator (account
     ids), created, updated, parent, labels, fixVersions (names), attachments[{id, filename, size,
-    created}], actor (sox.actor property), plus AGENT_FIELDS."""
+    created}], actingRole (sox.actingRole property), plus AGENT_FIELDS."""
 
     def get(self, key): raise NotImplementedError
     def search(self, type=None, status=None, parent=None, fix_version=None, label=None, statuses=None): raise NotImplementedError
@@ -164,7 +166,7 @@ class FileJira(JiraAdapter):
         out["statusId"] = STATUS_IDS.get(issue.get("status"))
         out["attachments"] = [{k: a.get(k) for k in ("id", "filename", "sha256", "size", "created")}
                               for a in issue.get("attachments", [])]
-        out.setdefault("actor", None)
+        out.setdefault("actingRole", None)
         for k in AGENT_FIELDS:
             out.setdefault(k, None)
         return out
@@ -199,7 +201,7 @@ class FileJira(JiraAdapter):
                  "reporter": actor.account, "creator": actor.account,
                  "created": now, "updated": now, "parent": parent, "labels": sorted(labels or []),
                  "fixVersions": [], "attachments": [], "comments": [], "changelog": [],
-                 "actor": {"role": actor.role} if actor.role else None}
+                 "actingRole": actor.role}
         for k, v in (fields or {}).items():
             if k not in AGENT_FIELDS:
                 raise JiraError(f"unknown field {k}")
@@ -412,13 +414,13 @@ class CloudJira(JiraAdapter):
                "fixVersions": [v["name"] for v in f.get("fixVersions") or []],
                "attachments": [{"id": a["id"], "filename": a["filename"], "sha256": None, "size": a.get("size"),
                                 "created": a.get("created")} for a in f.get("attachment") or []],
-               "actor": props.get("sox.actor")}
+               "actingRole": (props.get(ROLE_PROPERTY) or {}).get("role")}
         for k in AGENT_FIELDS:
             out[k] = agent.get(k)
         return out
 
     def raw(self, key):
-        q = urllib.parse.urlencode({"fields": ",".join(ISSUE_FIELDS), "properties": "sox.agent,sox.actor"})
+        q = urllib.parse.urlencode({"fields": ",".join(ISSUE_FIELDS), "properties": f"sox.agent,{ROLE_PROPERTY}"})
         return self._req("GET", f"/rest/api/3/issue/{urllib.parse.quote(key)}?{q}")
 
     def get(self, key):
@@ -428,7 +430,7 @@ class CloudJira(JiraAdapter):
         """All issues for a JQL query (new /search/jql endpoint, token pagination). Raw issues."""
         out, token = [], None
         for _ in range(limit // 100 + 2):
-            body = {"jql": jql, "maxResults": 100, "fields": ISSUE_FIELDS, "properties": ["sox.agent", "sox.actor"]}
+            body = {"jql": jql, "maxResults": 100, "fields": ISSUE_FIELDS, "properties": ["sox.agent", ROLE_PROPERTY]}
             if token:
                 body["nextPageToken"] = token
             res = self._req("POST", "/rest/api/3/search/jql", body)
@@ -500,6 +502,10 @@ class CloudJira(JiraAdapter):
         return [{"id": c["id"], "created": c["created"], "author": person(c.get("author")),
                  "body": adf_to_text(c.get("body")).strip()} for c in res]
 
+    def groups_of(self, account_id):
+        res = self._req("GET", "/rest/api/3/user/groups?" + urllib.parse.urlencode({"accountId": account_id})) or []
+        return sorted(g["name"] for g in res)
+
     def people(self, key):
         f = self.raw(key)["fields"]
         return person(f.get("reporter")), person(f.get("creator"))
@@ -521,7 +527,7 @@ class CloudJira(JiraAdapter):
         jt, extra = self._jira_type(type)
         body = {"fields": {"project": {"key": self.project}, "issuetype": {"name": jt}, "summary": summary,
                            "description": text_to_adf(description), "labels": sorted(set((labels or []) + extra))},
-                "properties": [{"key": "sox.actor", "value": {"role": actor.role, "run": _run_url()}}]}
+                "properties": [{"key": ROLE_PROPERTY, "value": {"role": actor.role, "run": _run_url()}}]}
         if fields:
             bad = [k for k in fields if k not in AGENT_FIELDS]
             if bad:
