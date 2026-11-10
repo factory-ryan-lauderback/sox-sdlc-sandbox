@@ -14,6 +14,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import (REPO, GitHub, digest_of, dump_json, is_control_path, load_json, now_utc,  # noqa: E402
                     positive_int, pr_binding, predicate_type, set_output, sha256_hex, subject_lines)
+import checks  # noqa: E402
 import rounds  # noqa: E402
 
 CHECK_NAME = "sox/review-agent"
@@ -166,6 +167,8 @@ def record(args):
     pr, diff, files = _snapshot(gh, number)
     binding = pr_binding(pr)
     head = pr["head"]["sha"]
+    # action: none (no check run), post (one completed run), attest (in_progress run, attest, complete),
+    # heal (complete our stale in_progress run whose verdict was attested). See checks.py.
     plan = {"pr": number, "headSha": head, "action": "post", "conclusion": "failure", "attest": False}
     out = args.out
     os.makedirs(out, exist_ok=True)
@@ -176,23 +179,40 @@ def record(args):
         set_output("attest", "true" if plan["attest"] else "false")
         set_output("action", plan["action"])
         print(json.dumps({k: plan[k] for k in ("action", "conclusion", "attest", "title")}))
+        if plan["action"] == "none":
+            print(f"::warning title=No check run::{title}: {summary}")
 
     if head != ctx["headSha"] or binding["baseRef"] != ctx["baseRef"]:
-        plan["action"] = "superseded"
+        plan["action"] = "none"
         return finish("Superseded", "PR head or base changed during review; a new run reviews the new state.")
     diff_digest = "sha256:" + sha256_hex(diff)
     if diff_digest != ctx["diffDigest"]:
-        plan["action"] = "superseded"
+        plan["action"] = "none"
         return finish("Superseded", "Diff changed during review.")
 
+    reviewer_app = int(os.environ["REVIEWER_APP_ID"])
+    runs = checks.app_runs(gh, head, CHECK_NAME, reviewer_app)
+    state = checks.head_state(runs)
     existing = rounds.verdict_for_head(head, binding["baseRef"])
     if existing:
         p = existing.predicate
         plan["conclusion"] = "success" if p.get("outcome") == "pass" else "failure"
+        cid = p.get("checkRunId")
+        mine = [r for r in runs if r["id"] == cid]
+        if mine and mine[0]["status"] != "completed":
+            plan.update(action="heal", checkRunId=cid)
+        elif any(r["status"] == "completed" and r.get("conclusion") == plan["conclusion"] for r in runs):
+            plan["action"] = "none"
         return finish(f"Review: {p.get('outcome')} (round {p.get('round')}, existing verified verdict)",
                       "A verified review-verdict already exists for this head SHA and base. It is re-posted, not re-run; "
                       "a failing verdict for a head can never be replaced by a later pass.",
                       f"Attestation {existing.digest}, run {existing.identity.get('runInvocationURI')}")
+    if state in ("burned", "open"):
+        # No attested verdict, yet a Review App run exists on this head: it was cancelled, failed or
+        # crashed during attest. The gate treats it as binding, so judging again cannot help.
+        plan["action"] = "none"
+        return finish("Head blocked", f"A {CHECK_NAME} run on {head[:12]} is {state} without an attested verdict. "
+                      "Push a new commit; the new head gets a fresh review.")
 
     prior, forgeries = rounds.failing_heads(tuple(binding["loopKey"]))
     prior = prior - {head}
@@ -208,9 +228,10 @@ def record(args):
 
     verdict = load_json(f"{args.dir}/verdict.json")
     if verdict["verdict"] not in ("pass", "changes_requested"):
+        # Infrastructure or model failure before judging: no check run, so the head stays reviewable.
+        plan["action"] = "none"
         return finish("Review error", verdict["summary"] or "Review Agent failed; the sweep retries.")
 
-    reviewer_app = int(os.environ["REVIEWER_APP_ID"])
     author_app = _app_id_for_login(gh, pr["user"])
     if author_app is not None and author_app == reviewer_app:
         return finish("Segregation of duties", "The Review App authored this PR; it cannot review it.")
@@ -251,7 +272,7 @@ def record(args):
     with open(f"{out}/subjects.txt", "w") as f:
         f.write(subject_lines(bindings))
     dump_json(f"{out}/predicate.json", predicate)
-    plan.update(attest=True, conclusion="success" if verdict["verdict"] == "pass" else "failure", round=round_no)
+    plan.update(action="attest", attest=True, conclusion="success" if verdict["verdict"] == "pass" else "failure", round=round_no)
     if binding["story"]:
         dump_json(f"{out}/jira-ops.json", [{"op": "comment", "key": binding["story"],
                                             "body": f"Review Agent round {round_no} on PR #{number} @ {head[:12]}: {verdict['verdict']}. {verdict['summary'][:500]}"}])
@@ -262,45 +283,44 @@ def record(args):
 
 
 def check_start(args):
-    """Create the check run (in progress) for the head SHA the record step verified; store its id in the predicate."""
-    gh = GitHub(os.environ["APP_TOKEN"])
+    """Open the in_progress check run just before attest and bind its id into the predicate."""
     plan = load_json(f"{args.out}/plan.json")
-    if plan["action"] != "post":
+    if plan["action"] != "attest":
         return
-    run = gh.request("POST", f"/repos/{REPO}/check-runs", {"name": CHECK_NAME, "head_sha": plan["headSha"], "status": "in_progress",
-                                                           "external_id": f"pr-{plan['pr']}"})
-    plan["checkRunId"] = run["id"]
+    gh = GitHub(os.environ["APP_TOKEN"])
+    ext = f"run-{os.environ.get('GITHUB_RUN_ID', 'local')}-{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}-pr-{plan['pr']}"
+    plan["checkRunId"] = checks.start(gh, CHECK_NAME, plan["headSha"], ext)
     dump_json(f"{args.out}/plan.json", plan)
-    if plan["attest"]:
-        p = load_json(f"{args.out}/predicate.json")
-        p["checkRunId"] = run["id"]
-        dump_json(f"{args.out}/predicate.json", p)
+    p = load_json(f"{args.out}/predicate.json")
+    p["checkRunId"] = plan["checkRunId"]
+    dump_json(f"{args.out}/predicate.json", p)
 
 
 def check_finish(args):
-    """Complete the check run. Conclusion is success only if the verdict is pass AND the attestation exists."""
-    gh = GitHub(os.environ["APP_TOKEN"])
+    """Complete or post the check run. Success only if the verdict is pass AND its attestation exists."""
     plan = load_json(f"{args.out}/plan.json")
-    if plan["action"] != "post":
-        print(f"nothing to post ({plan['action']})")
+    action = plan["action"]
+    if action == "none":
+        print(f"no check run: {plan['title']}")
         return
+    if action == "attest" and not plan.get("checkRunId"):
+        print("check run was never opened; nothing to complete (no verdict became evidence)")
+        return
+    gh = GitHub(os.environ["APP_TOKEN"])
     conclusion = plan["conclusion"]
     details = plan.get("details", "")
-    if plan["attest"]:
+    if action == "attest":
         if os.environ.get("ATTEST_OUTCOME") != "success" or not os.environ.get("ATTESTATION_URL"):
             conclusion, plan["title"] = "failure", "Attestation failed"
-            details = "The review-verdict attestation was not created, so the verdict is not evidence. The sweep retries.\n\n" + details
+            details = ("The review-verdict attestation was not created, so the verdict is not evidence. This head is "
+                       "blocked; push a new commit to get a fresh review.\n\n" + details)
         else:
             details = f"Attestation: {os.environ['ATTESTATION_URL']}\n\n" + details
     if conclusion not in ("success", "failure"):
         conclusion = "failure"
-    body = {"status": "completed", "conclusion": conclusion,
-            "output": {"title": plan["title"][:250], "summary": plan["summary"][:60000], "text": details[:60000]}}
-    if "checkRunId" in plan:
-        gh.request("PATCH", f"/repos/{REPO}/check-runs/{plan['checkRunId']}", body)
-    else:
-        gh.request("POST", f"/repos/{REPO}/check-runs", {"name": CHECK_NAME, "head_sha": plan["headSha"], **body})
-    if plan["attest"] and conclusion in ("success", "failure") and os.environ.get("ATTESTATION_URL"):
+    checks.complete(gh, CHECK_NAME, plan["headSha"], conclusion, plan["title"], plan["summary"], details,
+                    run_id=plan.get("checkRunId"), external_id=f"pr-{plan['pr']}")
+    if action == "attest" and os.environ.get("ATTESTATION_URL") and conclusion == plan["conclusion"]:
         # Advisory PR comment for the author agent; the check run and attestation are the record.
         try:
             gh.request("POST", f"/repos/{REPO}/pulls/{plan['pr']}/reviews",
@@ -308,7 +328,7 @@ def check_finish(args):
                         "body": f"**{plan['title']}**\n\n{plan['summary']}\n\n{details[:50000]}"})
         except RuntimeError as e:
             print(f"warning: could not post review comment: {e}")
-    print(f"{CHECK_NAME} -> {conclusion}")
+    print(f"{CHECK_NAME} -> {conclusion} ({action})")
 
 
 def main():
