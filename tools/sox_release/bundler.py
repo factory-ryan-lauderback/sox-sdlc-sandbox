@@ -26,7 +26,7 @@ import pathlib
 import sys
 
 from tools.sox_release import evidence
-from tools.sox_release.common import RELEASE_BRANCH, ROOT, STORY_BRANCH, RefusedError, slugify, write_json
+from tools.sox_release.common import RELEASE_BRANCH, ROOT, STORY_BRANCH, RefusedError, sha256_hex, slugify, write_json
 from tools.sox_release.gh import GitHub, GitHubError
 
 MARK = "<!-- sox-release-bundler -->"
@@ -58,21 +58,38 @@ def checks_passed(gh, sha, pinned):
     return problems
 
 
-def snapshot_releases(path):
-    """{slug: version name} from a Jira read snapshot, used only to discover candidate releases.
+SNAPSHOT_SCHEMA = "sox-jira-snapshot/v1"
+
+
+class SnapshotMismatch(Exception):
+    pass
+
+
+def snapshot_releases(path, digest=None):
+    """{slug: version name} from a sox-jira-read.yml snapshot (preset releases), used only to
+    discover candidate releases: unreleased, unarchived versions and unreleased story fix versions.
 
     The bundler never reads Jira itself. A snapshot only names candidates: nothing is acted on
     without a verified release-manifest, which the jira-attestor signs from its own Jira read.
-    Accepts the fake store (sox-jira-fake/v1, issues keyed by Jira key) or a list of issues.
+    digest is the producer job's output; a snapshot whose bytes do not match it is never used.
     """
     if not path:
         return {}, "no Jira snapshot"
     try:
-        data = json.loads(pathlib.Path(path).read_text())
-        issues = list(data.get("issues", {}).values()) if isinstance(data, dict) else data
-        names = {v for s in issues if isinstance(s, dict) and s.get("type") == "Story"
-                 for v in (s.get("fixVersions") or []) if isinstance(v, str)}
-    except (OSError, ValueError, AttributeError) as e:  # act only on releases that already have branches
+        raw = pathlib.Path(path).read_bytes()
+    except OSError as e:
+        return {}, f"Jira snapshot unreadable: {e}"
+    if digest is not None and "sha256:" + sha256_hex(raw) != digest:
+        raise SnapshotMismatch(f"Jira snapshot sha256:{sha256_hex(raw)} does not match producer digest {digest}")
+    try:
+        data = json.loads(raw)
+        if data.get("schema") != SNAPSHOT_SCHEMA or data.get("complete") is not True:
+            return {}, f"Jira snapshot not a complete {SNAPSHOT_SCHEMA}"
+        names = {v["name"] for v in data.get("versions") or []
+                 if isinstance(v.get("name"), str) and not v.get("released") and not v.get("archived")}
+        names |= {v["name"] for s in data.get("issues") or [] if (s.get("type") or {}).get("name") == "Story"
+                  for v in s.get("fixVersions") or [] if isinstance(v.get("name"), str) and not v.get("released")}
+    except (ValueError, AttributeError, TypeError, KeyError) as e:  # act only on releases that already have branches
         return {}, f"Jira snapshot unreadable: {e}"
     out = {}
     for n in sorted(names):
@@ -214,10 +231,10 @@ def sweep_release(reader, writer, slug, man, pinned, main_sha, dry_run=False):
     return {"release": slug, "log": log, "problems": problems, "jiraOps": jira_ops}
 
 
-def sweep(reader, writer, fetch=evidence.fetch, dry_run=False, policy=None, jira_snapshot=None):
+def sweep(reader, writer, fetch=evidence.fetch, dry_run=False, policy=None, jira_snapshot=None, snapshot_digest=None):
     policy = policy or trust_policy()
     pinned = pinned_checks(policy)
-    from_jira, jira_err = snapshot_releases(jira_snapshot)
+    from_jira, jira_err = snapshot_releases(jira_snapshot, snapshot_digest)
     slugs = sorted(set(from_jira) | set(release_branches(reader)))
     main_sha = reader.get("/repos/{repo}/git/ref/heads/main")["object"]["sha"]
     out = {"mainSha": main_sha, "jira": jira_err or "ok", "releases": [], "problems": []}
@@ -239,14 +256,23 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--out", required=True)
     ap.add_argument("--jira-ops-out", required=True)
-    ap.add_argument("--jira-snapshot", help="Jira read snapshot (data only, candidate release names)")
+    ap.add_argument("--jira-snapshot", help="sox-jira-read.yml snapshot.json (data only, candidate release names)")
+    ap.add_argument("--jira-snapshot-digest", help="the producer job's digest output for that snapshot")
     args = ap.parse_args(argv)
+    if args.jira_snapshot and not args.jira_snapshot_digest:
+        print("refused: --jira-snapshot needs --jira-snapshot-digest from the producer job", file=sys.stderr)
+        return 2
     reader = GitHub(token=os.environ.get("GITHUB_TOKEN"))
     writer = GitHub(token=os.environ.get("SOX_BUNDLER_TOKEN") or ("dry-run" if args.dry_run else None))
     if not args.dry_run and not os.environ.get("SOX_BUNDLER_TOKEN"):
         print("refused: SOX_BUNDLER_TOKEN (Release Bundler App token) is required for writes", file=sys.stderr)
         return 2
-    out = sweep(reader, writer, dry_run=args.dry_run, jira_snapshot=args.jira_snapshot)
+    try:
+        out = sweep(reader, writer, dry_run=args.dry_run, jira_snapshot=args.jira_snapshot,
+                    snapshot_digest=args.jira_snapshot_digest)
+    except SnapshotMismatch as e:
+        print(f"refused: {e}", file=sys.stderr)
+        return 2
     out["rejectedEvidence"] = evidence.REJECTED[:50]
     write_json(args.out, out)
     ops = [op for r in out["releases"] for op in r["jiraOps"]]
