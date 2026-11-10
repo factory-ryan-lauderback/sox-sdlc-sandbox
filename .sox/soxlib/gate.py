@@ -16,6 +16,7 @@ from .verify import parse_time
 
 STORY_RE = re.compile(r"^(story|qa-fix)/(FRQ-[0-9]{1,9})-[A-Za-z0-9._-]+$")
 RELEASE_RE = re.compile(r"^release/([a-z0-9][a-z0-9._-]{0,63})$")
+JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-[0-9]{1,9}$")
 HOTFIX_RE = re.compile(r"^hotfix/(FRQ-[0-9]{1,9})-[A-Za-z0-9._-]+$")
 NOT_PASSING = {"neutral", "skipped", "cancelled", "stale", "action_required", "timed_out",
                "startup_failure", "failure", None}
@@ -118,7 +119,12 @@ class Context:
 
     def check_runs(self, sha):
         data = self.api.get(f"/repos/{self.repo}/commits/{sha}/check-runs?per_page=100&filter=all")
-        return data.get("check_runs", [])
+        runs = data.get("check_runs", [])
+        if (data.get("total_count") or 0) > len(runs):
+            # Every run binds the head (F13); a partial list could hide a failing one.
+            raise RuntimeError(f"{sha}: {data.get('total_count')} check runs, more than one page; "
+                               "refusing a partial list")
+        return runs
 
 
 def classify(pd, policy):
@@ -365,19 +371,34 @@ class Evaluation:
         return latest
 
     def required_check(self, sha, name, role):
+        """Every run of the check by the role's App on this head binds it (F13, BP-41d): a run
+        still in progress, cancelled, or failed before its verdict was attested is not cleared by
+        a newer passing run, so re-dispatching the agent cannot re-roll the result."""
         app_id = self.policy.app_id(role)
+        slug = self.policy.app(role).get("slug")
         runs = [c for c in self.ctx.check_runs(sha) if c.get("name") == name]
         mine = [c for c in runs if (c.get("app") or {}).get("id") == app_id and app_id]
         if self.as_of is not None:
-            mine = [c for c in mine if c.get("completed_at")
-                    and parse_time(c["completed_at"]) <= self.as_of]
-        mine.sort(key=lambda c: (c.get("started_at") or "", c.get("id")))
-        latest = mine[-1] if mine else None
-        others = sorted({(c.get("app") or {}).get("slug") for c in runs} - {self.policy.app(role).get("slug")})
-        ok = latest is not None and latest.get("conclusion") == "success"
+            # Runs started after the merge could not have influenced it. A run without a start
+            # time cannot be placed, so it counts.
+            mine = [c for c in mine if not c.get("started_at")
+                    or parse_time(c["started_at"]) <= self.as_of]
+        mine.sort(key=lambda c: (c.get("started_at") or "", c.get("id") or 0))
+
+        def state(c):
+            done = c.get("completed_at")
+            if c.get("status") != "completed" or not done:
+                return f"not completed ({c.get('status')})"
+            if self.as_of is not None and parse_time(done) > self.as_of:
+                return "not completed at merge"
+            return c.get("conclusion")
+        bad = [f"run {c.get('id')}: {state(c)}" for c in mine if state(c) != "success"]
+        others = sorted({(c.get("app") or {}).get("slug") for c in runs} - {slug})
+        ok = bool(mine) and not bad
         self.req(f"CC-02.check:{name}", "CC-02", ok,
-                 f"latest {name} from {self.policy.app(role).get('slug')}: "
-                 f"{latest.get('conclusion') if latest else 'missing'}"
+                 (f"{len(mine)} {name} run(s) from {slug} on {sha[:12]}"
+                  + (f"; not success (every run on the head binds it): {bad}" if bad else
+                     ", all completed success" if mine else ": missing"))
                  + (f"; same-named checks from other sources ignored: {others}" if others else ""))
 
     def loop_review(self, story):
@@ -505,7 +526,7 @@ class Evaluation:
 
     def loop_human(self, slug):
         """LOOP-H. A Release Approver's or Control Owner's REQUEST_CHANGES binds the release (its
-        head branch, slug and epics), not the PR: dismissing the review, dropping the event, or
+        head branch, slug, stories and epics), not the PR: dismissing the review, dropping the event, or
         reopening a new PR from the same branch does not clear it (BP-39). Only a new plan for
         every epic, attested after the request, with a digest not used before, and a new head do."""
         pd, pol, api = self.pd, self.policy, self.ctx.api
@@ -536,9 +557,17 @@ class Evaluation:
                     crs.append({"pr": n, "reviewId": r.get("id"), "login": u.get("login"),
                                 "commitId": r.get("commit_id"), "at": parse_time(r.get("submitted_at")),
                                 "dismissed": r.get("state") == "DISMISSED"})
-        kinds = [("release", slug)] if slug else [("pr", pd.number)]
+        # The request also binds every story and Epic it covered (F14, BP-39g): re-bundling the
+        # same work under a new release slug or branch does not shed it without a re-plan.
+        kinds = ([("release", slug)] if slug else []) + [("pr", pd.number)]
+        kinds += [("jira", k) for k in sorted(set(self.facts["stories"]) | set(self.facts["epics"]))
+                  if JIRA_KEY_RE.match(str(k or ""))]
+        seen_att = set()
         for kind, ident in kinds:
             for a in self.all(kind, ident, "human-changes-requested"):
+                if a.digest in seen_att:
+                    continue
+                seen_att.add(a.digest)
                 q = a.predicate
                 crs.append({"pr": q.get("prNumber"), "reviewId": q.get("reviewId"),
                             "login": (q.get("reviewer") or {}).get("login"),
@@ -547,6 +576,12 @@ class Evaluation:
                             "attestation": a.digest})
         if self.as_of is not None:
             crs = [c for c in crs if c["at"] is not None and c["at"] <= self.as_of]
+        # One review seen both in the reviews API and as its attestation counts once.
+        merged = {}
+        for c in crs:
+            k = (c.get("pr"), c.get("reviewId")) if c.get("reviewId") is not None else (id(c),)
+            merged[k] = dict(merged.get(k) or {}, **{x: y for x, y in c.items() if y is not None})
+        crs = list(merged.values())
         self.facts["humanChangesRequested"] = [
             dict(c, at=iso(c["at"]) if c["at"] else None) for c in crs]
         if not crs:
