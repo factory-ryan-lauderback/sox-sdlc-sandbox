@@ -202,6 +202,8 @@ jobs:
   jira:
     needs: [resolve, record]
     if: ${{ !cancelled() && needs.resolve.outputs.prs != '[]' && needs.resolve.outputs.prs != '' }}
+    permissions:
+      contents: read
     uses: ./.github/workflows/sox-jira-write.yml
     with:
       role: review

@@ -7,7 +7,7 @@ import sys
 
 _SOX = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _SOX)
-from soxlib.ghapi import APIError, GitHub as SoxGitHub  # noqa: E402
+from soxlib.ghapi import GitHub as SoxGitHub  # noqa: E402
 from soxlib.verify import Verifier  # noqa: E402
 
 FAILING = {"review-verdict": "changes_requested", "qa-result": "fail"}
@@ -25,14 +25,7 @@ def _ctx():
 
 def fetch(kind, ident, predicate):
     v, api = _ctx()
-    try:
-        return v.fetch(api, kind, ident, predicate)
-    except APIError as e:
-        # The attestations API answers 404 when nothing is stored for a key: zero evidence.
-        # Every other error propagates, so a lookup failure never lowers a count.
-        if e.status == 404:
-            return [], []
-        raise
+    return v.fetch(api, kind, ident, predicate)
 
 
 def failing_heads(loop_key, predicate="review-verdict"):
@@ -41,12 +34,7 @@ def failing_heads(loop_key, predicate="review-verdict"):
     v, api = _ctx()
     outcome = FAILING[predicate]
     if kind == "jira":
-        try:
-            _, items, rejected = v.count_rounds(api, ident, predicate, outcome=outcome)
-        except APIError as e:
-            if e.status != 404:
-                raise
-            items, rejected = [], []
+        _, items, rejected = v.count_rounds(api, ident, predicate, outcome=outcome)
     else:
         # Release and PR loop keys: same rule (verified only, distinct heads) over that subject.
         verified, rejected = fetch(kind, ident, predicate)
