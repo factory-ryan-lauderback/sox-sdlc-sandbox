@@ -10,7 +10,7 @@ import re
 import time
 import urllib.parse
 
-from . import jcs
+from . import jcs, pairing
 from .scope import ScopeMap, norm_digest
 from .verify import parse_time
 
@@ -24,6 +24,25 @@ PASSED = {"passed", "pass"}
 STORY_TYPES = ("dev", "qa")
 MAX_COMMITS = 250
 MAX_FILES = 3000
+# A judging run can be queued (concurrency groups) for a while before its judging step starts on
+# the current head; list runs created this long before the head was pushed.
+JUDGING_QUEUE_MARGIN = 6 * 3600
+
+
+def _judging_started(job, step):
+    """Epoch at which the judging step (or the job, if step is None) started, or None if it never
+    ran (queued, skipped)."""
+    node = job
+    if step:
+        node = next((s for s in job.get("steps") or [] if s.get("name") == step), None)
+        if node is None:
+            return None
+    if node.get("status") not in ("in_progress", "completed") or node.get("conclusion") == "skipped":
+        return None
+    try:
+        return parse_time(node.get("started_at"))
+    except (TypeError, ValueError):
+        return None
 
 
 def iso(epoch):
@@ -89,7 +108,16 @@ class Context:
         self._story_results = {}
         self._release_slugs = None
         self.participants = set()
-
+        # Set by evaluate(): the as-of time of the top-level PR, which decides whether the
+        # chain is judged under the post-go-live rules (a story merged before go-live still
+        # carries pre-rotation App actions into a release merged after it).
+        self.top_as_of = None
+        # The gate's own in-progress check run in this workflow run; gate-decision pairs with it.
+        self.check_run_id = None
+        self._wf_runs = {}
+        self._jobs = {}
+        # Actions API reads (workflow runs, jobs) may use a different read-only token.
+        self.actions_api = api
     def prdata(self, n):
         if n not in self._prs:
             self._prs[n] = PRData(self, n)
@@ -126,6 +154,32 @@ class Context:
             raise RuntimeError(f"{sha}: {data.get('total_count')} check runs, more than one page; "
                                "refusing a partial list")
         return runs
+
+    def workflow_runs(self, workflow, since):
+        """Runs of one workflow file created at or after `since` (epoch)."""
+        k = (workflow, int(since))
+        if k not in self._wf_runs:
+            name = workflow.rsplit("/", 1)[-1]
+            q = urllib.parse.quote(">=" + iso(max(0, since)), safe="")
+            path = f"/repos/{self.repo}/actions/workflows/{name}/runs?created={q}&per_page=100"
+            try:
+                # The API caps filtered listings at 1000 runs; more fails closed in paginate.
+                runs = self.actions_api.paginate(path, key="workflow_runs", limit=1000)
+            except Exception as e:
+                # A workflow file that is not on main yet has no runs (404). Only trust that 404
+                # once the repository itself is readable with this token.
+                if getattr(e, "status", None) != 404 or not hasattr(self.actions_api, "require_repo"):
+                    raise
+                self.actions_api.require_repo(self.repo)
+                runs = []
+            self._wf_runs[k] = [r for r in runs if (r.get("path") or workflow) == workflow]
+        return self._wf_runs[k]
+
+    def run_jobs(self, run_id):
+        if run_id not in self._jobs:
+            self._jobs[run_id] = self.actions_api.paginate(
+                f"/repos/{self.repo}/actions/runs/{int(run_id)}/jobs?filter=all&per_page=100", key="jobs")
+        return self._jobs[run_id]
 
 
 def _jira_time(s):
@@ -252,6 +306,7 @@ class Evaluation:
                      f"{pd.head_ref!r} -> {pd.base_ref!r} is not story/qa-fix -> release/<slug>")
             return self
         self.check_agent_approvals()
+        self.gate_checks()
         if self.kind == "story":
             self.eval_story()
         else:
@@ -270,6 +325,7 @@ class Evaluation:
             self.facts["firstPushAt"] = min((parse_time(a["timestamp"]) for a in pushes), default=None)
         self.req(f"SDLC-05.pushers#{pd.number}", "SDLC-05", bool(pushes) and not bad,
                  f"pushers to {pd.head_ref}: {actors or 'none recorded'}; allowed {sorted(allowed)}")
+        self.pre_rotation_pushes(pd)
         return actors
 
     def check_agent_approvals(self):
@@ -439,10 +495,52 @@ class Evaluation:
                  [a.digest for a in ([latest] if latest else []) + fails])
         return latest
 
+    @property
+    def carry_over(self):
+        """Post-go-live rules apply: goLive.at is set and the top-level PR is open or merged at or
+        after go-live (evidence spec 7.6)."""
+        at = self.policy.go_live_at
+        if at is None:
+            return False
+        top = getattr(self.ctx, "top_as_of", self.as_of)
+        return top is None or top >= at
+
+    def _split_rotation(self, runs, role):
+        """(pre, post): runs started before the role's App key rotation are set aside (7.6): they
+        neither pass nor bind the head; only a new evaluation after rotation does."""
+        rot = self.policy.rotation_at(role) if self.carry_over else None
+        # started_at is writable by whoever holds the App key, so a run can only be pre-rotation
+        # if its head existed before the rotation; otherwise a backdated run would be set aside.
+        if rot is None or self.head_pushed_at(self.pd) >= rot:
+            return [], list(runs)
+        pre = [c for c in runs if (pairing.started(c) or 0) < rot]
+        return pre, [c for c in runs if c not in pre]
+
+    def _pair_all(self, sha, name, role, runs, pre):
+        """facts.checks[name] entries; returns {check id: attestation or None} for completed success."""
+        pred = pairing.PREDICATE_FOR_CHECK[name]
+        cands = self.all("commit", sha, pred)
+        out, entries = {}, []
+        for c in runs:
+            att = None
+            why = "not a success"
+            if c.get("status") == "completed" and c.get("conclusion") == "success":
+                att, why = pairing.pair(c, sha, cands, self.policy.repo)
+                out[c.get("id")] = att
+            e = dict(pairing.record(c, self.policy.app_id(role), att), headSha=sha,
+                     preRotation=c in pre, startedAt=c.get("started_at"), detail=why)
+            entries.append(e)
+            if c in pre and att is None and c.get("conclusion") == "success":
+                # Exposure finding (7.6 item 4), never an in-scope exception.
+                self.facts.setdefault("preRotationUnpaired", []).append(e)
+        self.facts.setdefault("checks", {}).setdefault(name, []).extend(entries)
+        return out
+
     def required_check(self, sha, name, role):
         """Every run of the check by the role's App on this head binds it (F13, BP-41d): a run
         still in progress, cancelled, or failed before its verdict was attested is not cleared by
-        a newer passing run, so re-dispatching the agent cannot re-roll the result."""
+        a newer passing run, so re-dispatching the agent cannot re-roll the result. Every success
+        must pair with a verified attestation from the same workflow run (F16, spec 2.5)."""
         app_id = self.policy.app_id(role)
         slug = self.policy.app(role).get("slug")
         runs = [c for c in self.ctx.check_runs(sha) if c.get("name") == name]
@@ -453,6 +551,7 @@ class Evaluation:
             mine = [c for c in mine if not c.get("started_at")
                     or parse_time(c["started_at"]) <= self.as_of]
         mine.sort(key=lambda c: (c.get("started_at") or "", c.get("id") or 0))
+        pre, post = self._split_rotation(mine, role)
 
         def state(c):
             done = c.get("completed_at")
@@ -461,15 +560,148 @@ class Evaluation:
             if self.as_of is not None and parse_time(done) > self.as_of:
                 return "not completed at merge"
             return c.get("conclusion")
-        bad = [f"run {c.get('id')}: {state(c)}" for c in mine if state(c) != "success"]
+        bad = [f"run {c.get('id')}: {state(c)}" for c in post if state(c) != "success"]
         others = sorted({(c.get("app") or {}).get("slug") for c in runs} - {slug})
-        ok = bool(mine) and not bad
+        ok = bool(post) and not bad
         self.req(f"CC-02.check:{name}", "CC-02", ok,
-                 (f"{len(mine)} {name} run(s) from {slug} on {sha[:12]}"
+                 (f"{len(post)} {name} run(s) from {slug} on {sha[:12]}"
                   + (f"; not success (every run on the head binds it): {bad}" if bad else
-                     ", all completed success" if mine else ": missing"))
+                     ", all completed success" if post else ": missing"))
+                 + (f"; {len(pre)} run(s) before the App key rotation set aside" if pre else "")
                  + (f"; same-named checks from other sources ignored: {others}" if others else ""))
+        if pre and not post:
+            self.req(f"CC-02.app-key-pre-rotation:{name}", "CC-02", False,
+                     f"app-key-pre-rotation: every {name} run on {sha[:12]} predates the {slug} key "
+                     "rotation; a new run after rotation is required")
+        paired = self._pair_all(sha, name, role, mine, pre)
+        unpaired = [cid for c in post for cid in [c.get("id")] if cid in paired and paired[cid] is None]
+        if any(cid in paired for cid in (c.get("id") for c in post)):
+            self.req(f"CC-02.check-without-evidence:{name}", "CC-02", not unpaired,
+                     (f"check-without-evidence: {name} success run(s) {unpaired} on {sha[:12]} have no "
+                      "verified attestation from the same workflow run (possible App key misuse)")
+                     if unpaired else f"every {name} success on {sha[:12]} is paired",
+                     [a.digest for a in paired.values() if a is not None])
 
+    def gate_checks(self):
+        """The gate's own sox/evidence-gate runs on this head. Open PR: every success must be paired
+        (an App key cannot sign a gate-decision). As of merge: the last run completed before the
+        merge, which the ruleset relied on, must be a paired success."""
+        pd, name, role = self.pd, "sox/evidence-gate", "gate"
+        app_id = self.policy.app_id(role)
+        if not app_id:
+            self.req(f"CC-02.check:{name}", "CC-02", False, "gate App id not pinned in the trust policy")
+            return
+        runs = [c for c in self.ctx.check_runs(pd.head)
+                if c.get("name") == name and (c.get("app") or {}).get("id") == app_id
+                and c.get("status") == "completed" and c.get("completed_at")]
+        if self.as_of is not None:
+            runs = [c for c in runs if parse_time(c["completed_at"]) <= self.as_of]
+        runs.sort(key=lambda c: (c.get("completed_at") or "", c.get("id") or 0))
+        pre, post = self._split_rotation(runs, role)
+        self.facts["gateCheckRuns"] = len(runs)
+        paired = self._pair_all(pd.head, name, role, runs, pre)
+        unpaired = [c.get("id") for c in post if c.get("id") in paired and paired[c.get("id")] is None]
+        self.req(f"CC-02.check-without-evidence:{name}", "CC-02", not unpaired,
+                 (f"check-without-evidence: {name} success run(s) {unpaired} on {pd.head[:12]} have no "
+                  "verified gate-decision from the same workflow run (possible Gate App key misuse)")
+                 if unpaired else f"{len(post)} completed {name} run(s) on {pd.head[:12]}; every success paired")
+        if self.as_of is not None:
+            last = post[-1] if post else None
+            ok = last is not None and paired.get(last.get("id")) is not None
+            self.req(f"CC-02.check:{name}", "CC-02", ok,
+                     f"last {name} run before the merge: "
+                     + (f"{last.get('id')} {last.get('conclusion')}, "
+                        f"{'paired' if ok else 'not a paired success'}" if last else "none")
+                     + (f"; {len(pre)} run(s) before the App key rotation set aside" if pre else ""))
+            if pre and not post:
+                self.req(f"CC-02.app-key-pre-rotation:{name}", "CC-02", False,
+                         f"app-key-pre-rotation: every {name} run before the merge predates the "
+                         "gate App key rotation")
+
+    def judging_runs(self, pd, role, rid, control):
+        """F17: every run of the role's judging workflow whose judging step started on this head
+        must have attested its predicate from the same run attempt; otherwise the verdict was
+        readable and could be discarded and re-rolled (unattested-judging-run)."""
+        cfg = self.policy.judging(role)
+        if not cfg:
+            self.req(rid, control, False, f"judgingWorkflows.{role} not configured in the trust policy")
+            return
+        since = self.head_pushed_at(pd)
+        runs = self.ctx.workflow_runs(cfg["workflow"], since - JUDGING_QUEUE_MARGIN)
+        job_re = re.compile(re.escape(cfg["job"]) + r" \(([0-9]+)(?:, [^)]*)?\)")
+        # A dispatched single-PR run names neither the PR in its job nor (without run-name) in its
+        # title; its check run on the head carries external_id = run id, which ties it to this head.
+        on_head = {str(c.get("external_id")) for c in self.ctx.check_runs(pd.head)
+                   if str(c.get("external_id") or "").isdigit()}
+        hits, by_head = [], set()
+        for run in runs:
+            if self.as_of is not None and (parse_time(run.get("created_at")) or 0) > self.as_of:
+                continue
+            for job in self.ctx.run_jobs(run["id"]):
+                m = job_re.fullmatch(job.get("name") or "")
+                if m:
+                    mine = int(m.group(1)) == pd.number
+                elif job.get("name") == cfg["job"]:
+                    t = re.search(r"\bpr[=#: ]?([0-9]+)\b", run.get("display_title") or "", re.I)
+                    if t:
+                        mine = int(t.group(1)) == pd.number
+                    else:
+                        mine = str(run["id"]) in on_head
+                        by_head.add(str(run["id"]))
+                else:
+                    continue
+                if not mine:
+                    continue
+                at = _judging_started(job, cfg.get("step"))
+                if at is None or at < since or (self.as_of is not None and at > self.as_of):
+                    continue
+                hits.append((str(run["id"]), int(job.get("run_attempt") or run.get("run_attempt") or 1), at))
+        attested = {pairing.run_of(a, self.policy.repo) for a in self.all("pr", pd.number, cfg["predicate"])
+                    if a.predicate.get("prNumber") == pd.number}
+        # Head-attributed runs may have judged another PR sharing this head; any attestation of the
+        # predicate from that run attempt shows the verdict was signed.
+        if by_head:
+            attested |= {pairing.run_of(a, self.policy.repo) for a in self.all("commit", pd.head, cfg["predicate"])}
+        missing = sorted({(r, n) for r, n, _ in hits if (r, n) not in attested})
+        self.facts.setdefault("judgingRuns", {})[f"{role}#{pd.number}"] = [
+            {"runId": r, "attempt": n, "judgingStartedAt": iso(t), "attested": (r, n) in attested}
+            for r, n, t in sorted(set(hits))]
+        self.req(rid, control, not missing,
+                 (f"unattested-judging-run: {cfg['workflow']} run(s) {[f'{r}/attempt {n}' for r, n in missing]} "
+                  f"judged PR #{pd.number} at head {pd.head[:12]} without attesting {cfg['predicate']} "
+                  "from the same run; the head is blocked") if missing else
+                 f"{len(hits)} judging run(s) of {cfg['workflow']} on head {pd.head[:12]}, all attested")
+
+    def head_pushed_at(self, pd):
+        """Earliest push that made pd.head the branch tip; PR creation time if none is recorded."""
+        ts = [parse_time(a["timestamp"]) for a in pd.pushes()
+              if a.get("after") == pd.head and a.get("timestamp")]
+        if ts:
+            return min(ts)
+        return parse_time(pd.pr.get("created_at")) if pd.pr.get("created_at") else 0
+
+    def pre_rotation_pushes(self, pd):
+        """7.6 item 3: a commit first pushed under an App identity before that App's key rotation
+        cannot be relied on after go-live; only a new head of commits pushed after rotation clears it."""
+        if not self.carry_over:
+            return
+        order = [c["sha"] for c in pd.commits]
+        idx = {s: i for i, s in enumerate(order)}
+        first = {}
+        for a in sorted(pd.pushes(), key=lambda a: a.get("timestamp") or ""):
+            if a.get("after") in idx:
+                for s in order[:idx[a["after"]] + 1]:
+                    first.setdefault(s, (parse_time(a.get("timestamp")), (a.get("actor") or {}).get("login")))
+        bad = []
+        for s, (t, login) in first.items():
+            role = self.policy.role_of_login(login)
+            rot = self.policy.rotation_at(role) if role else None
+            if rot is not None and (t is None or t < rot):
+                bad.append(f"{s[:12]} by {login}")
+        self.req(f"SDLC-05.app-key-pre-rotation#{pd.number}", "SDLC-05", not bad,
+                 (f"app-key-pre-rotation: commits first pushed by an App before its key rotation: {bad}; "
+                  "push a rebuilt head after rotation") if bad else
+                 "no commit was first pushed by an App before its key rotation")
     def loop_review(self, story):
         pol = self.policy
         mx = pol.loops.get("maxReviewRounds", 10)
@@ -515,6 +747,7 @@ class Evaluation:
                      else f"dependencies merged: {[m['storyKey'] for m in merges]}")
         self.review_verdict(pd)
         self.required_check(pd.head, "sox/review-agent", "review")
+        self.judging_runs(pd, "review", f"SDLC-06.unattested-judging-run#{pd.number}", "SDLC-06")
         self.loop_review(story)
 
     # ---------- release / emergency PR ----------
@@ -542,6 +775,8 @@ class Evaluation:
         self.review_verdict(pd)
         self.required_check(pd.head, "sox/review-agent", "review")
         self.required_check(pd.head, "sox/qa-agent", "qa")
+        self.judging_runs(pd, "review", f"SDLC-06.unattested-judging-run#{pd.number}", "SDLC-06")
+        self.judging_runs(pd, "qa", f"SDLC-08.unattested-judging-run#{pd.number}", "SDLC-08")
         env = self.get("commit", pd.head, "env-deploy",
                        where=lambda a: a.predicate.get("headSha") == pd.head
                        and a.predicate.get("environment") == "qa")
@@ -883,4 +1118,5 @@ class Evaluation:
 
 def evaluate(ctx, number, as_of=None):
     pd = ctx.prdata(number)
+    ctx.top_as_of = as_of
     return Evaluation(ctx, pd, as_of=as_of).run()

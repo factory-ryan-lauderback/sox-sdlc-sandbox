@@ -73,9 +73,14 @@ def t(x):
     return G.iso(T0 + x)
 
 
+def run_uri(run, attempt=1):
+    return f"https://github.com/{REPO}/actions/runs/{run}/attempts/{attempt}"
+
+
 class Att:
-    def __init__(self, name, subjects, predicate, at, digest=None):
+    def __init__(self, name, subjects, predicate, at, digest=None, run=None, attempt=1):
         self.name, self.subjects, self.predicate = name, subjects, predicate
+        self.identity = {"runInvocationURI": run_uri(run, attempt)} if run is not None else {}
         self.integrated_time = T0 + at
         self.digest = digest or "sha256:" + jcs.digest([name, subjects, predicate, at])[7:]
 
@@ -160,9 +165,22 @@ def push(actor, after, at):
     return {"activity_type": "push", "actor": {"login": actor}, "after": after, "timestamp": t(at)}
 
 
-def check(name, app, at):
+def check(name, app, at, run=None):
+    """Check run id 'at', posted by workflow run 'run' (default: run id = check id)."""
     return {"name": name, "app": {"id": IDS[app], "slug": f"x-{app}"}, "conclusion": "success",
-            "status": "completed", "started_at": t(at - 5), "completed_at": t(at), "id": at}
+            "status": "completed", "started_at": t(at - 5), "completed_at": t(at), "id": at,
+            "external_id": str(at if run is None else run)}
+
+
+def paired_att(check_name, head, pr, check_id, run=None, at=None, **pred):
+    """The attestation the check's own workflow run signs (spec 2.5)."""
+    name = {"sox/review-agent": "review-verdict", "sox/qa-agent": "qa-result",
+            "sox/evidence-gate": "gate-decision"}[check_name]
+    p = {"prNumber": pr, "headSha": head, "checkRunId": check_id, "baseRef": "refs/heads/main",
+         "verdict": "pass", "outcome": "pass", "conclusion": "success"}
+    p.update(pred)
+    return Att(name, [("commit", head), ("pr", str(pr))], p, (check_id if at is None else at) - 1,
+               run=check_id if run is None else run)
 
 
 class World:
@@ -180,6 +198,11 @@ class World:
         self.other_releases = []
         self.shared = []
         self.release_merged = False
+        self.release_at = {}
+        self.release_push_at = 310
+        self.workflow_runs = {"sox-review-agent.yml": [], "sox-qa-agent.yml": []}
+        self.jobs = {}
+        self.gate_runs = {H10: [check("sox/evidence-gate", "gate", 255)]}
         tl, pm = "svc-techlead-agent", "svc-pm-agent"
         plan = {"epicKey": "FRQ-5", "planDigest": "sha256:plan1",
                 "stories": [{"key": "FRQ-6", "creator": tl, "type": "dev", "dependsOn": [],
@@ -191,9 +214,10 @@ class World:
                  "epics": [{"key": "FRQ-5", "creator": pm}]}, 20),
             Att("techlead-plan", [("jira", "FRQ-5"), ("jira", "FRQ-6")], plan, 30),
             self.manifest(["api"], 40),
-            self.verdict(H10, 10, "release/autopay", "pass", 200),
+            self.verdict(H10, 10, "release/autopay", "pass", 200, check_id=210),
             Att("gate-decision", [("pr", "10"), ("commit", H10)],
-                {"headSha": H10, "conclusion": "success", "prNumber": 10}, 250),
+                {"headSha": H10, "conclusion": "success", "prNumber": 10, "checkRunId": 255}, 250,
+                run=255),
             Att("dev-change", [("pr", "10"), ("commit", H10)], {"headSha": H10, "prNumber": 10}, 250),
         ]
         self.add_release_evidence(R1)
@@ -203,13 +227,15 @@ class World:
                    {"stories": list(stories), "declaredServices": list(declared),
                     "servicesMapDigest": map_digest}, at)
 
-    def verdict(self, head, pr, base, verdict, at, story="FRQ-6"):
+    def verdict(self, head, pr, base, verdict, at, story="FRQ-6", check_id=None):
         return Att("review-verdict", [("commit", head), ("pr", str(pr)), ("jira", story)],
                    {"prNumber": pr, "headSha": head, "baseRef": f"refs/heads/{base}",
                     "verdict": verdict, "outcome": "pass" if verdict == "pass" else verdict,
-                    "reviewerAppId": IDS["review"], "authorAppId": IDS["dev"]}, at)
+                    "reviewerAppId": IDS["review"], "authorAppId": IDS["dev"],
+                    "checkRunId": check_id}, at, run=check_id)
 
     def add_release_evidence(self, head, at=400):
+        self.release_at[head] = at
         env = Att("env-deploy", [("commit", head), ("pr", "20")],
                   {"headSha": head, "environment": "qa", "envId": "qa-20", "baseRef": "refs/heads/main",
                    "images": [{"service": "api", "digest": IMG}]}, at)
@@ -217,9 +243,10 @@ class World:
                  {"prNumber": 20, "headSha": head, "baseRef": "refs/heads/main", "outcome": "pass",
                   "requiredCoverage": 1.0, "requiredTests": ["T-1", "T-2"], "mode": "full",
                   "tests": [{"id": "T-1", "status": "passed"}, {"id": "T-2", "status": "passed"}],
-                  "envDeploy": {"headSha": head, "digest": env.digest}, "reportDigest": "sha256:rep"},
-                 at + 100)
-        self.atts += [env, qa, self.verdict(head, 20, "main", "pass", at + 50)]
+                  "envDeploy": {"headSha": head, "digest": env.digest}, "reportDigest": "sha256:rep",
+                  "checkRunId": at + 110},
+                 at + 100, run=at + 110)
+        self.atts += [env, qa, self.verdict(head, 20, "main", "pass", at + 50, check_id=at + 60)]
 
     # ------------------------------------------------------------ API views
     def pr10(self):
@@ -257,10 +284,13 @@ class World:
             f"{r}/pulls/20/reviews": self.release_reviews,
             f"{r}/issues/20/timeline": self.release_timeline,
             f"{r}/activity": lambda q: ([push(self.story_pusher, H10, 100)]
-                                        if "story" in q["ref"] else [push(BUNDLER, self.release_head, 310)]),
-            f"{r}/commits/{H10}/check-runs": {"check_runs": [check("sox/review-agent", "review", 210)]},
+                                        if "story" in q["ref"] else [push(BUNDLER, self.release_head, self.release_push_at)]),
+            f"{r}/commits/{H10}/check-runs": {"check_runs": [check("sox/review-agent", "review", 210)]
+                                              + self.gate_runs.get(H10, [])},
             f"{r}/commits/{self.release_head}/check-runs": {"check_runs": [
-                check("sox/review-agent", "review", 460), check("sox/qa-agent", "qa", 510)]},
+                check("sox/review-agent", "review", self.release_at[self.release_head] + 60),
+                check("sox/qa-agent", "qa", self.release_at[self.release_head] + 110)]
+                + self.gate_runs.get(self.release_head, [])},
             f"{r}/branches/main": {"commit": {"sha": M0}},
             f"{r}/commits/{S1}/pulls": [self.pr10()],
             f"{r}/pulls": lambda q: [self.pr20()] + self.other_release_prs,
@@ -269,6 +299,10 @@ class World:
         }
         for sha, prs in heads.items():
             routes[f"{r}/commits/{sha}/pulls"] = prs
+        for wf, runs in self.workflow_runs.items():
+            routes[f"{r}/actions/workflows/{wf}/runs"] = runs
+        for rid, jobs in self.jobs.items():
+            routes[f"{r}/actions/runs/{rid}/jobs"] = jobs
         for p in self.other_release_prs:
             routes[f"{r}/pulls/{p['number']}/reviews"] = p["_reviews"]
             routes[f"{r}/issues/{p['number']}/timeline"] = []
@@ -297,6 +331,14 @@ class World:
                              {"headSha": self.release_head, "prNumber": 20,
                               "packetDigest": ev.facts["packetDigest"], "conclusion": "failure"}, at))
         return ev.facts["packetDigest"]
+
+    def add_gate_success(self, head, at, pr=20, paired=True):
+        """A completed sox/evidence-gate success run on head, with its gate-decision if paired."""
+        self.gate_runs.setdefault(head, []).append(check("sox/evidence-gate", "gate", at))
+        if paired:
+            self.atts.append(Att("gate-decision", [("pr", str(pr)), ("commit", head)],
+                                 {"headSha": head, "prNumber": pr, "conclusion": "success",
+                                  "checkRunId": at}, at - 2, run=at))
 
     def review(self, user, state, at, commit=None, rid=None):
         self.release_reviews.append({"id": rid or 500 + len(self.release_reviews), "user": dict(user),
@@ -515,13 +557,18 @@ class TestEveryCheckRunBinds(unittest.TestCase):
     def _eval(self, earlier, name="sox/review-agent", role="review", as_of=None, merged=False):
         w = World()
         w.release_merged = merged
+        if merged:
+            w.add_gate_success(R1, 880)
         runs = [check("sox/review-agent", "review", 460), check("sox/qa-agent", "qa", 510)]
         runs += [dict(check(name, role, at), **kw) for at, kw in earlier]
+        for at, kw in earlier:
+            # Successful extra runs attested like the agent would, so only F13 is under test here.
+            if kw.get("conclusion", "success") == "success" and "app" not in kw:
+                w.atts.append(paired_att(name, R1, 20, at))
         w.extra_routes = {f"/repos/{REPO}/commits/{R1}/check-runs":
-                          {"check_runs": runs, "total_count": len(runs)}}
+                          {"check_runs": runs + w.gate_runs.get(R1, []), "total_count": len(runs)}}
         ev, _ = w.evaluate(20, as_of=as_of)
         return failed(ev)
-
     def test_earlier_unfinished_or_failed_run_blocks(self):
         for name, role in (("sox/review-agent", "review"), ("sox/qa-agent", "qa")):
             for kw in ({"status": "in_progress", "conclusion": None, "completed_at": None},
@@ -594,6 +641,7 @@ class TestMergedRelease(unittest.TestCase):
         w = World()
         w.present_packet(600)
         w.review(AMAN, "APPROVED", 700)
+        w.add_gate_success(R1, 880)
         w.release_merged = True
         ev, ctx = w.evaluate(20)
         ha = Att("human-approval", [("commit", R1), ("pr", "20")],
@@ -880,6 +928,377 @@ class TestPolicyJira(unittest.TestCase):
         for m in bad:
             with self.assertRaises(PolicyError):
                 self._load(m)
+
+def golive_policy(at=1000, rotations=None, **mut):
+    """Trust policy with every App id pinned and a goLive block; rotations: {role: offset}."""
+    with open(os.path.join(SOX, "trust-policy.yaml")) as fh:
+        d = json.load(fh)
+    for role, i in IDS.items():
+        d["apps"][role]["id"] = i
+    keys = {}
+    for role, a in d["apps"].items():
+        if role.startswith("$"):
+            continue
+        keys[a["slug"]] = {"appId": a["id"], "keyFingerprint": "SHA256:" + "A" * 43,
+                           "rotationCompletedAt": t((rotations or {}).get(role, 0))}
+    d["goLive"].update({"at": t(at), "mainSha": M0, "rulesetVersion": 3, "appKeys": keys})
+    for path, value in mut.items():
+        node = d
+        parts = path.split("__")
+        for p in parts[:-1]:
+            node = node[p]
+        node[parts[-1]] = value
+    return Policy(json.dumps(d).encode())
+
+
+class TestPairedChecks(unittest.TestCase):
+    """F16, spec 2.5: an App key can post a success check but cannot sign the attestation it must
+    pair with, so an unpaired success is check-without-evidence and blocks."""
+
+    def _world(self, extra_checks=(), atts=()):
+        w = World()
+        runs = [check("sox/review-agent", "review", 460), check("sox/qa-agent", "qa", 510)]
+        runs += list(extra_checks)
+        w.extra_routes = {f"/repos/{REPO}/commits/{R1}/check-runs": {"check_runs": runs}}
+        w.atts += list(atts)
+        return w
+
+    def test_baseline_is_paired(self):
+        ev, _ = World().evaluate(20)
+        self.assertNotIn("CC-02.check-without-evidence:sox/review-agent", failed(ev))
+        self.assertNotIn("CC-02.check-without-evidence:sox/qa-agent", failed(ev))
+        e = ev.facts["checks"]["sox/review-agent"][0]
+        self.assertTrue(e["paired"])
+        self.assertEqual((e["checkRunId"], e["externalId"]), (460, "460"))
+
+    def test_forged_agent_success_blocks(self):
+        for name, role in (("sox/review-agent", "review"), ("sox/qa-agent", "qa")):
+            w = self._world([check(name, role, 470)])
+            ev, _ = w.evaluate(20)
+            self.assertIn(f"CC-02.check-without-evidence:{name}", failed(ev), name)
+            self.assertNotIn(f"CC-02.check:{name}", failed(ev))
+
+    def test_pairing_mismatches(self):
+        c = check("sox/review-agent", "review", 470)
+        bad = {
+            "other run": paired_att("sox/review-agent", R1, 20, 470, run=999),
+            "other check id": paired_att("sox/review-agent", R1, 20, 471, run=470),
+            "other head": paired_att("sox/review-agent", R2, 20, 470),
+            "not a pass": paired_att("sox/review-agent", R1, 20, 470, verdict="changes_requested"),
+            "other repo": Att("review-verdict", [("commit", R1), ("pr", "20")],
+                              {"prNumber": 20, "headSha": R1, "checkRunId": 470, "verdict": "pass"}, 469),
+        }
+        bad["other repo"].identity = {"runInvocationURI": "https://github.com/evil/fork/actions/runs/470/attempts/1"}
+        for label, att in bad.items():
+            ev, _ = self._world([c], [att]).evaluate(20)
+            self.assertIn("CC-02.check-without-evidence:sox/review-agent", failed(ev), label)
+        ev, _ = self._world([dict(c, external_id="pr-20")],
+                            [paired_att("sox/review-agent", R1, 20, 470)]).evaluate(20)
+        self.assertIn("CC-02.check-without-evidence:sox/review-agent", failed(ev))
+        ev, _ = self._world([c], [paired_att("sox/review-agent", R1, 20, 470)]).evaluate(20)
+        self.assertNotIn("CC-02.check-without-evidence:sox/review-agent", failed(ev))
+
+    def test_run_uri_parsing(self):
+        from soxlib import pairing
+        a = paired_att("sox/review-agent", R1, 20, 470, run=123456789)
+        self.assertEqual(pairing.run_of(a, REPO), ("123456789", 1))
+        a.identity = {"runInvocationURI": run_uri(5, 3) + "/extra"}
+        self.assertIsNone(pairing.run_of(a, REPO))
+
+    def test_forged_gate_success_on_open_head_blocks(self):
+        w = World()
+        w.present_packet(600)
+        w.review(AMAN, "APPROVED", 700)
+        w.add_gate_success(R1, 750, paired=False)
+        ev, _ = w.evaluate(20)
+        self.assertEqual(failed(ev), ["CC-02.check-without-evidence:sox/evidence-gate", "SDLC-09.packet"])
+        w2 = World()
+        w2.present_packet(600)
+        w2.review(AMAN, "APPROVED", 700)
+        w2.add_gate_success(R1, 750)
+        ev, _ = w2.evaluate(20)
+        self.assertTrue(ev.ok, failed(ev))
+
+    def test_gate_failure_runs_need_no_pair(self):
+        w = World()
+        w.gate_runs[R1] = [dict(check("sox/evidence-gate", "gate", 610), conclusion="failure")]
+        ev, _ = w.evaluate(20)
+        self.assertNotIn("CC-02.check-without-evidence:sox/evidence-gate", failed(ev))
+
+    def test_success_gate_decision_signed_every_run_with_check_id(self):
+        w = World()
+        w.present_packet(600)
+        w.review(AMAN, "APPROVED", 700)
+        for cid in (4242, 4243):
+            ev, ctx = w.evaluate(20)
+            ctx.check_run_id = cid
+            gd = [e for e in R.plan_open(ev, ctx) if e.name == "gate-decision"]
+            self.assertEqual(len(gd), 1)
+            self.assertEqual((gd[0].predicate["checkRunId"], gd[0].predicate["conclusion"],
+                              gd[0].predicate["headSha"]), (cid, "success", R1))
+            self.assertIn(("commit", R1), gd[0].subjects)
+            w.atts.append(Att("gate-decision", gd[0].subjects, gd[0].predicate, 710, run=cid))
+
+
+class TestMergeRecordChecks(unittest.TestCase):
+    def _merged(self, paired=True):
+        w = World()
+        w.present_packet(600)
+        w.review(AMAN, "APPROVED", 700)
+        w.gate_runs[R1] = [dict(check("sox/evidence-gate", "gate", 650), conclusion="failure")]
+        w.add_gate_success(R1, 880, paired=paired)
+        w.release_merged = True
+        ev, _ = w.evaluate(20)
+        w.atts.append(Att("human-approval", [("commit", R1), ("pr", "20")],
+                          {"prNumber": 20, "commitId": R1, "baseRef": "refs/heads/main",
+                           "packetDigest": ev.facts["packetDigest"]}, 710))
+        ev, ctx = w.evaluate(20, as_of=T0 + 900)
+        return ev, ctx
+
+    def test_checks_recorded_and_paired(self):
+        ev, ctx = self._merged()
+        self.assertTrue(ev.ok, failed(ev))
+        mr = R.plan_merged(ev, ctx)[0][0].predicate
+        self.assertTrue(mr["checksPaired"])
+        self.assertEqual(mr["outcome"], "recorded")
+        names = [(c["name"], c["checkRunId"]) for c in mr["checks"]]
+        self.assertEqual(names, [("sox/evidence-gate", 880), ("sox/qa-agent", 510),
+                                 ("sox/review-agent", 460)])
+        for c in mr["checks"]:
+            self.assertEqual(set(c), {"name", "checkRunId", "appId", "conclusion", "externalId",
+                                      "pairedAttestation", "paired"})
+            self.assertTrue(c["paired"])
+            self.assertTrue(c["pairedAttestation"].startswith("sha256:"))
+            self.assertEqual(c["externalId"], str(c["checkRunId"]))
+        ras, why = R.release_approvals(ev, ctx, "sha256:mr", mr)
+        self.assertEqual(why, [])
+
+    def test_unpaired_gate_success_blocks_merge_record_and_release_approval(self):
+        ev, ctx = self._merged(paired=False)
+        self.assertIn("CC-02.check:sox/evidence-gate", failed(ev))
+        self.assertIn("CC-02.check-without-evidence:sox/evidence-gate", failed(ev))
+        mr = R.plan_merged(ev, ctx)[0][0].predicate
+        self.assertFalse(mr["checksPaired"])
+        self.assertEqual(mr["outcome"], "fail")
+        ras, why = R.release_approvals(ev, ctx, "sha256:mr", dict(mr, treeMatch=True))
+        self.assertEqual(ras, [])
+        self.assertTrue(any("check-without-evidence" in x for x in why), why)
+
+
+class TestUnattestedJudgingRuns(unittest.TestCase):
+    """F17: a judging run that read an LLM verdict without attesting it from the same run attempt
+    blocks the head, whatever happened to its check run."""
+    STEP = "Review (droid exec, read-only)"
+
+    def _job(self, name, at, step=STEP, attempt=1, step_conclusion="success"):
+        steps = [{"name": "prepare", "status": "completed", "conclusion": "success", "started_at": t(at - 1)}]
+        if step:
+            steps.append({"name": step, "status": "completed", "conclusion": step_conclusion,
+                          "started_at": None if step_conclusion == "skipped" else t(at)})
+        return {"name": name, "run_attempt": attempt, "status": "completed", "conclusion": "success",
+                "started_at": t(at - 2), "steps": steps}
+
+    def _world(self, jobs, wf="sox-review-agent.yml", run=7001, created=450):
+        w = World()
+        w.workflow_runs[wf] = [{"id": run, "path": f".github/workflows/{wf}", "created_at": t(created),
+                                "run_attempt": max(j["run_attempt"] for j in jobs), "display_title": wf}]
+        w.jobs[run] = jobs
+        return w
+
+    def test_unattested_review_run_blocks(self):
+        w = self._world([self._job("review (20)", 455)])
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-06.unattested-judging-run#20", failed(ev))
+        self.assertEqual(ev.facts["judgingRuns"]["review#20"][0]["runId"], "7001")
+
+    def test_attested_from_same_run_passes(self):
+        w = self._world([self._job("review (20)", 455)])
+        w.atts.append(paired_att("sox/review-agent", R1, 20, 9999, run=7001, at=458))
+        ev, _ = w.evaluate(20)
+        self.assertNotIn("SDLC-06.unattested-judging-run#20", failed(ev))
+
+    def test_attested_by_other_attempt_does_not_clear(self):
+        w = self._world([self._job("review (20)", 455, attempt=1), self._job("review (20)", 470, attempt=2)])
+        w.atts.append(paired_att("sox/review-agent", R1, 20, 9999, run=7001, at=475))
+        w.atts[-1].identity = {"runInvocationURI": run_uri(7001, 2)}
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-06.unattested-judging-run#20", failed(ev))
+
+    def test_not_judging_is_ignored(self):
+        cases = [self._job("review (20)", 455, step_conclusion="skipped"),   # nothing to judge
+                 self._job("review (21)", 455),                              # another PR
+                 self._job("review (20)", 300),                              # before this head
+                 self._job("resolve", 455, step=None)]                       # not the judging job
+        for job in cases:
+            ev, _ = self._world([job]).evaluate(20)
+            self.assertNotIn("SDLC-06.unattested-judging-run#20", failed(ev), job["name"])
+
+    def test_qa_run_without_step(self):
+        w = self._world([self._job("qa (20)", 455, step=None)], wf="sox-qa-agent.yml")
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-08.unattested-judging-run#20", failed(ev))
+        w.atts.append(Att("qa-result", [("commit", R1), ("pr", "20")],
+                          {"prNumber": 20, "headSha": R1, "outcome": "fail"}, 458, run=7001))
+        ev, _ = w.evaluate(20)
+        self.assertNotIn("SDLC-08.unattested-judging-run#20", failed(ev))
+        self.assertIn("SDLC-08.qa-any-fail", failed(ev))
+
+    def test_story_pr_is_covered(self):
+        w = self._world([self._job("review (10)", 150)])
+        ev, _ = w.evaluate(10)
+        self.assertIn("SDLC-06.unattested-judging-run#10", failed(ev))
+
+    def test_plain_job_name_is_tied_to_head_by_check_external_id(self):
+        w = self._world([self._job("review", 455)])
+        ev, _ = w.evaluate(20)
+        self.assertNotIn("SDLC-06.unattested-judging-run#20", failed(ev))
+        w.gate_runs.setdefault(R1, []).append(check("sox/review-agent", "review", 455, run=7001))
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-06.unattested-judging-run#20", failed(ev))
+        w.atts.append(paired_att("sox/review-agent", R1, 20, 9999, run=7001, at=458))
+        ev, _ = w.evaluate(20)
+        self.assertNotIn("SDLC-06.unattested-judging-run#20", failed(ev))
+
+    def test_plain_job_name_with_pr_in_run_name(self):
+        w = self._world([self._job("review", 455)])
+        w.workflow_runs["sox-review-agent.yml"][0]["display_title"] = "sox-review-agent pr=20"
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-06.unattested-judging-run#20", failed(ev))
+        w.workflow_runs["sox-review-agent.yml"][0]["display_title"] = "sox-review-agent pr=21"
+        ev, _ = w.evaluate(20)
+        self.assertNotIn("SDLC-06.unattested-judging-run#20", failed(ev))
+
+    def test_judging_after_merge_is_ignored_as_of(self):
+        w = self._world([self._job("review (20)", 950)], created=940)
+        w.add_gate_success(R1, 880)
+        w.release_merged = True
+        ev, _ = w.evaluate(20, as_of=T0 + 900)
+        self.assertNotIn("SDLC-06.unattested-judging-run#20", failed(ev))
+
+    def test_missing_workflow_file_is_no_runs_only_if_repo_readable(self):
+        from soxlib.gate import Context
+
+        class E(Exception):
+            status = 404
+
+        class Api:
+            checked = []
+
+            def paginate(self, path, key=None, limit=None):
+                raise E()
+
+            def require_repo(self, repo):
+                self.checked.append(repo)
+        ctx = Context(policy(), Api(), FakeEvidence([]))
+        self.assertEqual(ctx.workflow_runs(".github/workflows/sox-qa-agent.yml", T0), [])
+        self.assertEqual(Api.checked, [REPO])
+
+        class NoRepo(Api):
+            def require_repo(self, repo):
+                raise RuntimeError("repo not readable")
+        with self.assertRaises(RuntimeError):
+            Context(policy(), NoRepo(), FakeEvidence([])).workflow_runs(".github/workflows/x.yml", T0)
+
+
+class TestGoLiveRotation(unittest.TestCase):
+    """Spec 7.6: rotation is a go-live precondition; a PR merged after go-live must not rely on a
+    pre-rotation App check or push."""
+
+    def test_loader(self):
+        from soxlib.policy import PolicyError
+        p = golive_policy(rotations={"review": 470})
+        self.assertEqual(p.rotation_at("review"), T0 + 470)
+        self.assertEqual(p.go_live_at, T0 + 1000)
+        self.assertIsNone(policy().go_live_at)
+        with self.assertRaises(PolicyError):
+            golive_policy(at=400, rotations={"review": 470})
+        for bad in ({"goLive__mainSha": None}, {"goLive__rulesetVersion": "3"},
+                    {"goLive__at": "not a time"}):
+            with self.assertRaises(PolicyError, msg=str(bad)):
+                golive_policy(**bad)
+        d = json.loads(golive_policy().raw)
+        del d["goLive"]["appKeys"]["acme-sox-gate"]
+        with self.assertRaises(PolicyError):
+            Policy(json.dumps(d).encode())
+        d = json.loads(golive_policy().raw)
+        d["goLive"]["appKeys"]["acme-sox-gate"]["appId"] = 1
+        with self.assertRaises(PolicyError):
+            Policy(json.dumps(d).encode())
+        d = json.loads(golive_policy().raw)
+        d["goLive"]["appKeys"]["acme-sox-gate"]["keyFingerprint"] = "-----BEGIN RSA PRIVATE KEY-----"
+        with self.assertRaises(PolicyError):
+            Policy(json.dumps(d).encode())
+
+    def _world(self, **rot):
+        w = World()
+        w.pol = golive_policy(rotations=rot)
+        return w
+
+    def test_after_rotation_passes(self):
+        ev, _ = self._world(review=200, qa=200, bundler=300).evaluate(20)
+        self.assertEqual(failed(ev), ["SDLC-09.approval"])
+
+    def test_pre_rotation_check_fails_then_clears_on_new_run(self):
+        w = self._world(review=470)
+        ev, _ = w.evaluate(20)
+        self.assertIn("CC-02.app-key-pre-rotation:sox/review-agent", failed(ev))
+        self.assertIn("CC-02.check:sox/review-agent", failed(ev))
+        self.assertEqual([e["checkRunId"] for e in ev.facts["checks"]["sox/review-agent"]
+                          if e["preRotation"]], [460])
+        runs = [check("sox/review-agent", "review", 460), check("sox/qa-agent", "qa", 510),
+                check("sox/review-agent", "review", 520)]
+        w.extra_routes = {f"/repos/{REPO}/commits/{R1}/check-runs": {"check_runs": runs}}
+        w.atts.append(paired_att("sox/review-agent", R1, 20, 520))
+        ev, _ = w.evaluate(20)
+        self.assertNotIn("CC-02.app-key-pre-rotation:sox/review-agent", failed(ev))
+        self.assertNotIn("CC-02.check:sox/review-agent", failed(ev))
+
+    def test_pre_rotation_unpaired_success_is_an_exposure_finding(self):
+        w = self._world(review=470)
+        runs = [check("sox/review-agent", "review", 455), check("sox/review-agent", "review", 460),
+                check("sox/qa-agent", "qa", 510), check("sox/review-agent", "review", 520)]
+        w.extra_routes = {f"/repos/{REPO}/commits/{R1}/check-runs": {"check_runs": runs}}
+        w.atts.append(paired_att("sox/review-agent", R1, 20, 520))
+        ev, _ = w.evaluate(20)
+        self.assertNotIn("CC-02.check-without-evidence:sox/review-agent", failed(ev))
+        self.assertEqual([e["checkRunId"] for e in ev.facts["preRotationUnpaired"]], [455])
+
+    def test_backdated_run_on_post_rotation_head_is_not_set_aside(self):
+        w = self._world(review=300, qa=300, bundler=300)
+        w.release_push_at = 320
+        runs = [check("sox/review-agent", "review", 250), check("sox/review-agent", "review", 460),
+                check("sox/qa-agent", "qa", 510)]
+        w.extra_routes = {f"/repos/{REPO}/commits/{R1}/check-runs": {"check_runs": runs}}
+        ev, _ = w.evaluate(20)
+        self.assertIn("CC-02.check-without-evidence:sox/review-agent", failed(ev))
+        self.assertNotIn("preRotationUnpaired", ev.facts)
+
+    def test_pre_rotation_push_fails_until_new_head(self):
+        w = self._world(bundler=320)
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-05.app-key-pre-rotation#20", failed(ev))
+        w.release_head = R2
+        w.release_push_at = 330
+        w.add_release_evidence(R2, 800)
+        ev, _ = w.evaluate(20)
+        self.assertNotIn("SDLC-05.app-key-pre-rotation#20", failed(ev))
+
+    def test_story_push_carries_into_release(self):
+        w = self._world(dev=150)
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-05.story-pr#10", failed(ev))
+        sp = ev.facts["storyPrs"][0]
+        self.assertIn("SDLC-05.app-key-pre-rotation#10", sp["failed"])
+
+    def test_merged_before_go_live_is_bootstrap(self):
+        w = World()
+        w.present_packet(600)
+        w.review(AMAN, "APPROVED", 700)
+        w.add_gate_success(R1, 880)
+        w.release_merged = True
+        w.pol = golive_policy(at=1000, rotations={"review": 470, "bundler": 320})
+        ev, _ = w.evaluate(20, as_of=T0 + 900)
+        self.assertFalse([f for f in failed(ev) if "app-key-pre-rotation" in f])
 
 class TestScopeMapFile(unittest.TestCase):
     def test_repo_services_yaml_loads_and_digest_is_git_blob(self):

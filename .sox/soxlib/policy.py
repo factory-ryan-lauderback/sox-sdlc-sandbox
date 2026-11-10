@@ -17,6 +17,17 @@ class PolicyError(ValueError):
     pass
 
 
+def _epoch(value, where):
+    import datetime as dt
+    try:
+        t = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        raise PolicyError(f"{where} must be an ISO 8601 timestamp, got {value!r}")
+    if t.tzinfo is None:
+        raise PolicyError(f"{where} must carry a timezone")
+    return t.timestamp()
+
+
 class Policy:
     # Only these files may ever sign evidence. Relays and the observer are dispatch-only by design
     # and must never become signers, even through a policy edit (F12, BP-53b).
@@ -86,6 +97,8 @@ class Policy:
             self.predicate_types[ptype] = name
         self._validate_humans()
         self._validate_jira()
+        self._validate_go_live()
+        self._validate_judging()
 
     def _validate_humans(self):
         humans = self.data.get("humans") or {}
@@ -120,6 +133,51 @@ class Policy:
                     and not re.fullmatch(r"[0-9]{1,12}", str(status)):
                 raise PolicyError(f"jira.approvalStatuses.{kind} must be a numeric status id or null")
 
+    def _validate_go_live(self):
+        """Rotation is a go-live precondition (F16): once goLive.at is set, every App in `apps` needs
+        an appKeys entry (by slug) whose rotationCompletedAt is not after goLive.at."""
+        g = self.data.get("goLive") or {}
+        self._rotation = {}
+        self._go_live_at = None
+        if g.get("at") is None:
+            return
+        at = _epoch(g.get("at"), "goLive.at")
+        if not re.fullmatch(r"[0-9a-f]{40}", str(g.get("mainSha") or "")):
+            raise PolicyError("goLive.mainSha must be a 40-hex commit SHA once goLive.at is set")
+        if not isinstance(g.get("rulesetVersion"), int) or isinstance(g.get("rulesetVersion"), bool):
+            raise PolicyError("goLive.rulesetVersion must be an integer once goLive.at is set")
+        keys = g.get("appKeys")
+        if not isinstance(keys, dict):
+            raise PolicyError("goLive.appKeys must map every App slug to its rotation entry")
+        apps = {r: a for r, a in (self.data.get("apps") or {}).items()
+                if not r.startswith("$") and isinstance(a, dict)}
+        slugs = {a.get("slug"): r for r, a in apps.items()}
+        extra = sorted(k for k in keys if not k.startswith("$") and k not in slugs)
+        if extra:
+            raise PolicyError(f"goLive.appKeys names Apps not in apps: {extra}")
+        for slug, role in sorted(slugs.items()):
+            e = keys.get(slug)
+            if not isinstance(e, dict):
+                raise PolicyError(f"goLive.appKeys.{slug} missing: every App needs a rotation entry")
+            if e.get("appId") is None or e.get("appId") != apps[role].get("id"):
+                raise PolicyError(f"goLive.appKeys.{slug}.appId {e.get('appId')!r} does not match "
+                                  f"apps.{role}.id {apps[role].get('id')!r}")
+            if not re.fullmatch(r"SHA256:[A-Za-z0-9+/=]{20,}", str(e.get("keyFingerprint") or "")):
+                raise PolicyError(f"goLive.appKeys.{slug}.keyFingerprint must be SHA256:<base64>")
+            rot = _epoch(e.get("rotationCompletedAt"), f"goLive.appKeys.{slug}.rotationCompletedAt")
+            if rot > at:
+                raise PolicyError(f"goLive.appKeys.{slug}.rotationCompletedAt is after goLive.at: "
+                                  "rotation must complete before go-live")
+            self._rotation[role] = rot
+        self._go_live_at = at
+
+    def _validate_judging(self):
+        for role, j in (self.data.get("judgingWorkflows") or {}).items():
+            if role.startswith("$"):
+                continue
+            if not isinstance(j, dict) or j.get("workflow") not in self.SIGNER_WORKFLOWS \
+                    or not j.get("job") or not j.get("predicate"):
+                raise PolicyError(f"judgingWorkflows.{role} needs a signer workflow, job and predicate")
     # convenience accessors
     @property
     def repo(self):
@@ -182,3 +240,21 @@ class Policy:
     @property
     def go_live_sha(self):
         return (self.data.get("goLive") or {}).get("mainSha")
+
+    @property
+    def go_live_at(self):
+        """Epoch of goLive.at, or None before go-live (bootstrap)."""
+        return self._go_live_at
+
+    def rotation_at(self, role):
+        """Epoch of the role's App key rotation (goLive.appKeys), or None before go-live."""
+        return self._rotation.get(role)
+
+    def role_of_login(self, login):
+        for role, a in (self.data.get("apps") or {}).items():
+            if isinstance(a, dict) and login and a.get("botLogin") == login:
+                return role
+        return None
+
+    def judging(self, role):
+        return (self.data.get("judgingWorkflows") or {}).get(role)

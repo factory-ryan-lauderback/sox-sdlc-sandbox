@@ -19,6 +19,7 @@
     "code": [
       ".sox/gate.py",
       ".sox/soxlib/gate.py",
+      ".sox/soxlib/pairing.py",
       ".sox/soxlib/records.py",
       ".sox/soxlib/scope.py"
     ],
@@ -28,7 +29,7 @@
       "check_run completed (acme-review-agent, acme-qa-agent only)",
       "schedule every 15 min: all open PRs plus PRs merged into main in the last 2 days"
     ],
-    "check_lifecycle": "created in_progress by the Gate App before the PR is read, completed success/failure only after every record is signed; any error completes it as failure",
+    "check_lifecycle": "created in_progress by the Gate App (external_id = github.run_id) before the PR is read; gate-decision signed with checkRunId = that check run's id (every success is signed, unchanged failures are not re-signed); completed success/failure only after every record is signed; any error completes it as failure",
     "records": {
       "open PR": [
         "gate-decision",
@@ -38,8 +39,8 @@
         "loop-escalation"
       ],
       "merged PR into main": [
-        "merge-record",
-        "release-approval (job release-approval: store copy with sox subjects + registry copy via .github/actions/sox-attest-image)"
+        "merge-record (checks[] {name, checkRunId, appId, conclusion, externalId, pairedAttestation, paired}: the last sox/evidence-gate run before the merge plus every post-rotation sox/review-agent and sox/qa-agent run on the merged head; checksPaired; preRotationChecks[]; outcome fail unless treeMatch, gate as of merge and checksPaired)",
+        "release-approval (only if checksPaired; job release-approval: store copy with sox subjects + registry copy via .github/actions/sox-attest-image)"
       ]
     },
     "rules": {
@@ -50,7 +51,10 @@
       "approval_packet": "human-approval.packet binds releaseManifest (digest of the latest verified release-manifest), stories[], declaredServices[], planDigests; an approval given on an earlier packet for the same head fails with SDLC-09.approval-stale until the new packet is presented and approved (BP-38e)",
       "jira_identities": "Jira identities are Atlassian accountIds. SDLC-01 requirement, SDLC-03b approach and CC-04 ECAB approvals are re-derived from the changelog in the attestation: the latest transition to jira.approvalStatuses[type] (10071, 10082, 10089) after the last change to jira.contentFields (summary, description, Attachment), whose author has accountType atlassian, is listed in jira.humanApprovers[type], is not in jira.neverApprovers or the sharedAutomationAccount, and is not the issue reporter or creator. Agent-created Epics and stories (SDLC-02, SDLC-03) need creator == jira.agentAccounts[role], or creator == jira.sharedAutomationAccount with actingRole == role (issue property sox.actingRole) and actingRoleComment true ([sox:<role>] comment); the shared case is recorded as facts.jiraSharedIdentity (jira-shared-identity) and reported by reconciliation",
       "fixtures": "a verified attestation whose predicate has fixture set to anything but null/false is never evidence: it is dropped before any gate rule, approval, verdict or LOOP-R/LOOP-Q round count, and kept aside for reconciliation to report",
-      "story_type": "SDLC-03.plan requires the story's type in the techlead-plan to be dev or qa; the plan is the only source of the type (never Jira labels or issue types); recorded as facts.storyTypes"
+      "story_type": "SDLC-03.plan requires the story's type in the techlead-plan to be dev or qa; the plan is the only source of the type (never Jira labels or issue types); recorded as facts.storyTypes",
+      "paired_checks": "F16, spec 2.5: every success check run from the pinned App for sox/evidence-gate, sox/review-agent and sox/qa-agent must pair with a verified attestation (gate-decision conclusion success / review-verdict verdict pass / qa-result outcome pass) whose certificate Run Invocation URI (OID 1.3.6.1.4.1.57264.1.21, https://github.com/<repo>/actions/runs/<runId>/attempts/<n>) names the check's external_id, with checkRunId = the check run id and headSha = the check's head. An unpaired success fails CC-02.check-without-evidence:<name>. As of merge, the last sox/evidence-gate run completed before the merge must be a paired success (CC-02.check:sox/evidence-gate).",
+      "unattested_judging_run": "F17: every run of judgingWorkflows[role].workflow (sox-review-agent.yml, sox-qa-agent.yml) whose judging job '<job> (<pr>)' reached its judging step (trust policy judgingWorkflows.<role>.step, or the job itself if null) at or after the current head was pushed must have attested its predicate (review-verdict / qa-result, prNumber = the PR) from the same run id AND attempt; otherwise SDLC-06.unattested-judging-run#<pr> / SDLC-08.unattested-judging-run#<pr> fails and the head is blocked. Runs and jobs are read via the Actions API (workflow runs created since head push minus 6h; more than 1000 fails closed).",
+      "app_key_pre_rotation": "Spec 7.6: once trust-policy goLive.at is set, a PR open or merged at/after go-live fails CC-02.app-key-pre-rotation:<name> when every run of a required check predates that App's goLive.appKeys.<slug>.rotationCompletedAt (pre-rotation runs are set aside; a new paired run after rotation clears it), and SDLC-05.app-key-pre-rotation#<pr> when any PR commit was first pushed by an App before its rotation (cleared only by a new head pushed after rotation). Story PRs carry the rule into the release. Unpaired pre-rotation successes are recorded in facts.preRotationUnpaired as exposure findings. The loader refuses a goLive block missing an App, with rotationCompletedAt > at, appId != apps.<role>.id, or a non SHA256: fingerprint."
     }
   },
   "verifier": {
@@ -96,10 +100,11 @@
     "declared_services": null
   },
   "jira": {
+    "$comment": "Sandbox Jira for test_05. Approvals are status transitions; the gate reads them from the attested changelog (gate.rules.jira_identities).",
     "site": "https://factory-dev-testing.atlassian.net",
     "project": "FRQ",
     "approval_field": "status",
-    "approved_value": "Approved",
+    "approved_value": "Approach Approved",
     "approved_status_id": "10071",
     "approach_approved_status_id": "10082",
     "ecab_approved_status_id": "10089",
@@ -112,7 +117,15 @@
     "acting_role": "sox.actingRole issue property and [sox:<role>] comment prefix (workflow-asserted; one shared agent account)",
     "read_snapshot": ".github/workflows/sox-jira-read.yml (artifact snapshot.json, schema sox-jira-snapshot/v1, output digest)",
     "write_path": ".github/workflows/sox-jira-write.yml",
-    "test_issue": null
+    "test_issue": "FRQ-11",
+    "approved_status_ids": {
+      "Approved": "10071",
+      "Approach Approved": "10082",
+      "ECAB Approved": "10089"
+    },
+    "human_approver_account_ids": [
+      "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+    ]
   },
   "loops": {
     "test_story_key": null
