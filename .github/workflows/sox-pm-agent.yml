@@ -1,0 +1,154 @@
+name: sox-pm-agent
+# SDLC-02 PM Agent: one approved requirement per run becomes Epics. Runs only from main: a 15-minute schedule sweep (no Jira-to-GitHub push exists in the
+# sandbox) and workflow_dispatch with an optional Jira key, which is only a lookup hint.
+#
+#   jira-context (env jira-attestor: Jira read snapshot, digest output)
+#   -> select (no secrets: one work item, context directory + digest)
+#   -> think (env agent-llm: FACTORY_API_KEY only; droid exec read-only on the context as data;
+#      the proposal leaves the job only as a job output)
+#   -> compose (no secrets: fixed rules turn the proposal into Jira operations, digest output)
+#   -> jira (sox-jira-write.yml, role pm fixed here, refuses any ops file but compose's)
+#
+# Nothing here is evidence. sox-jira-attestor.yml signs pm-decomposition from its own Jira read.
+on:
+  schedule:
+    - cron: "4,19,34,49 * * * *"
+  workflow_dispatch:
+    inputs:
+      key:
+        description: "Optional requirement key (FRQ-n). Lookup hint only."
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: sox-pm-agent
+  cancel-in-progress: false
+
+jobs:
+  jira-context:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sox-jira-read.yml
+    with:
+      preset: sweep
+      artifact-name: jira-snapshot-pm
+
+  select:
+    needs: jira-context
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.s.outputs.mode }}
+      key: ${{ steps.s.outputs.key }}
+      context_digest: ${{ steps.s.outputs.context_digest }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: jira-snapshot-pm
+          path: ${{ runner.temp }}/jira
+      - id: s
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          JIRA_SNAPSHOT_DIGEST: ${{ needs.jira-context.outputs.digest }}
+          HINT: ${{ inputs.key }}
+        run: python3 .sox/agents/planning_agent.py select --role pm --snapshot "$RUNNER_TEMP/jira/snapshot.json" --out "$RUNNER_TEMP/ctx" --key "$HINT"
+      - if: steps.s.outputs.mode != 'none'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pm-context
+          path: ${{ runner.temp }}/ctx
+          retention-days: 30
+
+  think:
+    needs: select
+    if: needs.select.outputs.mode == 'llm'
+    runs-on: ubuntu-latest
+    environment: agent-llm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      proposal: ${{ steps.parse.outputs.proposal }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: pm-context
+          path: ${{ runner.temp }}/ctx
+      - name: Check the context is the one select produced
+        env:
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+        run: python3 -c 'import os,sys; sys.path.insert(0,".sox/agents"); import planning_agent as p; sys.exit(p.dir_digest(os.environ["RUNNER_TEMP"]+"/ctx") != os.environ["CONTEXT_DIGEST"])'
+      - name: Install droid
+        uses: ./.github/actions/sox-droid-setup
+      - name: PM Agent (droid exec, read-only)
+        env:
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
+          MODEL: ${{ vars.SOX_PM_MODEL }}
+        working-directory: ${{ runner.temp }}/ctx
+        run: |
+          args=(exec -o json -f "$GITHUB_WORKSPACE/.sox/agents/prompts/pm.md")
+          if [ -n "$MODEL" ]; then args+=(-m "$MODEL"); fi
+          timeout 1200 droid "${args[@]}" > droid.json 2> droid.err || echo "droid exited $?"
+      - id: parse
+        env:
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+        run: python3 .sox/agents/planning_agent.py parse --role pm --dir "$RUNNER_TEMP/ctx"
+
+  compose:
+    needs: [select, think]
+    if: >-
+      always() && needs.select.result == 'success' && needs.select.outputs.mode != 'none' &&
+      (needs.think.result == 'success' || (needs.think.result == 'skipped' && needs.select.outputs.mode == 'finish'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      ops_digest: ${{ steps.c.outputs.ops_digest }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: pm-context
+          path: ${{ runner.temp }}/ctx
+      - id: c
+        env:
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+          PROPOSAL_B64: ${{ needs.think.outputs.proposal }}
+        run: python3 .sox/agents/planning_agent.py compose --role pm --ctx "$RUNNER_TEMP/ctx" --out "$RUNNER_TEMP/ops"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jira-ops-pm
+          path: ${{ runner.temp }}/ops/ops.json
+          retention-days: 30
+
+  jira:
+    needs: compose
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sox-jira-write.yml
+    with:
+      role: pm
+      artifact-pattern: jira-ops-pm
+      ops-digest: ${{ needs.compose.outputs.ops_digest }}

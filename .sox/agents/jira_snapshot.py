@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -21,6 +22,7 @@ from common import JIRA_KEY_RE, now_utc, set_output  # noqa: E402
 
 SCHEMA = "sox-jira-snapshot/v1"
 MAX_ISSUES = 300
+MAX_PLAN_BYTES = 200_000
 SWEEP_STATUSES = ["Approved", "Planning", "Plan Ready", "Approach Approved", "Ready for Dev", "Re-plan",
                   "Blocked - Human Escalation"]
 DONE = ("Done", "Released")
@@ -35,7 +37,23 @@ def _keys_for(j, preset, keys):
                 out.append(p)
         return out
     if preset == "sweep":
-        return [i["key"] for i in j.search(statuses=SWEEP_STATUSES)]
+        # Work items plus what an agent needs to act on them: each Epic's stories and source
+        # requirement, and each item's parent.
+        found = j.search(statuses=SWEEP_STATUSES)
+        out = [i["key"] for i in found]
+        for i in found:
+            extra = [i.get("parent"), i.get("requirementKey")]
+            if i["type"] == "Epic":
+                extra += [s["key"] for s in j.search(parent=i["key"])]
+            for k in extra:
+                if k and k not in out:
+                    out.append(k)
+        for k in list(out):
+            if k not in [i["key"] for i in found]:
+                n = j.get(k)
+                if n["type"] == "Epic" and n.get("requirementKey") and n["requirementKey"] not in out:
+                    out.append(n["requirementKey"])
+        return out
     if preset == "releases":
         unreleased = {v["name"] for v in j.versions() if not v["released"] and not v.get("archived")}
         found = []
@@ -44,6 +62,17 @@ def _keys_for(j, preset, keys):
                 found.append(i["key"])
         return found
     raise SystemExit(f"unknown preset {preset!r}")
+
+
+def latest_plan_md(j, issue):
+    """The Epic's current plan.md (latest attachment by that name), as text, for planning agents."""
+    plans = [a for a in issue.get("attachments") or [] if a["filename"] == "plan.md"]
+    if not plans:
+        return None
+    a = max(plans, key=lambda a: (str(a.get("created") or ""), int(re.sub(r"\D", "", str(a["id"])) or 0)))
+    content = j.attachment_content(issue["key"], a["id"])
+    return {"attachmentId": str(a["id"]), "created": a.get("created"),
+            "sha256": hashlib.sha256(content).hexdigest(), "text": content[:MAX_PLAN_BYTES].decode(errors="replace")}
 
 
 def snapshot_issue(j, key, versions):
@@ -63,6 +92,7 @@ def snapshot_issue(j, key, versions):
         "attachments": n["attachments"],
         "comments": j.comments(key),
         "changelog": j.changelog(key),
+        "planMd": latest_plan_md(j, n) if n["type"] == "Epic" else None,
     }
 
 
