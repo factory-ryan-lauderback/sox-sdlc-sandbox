@@ -56,35 +56,51 @@ def sweep(args):
     print(f"dispatched reviews for PRs {sent}")
 
 
-def _jira_context(binding):
-    """Story/plan context and Jira keys for the PR, read from Jira (never from the PR)."""
-    keys, text = [], []
-    try:
-        import jira_cli
-        j = jira_cli.load()
-    except (Exception, SystemExit) as e:  # Jira unavailable: review continues; the gate enforces the Jira chain.
-        return ([binding["story"]] if binding["story"] else []), f"(Jira unavailable: {type(e).__name__})"
-    stories = []
-    if binding["kind"] == "story" and binding["story"]:
-        stories = [binding["story"]]
+def _slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-")
+
+
+def resolve(args):
+    """Which Jira read the review needs (no secrets): story PRs read their story and epic, release
+    PRs read the release snapshot, anything else reads nothing."""
+    pr = GitHub().pr(positive_int(args.pr, "pr"))
+    b = pr_binding(pr)
+    if b["kind"] == "story" and b["story"]:
+        set_output("preset", "issues"); set_output("keys", b["story"])
+    elif b["kind"] == "release" and b["release"]:
+        set_output("preset", "releases"); set_output("keys", "")
+    else:
+        set_output("preset", "none"); set_output("keys", "")
+
+
+def _jira_context(binding, snapshot_path=None):
+    """Story context and Jira keys for the PR, from the jira-attestor snapshot (never from the PR).
+    The snapshot is accepted only if it matches the digest output of the job that produced it."""
+    fallback = [binding["story"]] if binding["story"] else []
+    if not snapshot_path or not os.path.exists(snapshot_path):
+        return fallback, "(no Jira snapshot)"
+    import jira_snapshot
+    snap = jira_snapshot.load_verified(snapshot_path, os.environ.get("JIRA_SNAPSHOT_DIGEST"))
+    issues = {i["key"]: i for i in snap["issues"]}
+    if binding["kind"] == "story":
+        stories = fallback
     elif binding["kind"] == "release" and binding["release"]:
-        stories = [s["key"] for s in j.search(type="Story", fix_version=binding["release"])]
+        stories = [k for k, i in issues.items() if i["type"]["name"] == "Story"
+                   and any(_slug(v["name"]) == binding["release"] for v in i["fixVersions"])]
+    else:
+        stories = []
+    keys, text = [], []
     for key in stories:
-        try:
-            s = j.get(key)
-        except Exception:
-            text.append(f"## {key}\n(not found in Jira)\n"); keys.append(key); continue
         keys.append(key)
-        text.append(f"## {key}: {s['summary']}\nType: {s.get('storyType')}  Services: {s.get('services')}\n"
-                    f"Required tests: {s.get('requiredTests')}\nDepends on: {s.get('dependsOn')}\n\n{s['description']}\n")
-        if s.get("parent"):
-            try:
-                epic = j.get(s["parent"])
-                plan = [a for a in epic["attachments"] if a["filename"] == "plan.md"]
-                if plan:
-                    text.append(f"### Plan for {epic['key']}\n" + j.attachment_content(epic["key"], plan[-1]["id"]).decode()[:20000])
-            except Exception:
-                pass
+        s = issues.get(key)
+        if not s:
+            text.append(f"## {key}\n(not found in Jira)\n"); continue
+        a = s["properties"].get("sox.agent") or {}
+        text.append(f"## {key}: {s['summary']}\nType: {a.get('storyType')}  Services: {a.get('services')}\n"
+                    f"Required tests: {a.get('requiredTests')}\nDepends on: {a.get('dependsOn')}\n\n{s['description']}\n")
+        epic = issues.get(s.get("parent") or "")
+        if epic:
+            text.append(f"### Epic {epic['key']}: {epic['summary']}\n{epic['description'][:20000]}\n")
     return sorted(set(keys), key=lambda k: int(k.split("-")[1])), "\n".join(text) or "(no Jira context)"
 
 
@@ -172,7 +188,7 @@ def open_(args):
         post("failure", "Segregation of duties", "The Review App authored this PR; it cannot review it.")
         return done("segregation of duties")
 
-    jira_keys, jira_text = _jira_context(binding)
+    jira_keys, jira_text = _jira_context(binding, args.jira_snapshot)
     cid = checks.start(app, CHECK_NAME, head, run_id())
     mode = "too-large" if len(diff) > MAX_DIFF_BYTES else "llm"
     ctx = {"pr": number, "headSha": head, "baseSha": pr["base"]["sha"], "baseRef": binding["baseRef"],
@@ -398,12 +414,14 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("sweep")
+    rs = sub.add_parser("resolve"); rs.add_argument("--pr", required=True)
     o = sub.add_parser("open"); o.add_argument("--pr", required=True); o.add_argument("--out", required=True)
+    o.add_argument("--jira-snapshot")
     q = sub.add_parser("parse"); q.add_argument("--dir", required=True)
     r = sub.add_parser("record"); r.add_argument("--ctx", required=True); r.add_argument("--out", required=True)
     f = sub.add_parser("finish"); f.add_argument("--out", required=True)
     args = ap.parse_args()
-    {"sweep": sweep, "open": open_, "parse": parse, "record": record, "finish": finish}[args.cmd](args)
+    {"sweep": sweep, "resolve": resolve, "open": open_, "parse": parse, "record": record, "finish": finish}[args.cmd](args)
 
 
 if __name__ == "__main__":

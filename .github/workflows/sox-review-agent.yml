@@ -28,11 +28,6 @@ concurrency:
   group: sox-review-agent-${{ inputs.pr || 'sweep' }}
   cancel-in-progress: false
 
-env:
-  SOX_JIRA_BACKEND: ${{ vars.SOX_JIRA_BACKEND || 'file' }}
-  SOX_JIRA_STORE_BRANCH: sox-jira-fake
-  SOX_JIRA_FILE: ${{ github.workspace }}/../jira-fake/jira.json
-
 jobs:
   sweep:
     if: github.event_name == 'schedule'
@@ -53,10 +48,47 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 .sox/agents/review_agent.py sweep
 
+  resolve:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      preset: ${{ steps.r.outputs.preset }}
+      keys: ${{ steps.r.outputs.keys }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: r
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_PR: ${{ inputs.pr }}
+        run: python3 .sox/agents/review_agent.py resolve --pr "$INPUT_PR"
+
+  # Jira is read only in env jira-attestor. A failure here happens before judging: no check run.
+  jira-context:
+    needs: resolve
+    if: needs.resolve.outputs.preset != 'none'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sox-jira-read.yml
+    with:
+      preset: ${{ needs.resolve.outputs.preset }}
+      keys: ${{ needs.resolve.outputs.keys }}
+      artifact-name: jira-snapshot-review
+
   # Key-holding: Review App token. Decides whether this head is judged and, if so, opens the binding
   # check run before the model sees anything.
   open:
-    if: github.event_name == 'workflow_dispatch'
+    needs: [resolve, jira-context]
+    if: >-
+      always() && github.event_name == 'workflow_dispatch' && needs.resolve.result == 'success' &&
+      (needs.jira-context.result == 'success' || needs.jira-context.result == 'skipped')
     runs-on: ubuntu-latest
     environment: agent-review
     timeout-minutes: 10
@@ -78,6 +110,11 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - if: needs.jira-context.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: jira-snapshot-review
+          path: ${{ runner.temp }}/jira
       - id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
@@ -89,7 +126,8 @@ jobs:
           APP_TOKEN: ${{ steps.app.outputs.token }}
           REVIEWER_APP_ID: ${{ vars.REVIEW_APP_ID }}
           INPUT_PR: ${{ inputs.pr }}
-        run: python3 .sox/agents/review_agent.py open --pr "$INPUT_PR" --out "$RUNNER_TEMP/review"
+          JIRA_SNAPSHOT_DIGEST: ${{ needs.jira-context.outputs.digest }}
+        run: python3 .sox/agents/review_agent.py open --pr "$INPUT_PR" --out "$RUNNER_TEMP/review" --jira-snapshot "$RUNNER_TEMP/jira/snapshot.json"
       # Public PR data only (diff, context); no verdict exists yet.
       - if: steps.open.outputs.check_run_id != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -230,7 +268,7 @@ jobs:
 
   jira:
     needs: [open, record]
-    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && needs.open.result == 'success' }}
     permissions:
       contents: read
     uses: ./.github/workflows/sox-jira-write.yml
