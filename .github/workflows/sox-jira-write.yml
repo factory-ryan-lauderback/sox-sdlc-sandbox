@@ -1,0 +1,60 @@
+name: sox-jira-write
+# The only path that writes Jira. Called by agent workflows with a fixed role literal and the name
+# pattern of artifacts holding operation lists. Runs in the main-only jira-attestor environment.
+# Fake backend: compare-and-swap writes of jira.json on branch sox-jira-fake with the
+# acme-jira-attestor App token. Cloud backend: the role's own Jira API token.
+on:
+  workflow_call:
+    inputs:
+      role:
+        type: string
+        required: true
+      artifact-pattern:
+        type: string
+        required: true
+permissions: {}
+jobs:
+  write:
+    runs-on: ubuntu-latest
+    environment: jira-attestor
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    concurrency:
+      group: sox-jira-write
+      cancel-in-progress: false
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ${{ inputs.artifact-pattern }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/ops
+      - id: app
+        if: (vars.SOX_JIRA_BACKEND || 'file') == 'file'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.JIRA_ATTESTOR_APP_ID }}
+          private-key: ${{ secrets.JIRA_ATTESTOR_APP_PRIVATE_KEY }}
+      - name: Apply operations
+        env:
+          ROLE: ${{ inputs.role }}
+          SOX_JIRA_BACKEND: ${{ vars.SOX_JIRA_BACKEND || 'file' }}
+          SOX_JIRA_STORE_BRANCH: sox-jira-fake
+          SOX_JIRA_STORE_TOKEN: ${{ steps.app.outputs.token }}
+          SOX_JIRA_FILE: ${{ runner.temp }}/jira-fake/jira.json
+          SOX_JIRA_EMAIL: ${{ vars[format('JIRA_EMAIL_{0}', inputs.role)] }}
+          JIRA_API_TOKEN: ${{ secrets[format('JIRA_API_TOKEN_{0}', inputs.role)] }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          files=("$RUNNER_TEMP"/ops/*.json)
+          echo "${#files[@]} operation file(s)"
+          for f in "${files[@]}"; do
+            python3 .sox/agents/jira_cli.py apply --ops "$f" --role "$ROLE" --message "$(basename "$f")"
+          done

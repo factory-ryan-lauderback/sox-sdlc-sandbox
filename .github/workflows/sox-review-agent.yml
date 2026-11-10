@@ -1,0 +1,208 @@
+name: sox-review-agent
+# SDLC-06 Review Agent. Runs only from main (workflow_dispatch from the secret-less relay or a human,
+# and a schedule sweep). Not triggered by pull_request_target directly: for story PRs that event runs
+# the base branch's (release/*) copy of this file, whose certificate ref would not be refs/heads/main.
+# No job checks out or executes PR code; the diff is fetched through the API as data.
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number. Lookup key only; everything else is re-read from the API."
+        required: true
+        type: string
+  schedule:
+    - cron: "11,41 * * * *"
+
+permissions: {}
+
+concurrency:
+  group: sox-review-agent-${{ inputs.pr || 'sweep' }}
+  cancel-in-progress: false
+
+env:
+  SOX_JIRA_BACKEND: ${{ vars.SOX_JIRA_BACKEND || 'file' }}
+  SOX_JIRA_STORE_BRANCH: sox-jira-fake
+  SOX_JIRA_FILE: ${{ github.workspace }}/../jira-fake/jira.json
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    outputs:
+      prs: ${{ steps.r.outputs.prs }}
+      fixture: ${{ steps.r.outputs.fixture }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: r
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_PR: ${{ inputs.pr }}
+        run: python3 .sox/agents/review_agent.py resolve
+
+  # Temporary: mints .sox/testdata/good-review-verdict.bundle.json (dispatch with pr=0). Fixed subjects
+  # pr:0 and commit:4de6278..., which no real PR can bind to. Removed once the bundle is committed.
+  testdata-fixture:
+    needs: resolve
+    if: needs.resolve.outputs.fixture == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 .sox/agents/review_agent.py fixture --out out
+      - id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: out/subjects.txt
+          predicate-type: https://acme-lending.example/sox/review-verdict/v1
+          predicate-path: out/predicate.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: good-review-verdict-bundle
+          path: ${{ steps.attest.outputs.bundle-path }}
+
+  # LLM job: FACTORY_API_KEY and a read-only GITHUB_TOKEN only. No App key, no id-token.
+  review:
+    needs: resolve
+    # Skipping this job never yields a skipped required check: sox/review-agent is a check run the
+    # Review App creates in the record job, so no run means the check stays expected (blocked).
+    if: needs.resolve.outputs.prs != '[]' && needs.resolve.outputs.prs != ''
+    runs-on: ubuntu-latest
+    environment: agent-llm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        pr: ${{ fromJSON(needs.resolve.outputs.prs) }}
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: prep
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ matrix.pr }}
+        run: python3 .sox/agents/review_agent.py prepare --pr "$PR" --out "$RUNNER_TEMP/review"
+      - name: Install droid
+        if: steps.prep.outputs.mode == 'llm'
+        uses: ./.github/actions/sox-droid-setup
+      - name: Review (droid exec, read-only)
+        if: steps.prep.outputs.mode == 'llm'
+        continue-on-error: true
+        env:
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
+          MODEL: ${{ vars.SOX_REVIEW_MODEL }}
+        working-directory: ${{ runner.temp }}/review
+        run: |
+          args=(exec -o json -f "$GITHUB_WORKSPACE/.sox/agents/prompts/review.md")
+          if [ -n "$MODEL" ]; then args+=(-m "$MODEL"); fi
+          timeout 1200 droid "${args[@]}" > droid.json || echo "droid exited $?"
+      - name: Parse verdict
+        run: python3 .sox/agents/review_agent.py parse --dir "$RUNNER_TEMP/review"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: review-${{ matrix.pr }}
+          path: |
+            ${{ runner.temp }}/review/context.json
+            ${{ runner.temp }}/review/verdict.json
+          retention-days: 30
+
+  # Key-holding job: Review App token, id-token, attestations. Checks out main only; reads the PR via API.
+  record:
+    needs: [resolve, review]
+    runs-on: ubuntu-latest
+    environment: agent-review
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        pr: ${{ fromJSON(needs.resolve.outputs.prs) }}
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: review-${{ matrix.pr }}
+          path: ${{ runner.temp }}/review
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.REVIEW_APP_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+      - id: rec
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          REVIEWER_APP_ID: ${{ vars.REVIEW_APP_ID }}
+          REVIEWER_APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: python3 .sox/agents/review_agent.py record --dir "$RUNNER_TEMP/review" --out "$RUNNER_TEMP/out"
+      - name: Open check run
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 .sox/agents/review_agent.py check-start --out "$RUNNER_TEMP/out"
+      - id: attest
+        if: steps.rec.outputs.attest == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/out/subjects.txt
+          predicate-type: https://acme-lending.example/sox/review-verdict/v1
+          predicate-path: ${{ runner.temp }}/out/predicate.json
+      - name: Complete check run
+        if: always()
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: python3 .sox/agents/review_agent.py check-finish --out "$RUNNER_TEMP/out"
+      - name: Stage Jira operations
+        if: always()
+        env:
+          PR: ${{ matrix.pr }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/jira-out"
+          if [ -f "$RUNNER_TEMP/out/jira-ops.json" ]; then cp "$RUNNER_TEMP/out/jira-ops.json" "$RUNNER_TEMP/jira-out/review-pr-$PR.json"; else echo '[]' > "$RUNNER_TEMP/jira-out/review-pr-$PR.json"; fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: jira-ops-review-${{ matrix.pr }}
+          path: ${{ runner.temp }}/jira-out/
+          retention-days: 30
+
+  jira:
+    needs: [resolve, record]
+    if: ${{ !cancelled() && needs.resolve.outputs.prs != '[]' && needs.resolve.outputs.prs != '' }}
+    uses: ./.github/workflows/sox-jira-write.yml
+    with:
+      role: review
+      artifact-pattern: jira-ops-review-*

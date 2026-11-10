@@ -1,0 +1,22 @@
+name: sox-droid-setup
+description: Install the droid CLI. Guardrail hooks, when used, come from the main checkout, never from PR code.
+inputs:
+  hooks:
+    description: "Path (in the main checkout) of a hooks.json to install at user level, or empty"
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        HOOKS: ${{ inputs.hooks }}
+      run: |
+        curl -fsSL https://app.factory.ai/cli | sh
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        "$HOME/.local/bin/droid" --version
+        if [ -n "$HOOKS" ]; then
+          mkdir -p "$HOME/.factory"
+          sed "s#__SOX_HOOKS_DIR__#$GITHUB_WORKSPACE/.factory/hooks#g" "$HOOKS" > "$HOME/.factory/hooks.json"
+          echo "installed guardrail hooks from $HOOKS"
+        fi

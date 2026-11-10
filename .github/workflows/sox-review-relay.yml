@@ -1,0 +1,21 @@
+name: sox-review-relay
+# Secret-less relay. pull_request_target runs this file from the PR's base branch, so it does nothing
+# but dispatch sox-review-agent.yml on main with the PR number as a lookup key. It never checks out
+# code and passes no other event data. A dropped relay leaves sox/review-agent expected; the
+# schedule sweep in sox-review-agent.yml picks the PR up.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+permissions: {}
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          case "$PR" in ''|*[!0-9]*) echo "bad PR number"; exit 1;; esac
+          gh workflow run sox-review-agent.yml --repo "$GITHUB_REPOSITORY" --ref main -f pr="$PR"
