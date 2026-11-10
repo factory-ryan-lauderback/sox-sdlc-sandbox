@@ -463,6 +463,21 @@
     "sox/qa-agent": "qa",
     "sox/evidence-gate": "gate"
   },
+  "judgingWorkflows": {
+    "$comment": "F17: every run of these workflows whose judging step started on the current head must have attested its predicate from the same run attempt (cert Run Invocation URI), else unattested-judging-run blocks the head. The judging job is '<job> (<pr>)', or '<job>' tied to the PR by a 'pr=<n>' run-name or by a check run on the head whose external_id is the run id; step null means the job itself.",
+    "review": {
+      "workflow": ".github/workflows/sox-review-agent.yml",
+      "job": "review",
+      "step": "Review (droid exec, read-only)",
+      "predicate": "review-verdict"
+    },
+    "qa": {
+      "workflow": ".github/workflows/sox-qa-agent.yml",
+      "job": "qa",
+      "step": null,
+      "predicate": "qa-result"
+    }
+  },
   "pushers": {
     "story": [
       "dev",
@@ -574,9 +589,11 @@
     "maxQaRounds": 10
   },
   "goLive": {
-    "$comment": "Set at the coordinated go-live. First-parent commits on main up to and including this SHA are labelled bootstrap by the reconciler.",
+    "$comment": "Set at the coordinated go-live, after every App key is rotated (evidence spec 7.6). First-parent commits on main up to and including mainSha are labelled bootstrap by the reconciler. While at is null the policy is in bootstrap and app-key-pre-rotation is not evaluated. Once at is set the loader requires mainSha, rulesetVersion and one appKeys entry per App slug in apps {appId (= apps.<role>.id), keyFingerprint SHA256:..., rotationCompletedAt <= at}; IDs and fingerprints only, never key material.",
     "mainSha": null,
-    "at": null
+    "at": null,
+    "rulesetVersion": null,
+    "appKeys": {}
   },
   "evidenceStore": {
     "repo": "factory-ryan-lauderback/sox-sdlc-evidence",

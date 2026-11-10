@@ -100,12 +100,13 @@ def requirement_key(ev):
 
 # ---------- open PR ----------
 
-def gate_decision(ev, forgeries):
+def gate_decision(ev, forgeries, check_run_id=None):
     f = ev.facts
     p = common(ev, "SDLC-10" if ev.kind in ("release", "emergency") else "SDLC-05",
                "pass" if ev.ok else "fail", upstream=f["upstream"].values(),
                inputs=[{"name": "trust-policy", "digest": {"sha256": ev.policy.digest.split(":")[1]}}])
-    p.update({"check": "sox/evidence-gate", "conclusion": "success" if ev.ok else "failure",
+    p.update({"check": "sox/evidence-gate", "checkRunId": check_run_id,
+              "conclusion": "success" if ev.ok else "failure",
               "kind": ev.kind, "requirements": [r.to_json() for r in ev.reqs],
               "requirementsDigest": requirement_key(ev),
               "policyDigest": ev.policy.digest, "packetDigest": f.get("packetDigest"),
@@ -192,11 +193,13 @@ def plan_open(ev, ctx):
     forgeries = ctx.ev.forgeries()
     prev = ctx.ev.latest("pr", pd.number, "gate-decision",
                          where=lambda a: a.predicate.get("headSha") == pd.head)
-    if prev is None or (prev.predicate.get("requirementsDigest"),
+    # A success check run must pair with a gate-decision from its own run (spec 2.5), so a
+    # success is signed every time; an unchanged failure is not signed again.
+    if ev.ok or prev is None or (prev.predicate.get("requirementsDigest"),
                         prev.predicate.get("packetDigest"),
                         prev.predicate.get("conclusion")) != (
             requirement_key(ev), ev.facts.get("packetDigest"), "success" if ev.ok else "failure"):
-        out.append(gate_decision(ev, forgeries))
+        out.append(gate_decision(ev, forgeries, getattr(ctx, "check_run_id", None)))
     if ev.kind in ("story", "emergency"):
         if ctx.ev.latest("commit", pd.head, "dev-change",
                          where=lambda a: a.predicate.get("prNumber") == pd.number) is None:
@@ -226,6 +229,25 @@ def plan_open(ev, ctx):
 
 # ---------- merged release / emergency PR ----------
 
+def merge_checks(ev):
+    """merge-record.checks[] (spec 2.5): for sox/evidence-gate the last run completed before the
+    merge (the one the ruleset relied on); for agent checks every run on the merged head, since
+    each binds it. Runs set aside as pre-rotation are listed separately."""
+    out, pre = [], []
+    keep = ("name", "checkRunId", "appId", "conclusion", "externalId", "pairedAttestation", "paired")
+    for name in sorted(ev.policy.data.get("requiredChecks") or {}):
+        entries = [e for e in (ev.facts.get("checks") or {}).get(name, [])
+                   if e.get("headSha") == ev.pd.head]
+        pre += [{k: e[k] for k in keep} for e in entries if e.get("preRotation")]
+        post = [e for e in entries if not e.get("preRotation")]
+        if name == "sox/evidence-gate":
+            post = post[-1:]
+        out += [{k: e[k] for k in keep} for e in post]
+    names = set(ev.policy.data.get("requiredChecks") or {})
+    paired = (bool(out) and all(e["paired"] for e in out)
+              and names <= {e["name"] for e in out})
+    return out, pre, paired
+
 def merge_record(ev, mirror):
     pd = ev.pd
     merge = pd.pr["merge_commit_sha"]
@@ -234,12 +256,14 @@ def merge_record(ev, mirror):
     parents = mirror.parents(merge)
     tree, htree = mirror.tree(merge), mirror.tree(pd.head)
     match = tree == htree and len(parents) == 2 and parents[1] == pd.head
-    p = common(ev, "SDLC-10", "recorded" if match and ev.ok else "fail",
+    checks, pre_checks, paired = merge_checks(ev)
+    p = common(ev, "SDLC-10", "recorded" if match and ev.ok and paired else "fail",
                upstream=ev.facts["upstream"].values())
     p.update({"mergeCommitSha": merge, "parents": parents, "treeSha": tree,
               "approvedHeadSha": pd.head, "approvedHeadTreeSha": htree, "treeMatch": match,
               "mergedBy": (pd.pr.get("merged_by") or {}).get("login"),
               "mergedAt": pd.pr.get("merged_at"),
+              "checks": checks, "checksPaired": paired, "preRotationChecks": pre_checks,
               "gateAsOfMerge": {"result": "pass" if ev.ok else "fail",
                                 "failed": [r.id for r in ev.reqs if not r.ok],
                                 "requirementsDigest": requirement_key(ev)}})
@@ -267,6 +291,11 @@ def release_approvals(ev, ctx, mr_digest, mr_predicate):
         why.append("gate re-evaluation as of merge fails: " + str([r.id for r in ev.reqs if not r.ok]))
     if not (mr_predicate or {}).get("treeMatch"):
         why.append("merge-record treeMatch is not true")
+    if not (mr_predicate or {}).get("checksPaired"):
+        unpaired = [f"{c.get('name')}#{c.get('checkRunId')}" for c in (mr_predicate or {}).get("checks") or []
+                    if not c.get("paired")]
+        why.append("merge-record checks are not all paired with attestations from their own runs "
+                   f"(check-without-evidence): {unpaired or 'no checks recorded'}")
     ha = ctx.ev.latest("commit", pd.head, "human-approval",
                        where=lambda a: a.predicate.get("prNumber") == pd.number
                        and a.predicate.get("commitId") == pd.head
