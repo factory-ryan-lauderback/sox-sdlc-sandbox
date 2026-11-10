@@ -2,12 +2,21 @@ name: sox-admission-demo
 # Demonstrates production admission control (deploy/kyverno/prod-policy.yaml) on a fresh kind
 # cluster: only images built by sox-env-deploy.yml on main AND release-approved by sox-gate.yml on
 # main are admitted. Holds no signing permissions (no id-token, no attestations:write), so it can
-# never create evidence; its run log and summary are the demonstration record.
+# never create evidence; its run log and summary are the demonstration record. Not a signer, so
+# a push trigger is acceptable here.
 # Cases come from deploy/kyverno/testdata/admission-cases.json and from verified evidence.
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "15 6 * * 1"
+    - cron: "15 6 * * *"
+  # Re-run whenever the admission policy, its cases, or this demo change on main.
+  push:
+    branches: [main]
+    paths:
+      - deploy/kyverno/**
+      - tools/sox_release/admission.py
+      - .github/actions/sox-env-up/**
+      - .github/workflows/sox-admission-demo.yml
 
 permissions: {}
 
