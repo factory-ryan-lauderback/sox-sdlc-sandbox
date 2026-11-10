@@ -19,6 +19,13 @@ on:
         type: string
         required: false
         default: ""
+    secrets:
+      # Environment secrets reach a reusable workflow only if the caller passes them by name; the
+      # values used are still the ones in env jira-attestor (main only).
+      JIRA_API_TOKEN:
+        required: false
+      JIRA_ATTESTOR_APP_PRIVATE_KEY:
+        required: false
 permissions: {}
 jobs:
   write:
