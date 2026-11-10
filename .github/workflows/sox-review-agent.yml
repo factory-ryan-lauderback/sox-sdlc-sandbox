@@ -1,11 +1,16 @@
 name: sox-review-agent
-# SDLC-06 Review Agent. Runs only from main (workflow_dispatch from the secret-less relay or a human,
-# and a schedule sweep). Not triggered by pull_request_target directly: for story PRs that event runs
-# the base branch's (release/*) copy of this file, whose certificate ref would not be refs/heads/main.
+# SDLC-06 Review Agent. Runs only from main: workflow_dispatch (from the secret-less relay, the
+# schedule sweep, or a human) for exactly one PR, plus a schedule sweep that only dispatches.
+# Not triggered by pull_request_target directly: for story PRs that event runs the base branch's
+# (release/*) copy of this file, whose certificate ref would not be refs/heads/main.
 # No job checks out or executes PR code; the diff is fetched through the API as data.
-# Check runs follow .sox/agents/checks.py: one is created only for a verdict about to be attested.
-# A head whose sox/review-agent run ended non-success without an attested verdict is blocked for
-# good (gate F13); recovery is a new commit, which then needs its own review, QA and approval.
+#
+# Signing order (gate F13/F16, red team F17): `open` creates the in_progress sox/review-agent check
+# run (external_id = this run's ID) BEFORE the model runs. The verdict travels to `record` only as a
+# job output, is attested with that checkRunId, and only then does `finish` complete the check with
+# the verdict's conclusion and publish the reasoning. Anything else (cancel, timeout, model error,
+# invalid verdict, attest failure) leaves the run failed or unfinished, which blocks the head.
+# Recovery for a blocked head is a new commit, which then needs its own review, QA and approval.
 on:
   workflow_dispatch:
     inputs:
@@ -18,8 +23,7 @@ on:
 
 permissions: {}
 
-# Never cancel-in-progress: every Review App check run on a head binds it (gate F13), so a cancelled
-# run would block the head until a new commit. Queued runs replaced in a group never opened a check run.
+# Never cancel-in-progress: a cancelled run after `open` would block the head (F13).
 concurrency:
   group: sox-review-agent-${{ inputs.pr || 'sweep' }}
   cancel-in-progress: false
@@ -30,14 +34,14 @@ env:
   SOX_JIRA_FILE: ${{ github.workspace }}/../jira-fake/jira.json
 
 jobs:
-  resolve:
+  sweep:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
       checks: read
-    outputs:
-      prs: ${{ steps.r.outputs.prs }}
+      actions: write
     steps:
       - name: Refuse to run outside main
         run: test "$GITHUB_REF" = "refs/heads/main"
@@ -45,29 +49,28 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - id: r
-        env:
+      - env:
           GITHUB_TOKEN: ${{ github.token }}
-          INPUT_PR: ${{ inputs.pr }}
-        run: python3 .sox/agents/review_agent.py resolve
+        run: python3 .sox/agents/review_agent.py sweep
 
-  # LLM job: FACTORY_API_KEY and a read-only GITHUB_TOKEN only. No App key, no id-token.
-  review:
-    needs: resolve
-    # Skipping this job never yields a skipped required check: sox/review-agent is a check run the
-    # Review App creates in the record job, so no run means the check stays expected (blocked).
-    if: needs.resolve.outputs.prs != '[]' && needs.resolve.outputs.prs != ''
+  # Key-holding: Review App token. Decides whether this head is judged and, if so, opens the binding
+  # check run before the model sees anything.
+  open:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    environment: agent-llm
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        pr: ${{ fromJSON(needs.resolve.outputs.prs) }}
+    environment: agent-review
+    timeout-minutes: 10
+    concurrency:
+      group: sox-review-open-${{ inputs.pr }}
+      cancel-in-progress: false
     permissions:
       contents: read
       pull-requests: read
+      checks: read
+    outputs:
+      mode: ${{ steps.open.outputs.mode }}
+      check_run_id: ${{ steps.open.outputs.check_run_id }}
+      context_digest: ${{ steps.open.outputs.context_digest }}
     steps:
       - name: Refuse to run outside main
         run: test "$GITHUB_REF" = "refs/heads/main"
@@ -75,17 +78,66 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - id: prep
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.REVIEW_APP_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+      - id: open
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ matrix.pr }}
-        run: python3 .sox/agents/review_agent.py prepare --pr "$PR" --out "$RUNNER_TEMP/review"
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          REVIEWER_APP_ID: ${{ vars.REVIEW_APP_ID }}
+          INPUT_PR: ${{ inputs.pr }}
+        run: python3 .sox/agents/review_agent.py open --pr "$INPUT_PR" --out "$RUNNER_TEMP/review"
+      # Public PR data only (diff, context); no verdict exists yet.
+      - if: steps.open.outputs.check_run_id != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: review-context
+          path: |
+            ${{ runner.temp }}/review/context.json
+            ${{ runner.temp }}/review/context.md
+            ${{ runner.temp }}/review/pr.diff
+          retention-days: 30
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jira-ops-review-open
+          path: ${{ runner.temp }}/review/jira-ops.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # LLM job: FACTORY_API_KEY and a read-only GITHUB_TOKEN only. No App key, no id-token. The verdict
+  # leaves this job only as a job output; nothing about it is printed or uploaded.
+  review:
+    needs: open
+    if: needs.open.outputs.mode == 'llm'
+    runs-on: ubuntu-latest
+    environment: agent-llm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      verdict: ${{ steps.parse.outputs.verdict }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: review-context
+          path: ${{ runner.temp }}/review
+      - name: Check the context is the one the open job produced
+        env:
+          WANT: ${{ needs.open.outputs.context_digest }}
+        run: test "sha256:$(sha256sum "$RUNNER_TEMP/review/context.json" | cut -d' ' -f1)" = "$WANT"
       - name: Install droid
-        if: steps.prep.outputs.mode == 'llm'
         uses: ./.github/actions/sox-droid-setup
       - name: Review (droid exec, read-only)
-        if: steps.prep.outputs.mode == 'llm'
         continue-on-error: true
         env:
           FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
@@ -94,32 +146,23 @@ jobs:
         run: |
           args=(exec -o json -f "$GITHUB_WORKSPACE/.sox/agents/prompts/review.md")
           if [ -n "$MODEL" ]; then args+=(-m "$MODEL"); fi
-          timeout 1200 droid "${args[@]}" > droid.json || echo "droid exited $?"
-      - name: Parse verdict
+          timeout 1200 droid "${args[@]}" > droid.json 2> droid.err || echo "droid exited $?"
+      - id: parse
+        name: Parse verdict
+        env:
+          CONTEXT_DIGEST: ${{ needs.open.outputs.context_digest }}
         run: python3 .sox/agents/review_agent.py parse --dir "$RUNNER_TEMP/review"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: review-${{ matrix.pr }}
-          path: |
-            ${{ runner.temp }}/review/context.json
-            ${{ runner.temp }}/review/verdict.json
-          retention-days: 30
 
-  # Key-holding job: Review App token, id-token, attestations. Checks out main only; reads the PR via API.
+  # Key-holding: Review App token, id-token, attestations. Checks out main only; reads the PR via API.
   record:
-    needs: [resolve, review]
+    needs: [open, review]
+    if: always() && needs.open.outputs.check_run_id != ''
     runs-on: ubuntu-latest
     environment: agent-review
     timeout-minutes: 15
-    # One judging job per PR at a time across dispatch and sweep runs, so two runs never both see
-    # "no verdict yet" for the same head.
     concurrency:
-      group: sox-review-record-${{ matrix.pr }}
+      group: sox-review-record-${{ inputs.pr }}
       cancel-in-progress: false
-    strategy:
-      fail-fast: false
-      matrix:
-        pr: ${{ fromJSON(needs.resolve.outputs.prs) }}
     permissions:
       contents: read
       pull-requests: read
@@ -135,7 +178,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: review-${{ matrix.pr }}
+          name: review-context
           path: ${{ runner.temp }}/review
       - id: app
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -145,16 +188,13 @@ jobs:
       - id: rec
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          GH_TOKEN: ${{ github.token }}
           REVIEWER_APP_ID: ${{ vars.REVIEW_APP_ID }}
           REVIEWER_APP_SLUG: ${{ steps.app.outputs.app-slug }}
-        run: python3 .sox/agents/review_agent.py record --dir "$RUNNER_TEMP/review" --out "$RUNNER_TEMP/out"
-      # Everything that can fail for infrastructure reasons runs before this step, which opens the
-      # check run only for an attest action. No check run means the head stays reviewable.
-      - name: Open check run
-        env:
-          APP_TOKEN: ${{ steps.app.outputs.token }}
-        run: python3 .sox/agents/review_agent.py check-start --out "$RUNNER_TEMP/out"
+          OPEN_CONTEXT_DIGEST: ${{ needs.open.outputs.context_digest }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          VERDICT_B64: ${{ needs.review.outputs.verdict }}
+          SOX_REVIEW_MODEL: ${{ vars.SOX_REVIEW_MODEL }}
+        run: python3 .sox/agents/review_agent.py record --ctx "$RUNNER_TEMP/review" --out "$RUNNER_TEMP/out"
       - id: attest1
         if: steps.rec.outputs.attest == 'true'
         continue-on-error: true
@@ -163,7 +203,6 @@ jobs:
           subject-checksums: ${{ runner.temp }}/out/subjects.txt
           predicate-type: https://acme-lending.example/sox/review-verdict/v1
           predicate-path: ${{ runner.temp }}/out/predicate.json
-      # One retry: once the check run is open, a failed attest blocks the head for good.
       - id: attest2
         if: steps.rec.outputs.attest == 'true' && steps.attest1.outcome == 'failure'
         continue-on-error: true
@@ -172,30 +211,26 @@ jobs:
           subject-checksums: ${{ runner.temp }}/out/subjects.txt
           predicate-type: https://acme-lending.example/sox/review-verdict/v1
           predicate-path: ${{ runner.temp }}/out/predicate.json
+      # Runs whatever happened above: without a plan the check run completes as failure.
       - name: Complete check run
-        if: always() && steps.rec.outcome == 'success'
+        if: always() && steps.app.outcome == 'success'
         env:
           APP_TOKEN: ${{ steps.app.outputs.token }}
+          CHECK_RUN_ID: ${{ needs.open.outputs.check_run_id }}
           ATTEST_OUTCOME: ${{ steps.attest1.outcome == 'success' && 'success' || steps.attest2.outcome }}
           ATTESTATION_URL: ${{ steps.attest1.outputs.attestation-url || steps.attest2.outputs.attestation-url }}
-        run: python3 .sox/agents/review_agent.py check-finish --out "$RUNNER_TEMP/out"
-      - name: Stage Jira operations
-        if: always()
-        env:
-          PR: ${{ matrix.pr }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/jira-out"
-          if [ -f "$RUNNER_TEMP/out/jira-ops.json" ]; then cp "$RUNNER_TEMP/out/jira-ops.json" "$RUNNER_TEMP/jira-out/review-pr-$PR.json"; else echo '[]' > "$RUNNER_TEMP/jira-out/review-pr-$PR.json"; fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always()
+        run: python3 .sox/agents/review_agent.py finish --out "$RUNNER_TEMP/out"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: jira-ops-review-${{ matrix.pr }}
-          path: ${{ runner.temp }}/jira-out/
+          name: jira-ops-review-record
+          path: ${{ runner.temp }}/out/jira-ops.json
+          if-no-files-found: ignore
           retention-days: 30
 
   jira:
-    needs: [resolve, record]
-    if: ${{ !cancelled() && needs.resolve.outputs.prs != '[]' && needs.resolve.outputs.prs != '' }}
+    needs: [open, record]
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' }}
     permissions:
       contents: read
     uses: ./.github/workflows/sox-jira-write.yml
