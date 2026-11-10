@@ -8,3 +8,20 @@ services:
     manifest: services/api/service.yaml
   - name: ui
     manifest: services/ui/service.yaml
+# Paths outside services/** that still belong to a release's scope. Control paths from the trust
+# policy (.github/, .sox/, .factory/, tools/, CODEOWNERS) map to `controls` automatically.
+shared:
+  - path: README.md
+    services: [db, api, ui]
+  - path: Tiltfile
+    services: [db, api, ui]
+  - path: services/__init__.py
+    services: [db, api, ui]
+  - paths: [deploy/kind/**]
+    services: [db, api, ui]
+  - paths: [deploy/kyverno/**]
+    services: [controls]
+  - path: redteam-contract.json
+    services: [controls]
+  - path: .gitignore
+    services: [controls]
