@@ -72,7 +72,7 @@ class Common(unittest.TestCase):
         out = subprocess.run(["git", "hash-object", str(ROOT / ".sox/services.yaml")], capture_output=True, text=True, check=True)
         self.assertEqual(common.services_map_digest(), out.stdout.strip())
 
-    def test_fetch_no_attestations_is_empty(self):
+    def test_fetch_defers_to_verifier(self):
         sys.path.insert(0, str(ROOT / ".sox"))
         from soxlib.ghapi import APIError
 
@@ -81,14 +81,17 @@ class Common(unittest.TestCase):
                 self.status = status
 
             def fetch(self, api, kind, ident, predicate):
+                if self.status is None:
+                    return [], []
                 raise APIError(self.status, "https://api.github.com/repos/x/attestations/sha256:ab?per_page=100", "")
         saved = evidence._verifier
         try:
-            evidence._verifier = (V(404), lambda token: None)
+            evidence._verifier = (V(None), lambda token: None)
             self.assertEqual(evidence.fetch("commit:" + H, "release-approval"), [])
-            evidence._verifier = (V(500), lambda token: None)
-            with self.assertRaises(evidence.EvidenceUnavailable):
-                evidence.fetch("commit:" + H, "release-approval")
+            for status in (404, 500):
+                evidence._verifier = (V(status), lambda token: None)
+                with self.assertRaises(evidence.EvidenceUnavailable):
+                    evidence.fetch("commit:" + H, "release-approval")
         finally:
             evidence._verifier = saved
 

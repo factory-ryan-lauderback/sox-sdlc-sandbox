@@ -60,9 +60,6 @@ def fetch(subject, predicate):
     try:
         ok, bad = verifier.fetch(SoxGitHub(token=token), kind, ident, predicate)
     except Exception as e:
-        # The attestations API answers 404 when a digest has no attestations at all.
-        if getattr(e, "status", None) == 404 and "/attestations/sha256:" in str(getattr(e, "url", "")):
-            return []
         raise EvidenceUnavailable(f"verifier fetch {subject} {predicate}: {e}") from None
     REJECTED.extend({"subject": subject, **r.to_json()} for r in bad)
     return [normalize(a) for a in ok]
