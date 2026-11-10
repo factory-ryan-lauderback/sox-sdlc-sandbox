@@ -121,6 +121,12 @@ def main(argv=None):
     print(text)
     for r in results:
         print(f"--- {r['id']}: {r['message'][:600]}")
+        # Annotations are public on the run page, so auditors can read results without artifacts.
+        msg = " ".join(r["message"].split())[:700]
+        level = "notice" if r["pass"] else "error"
+        print(f"::{level} title={r['id']} expect={r['expect']} got={r['got']} byProdPolicy={r['deniedByProdPolicy']}::{r['image']} | {msg}")
+    for n in cases.get("notes", []):
+        print(f"::notice title=not run::{n}")
     if args.summary:
         with open(args.summary, "a") as f:
             f.write("## Production admission demo\n\n" + text)
