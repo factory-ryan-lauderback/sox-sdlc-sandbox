@@ -1,15 +1,15 @@
 """Jira command line for agent workflows and demos.
 
-  jira_cli.py apply --ops ops.json --as svc-pm-agent [--out results.json]
-  jira_cli.py show FRQ-1 | list [--type Epic] [--status Approved]
-  jira_cli.py requirement --summary S --description D --as <reporter>
-  jira_cli.py transition FRQ-1 Approved --as <account>
+  jira_cli.py apply --ops ops.json --role pm [--out results.json] [--message M]
+  jira_cli.py show FRQ-1 | changelog FRQ-1 | list [--type Epic] [--status Approved]
+  jira_cli.py requirement --summary S --description D [--role intake | --as <human>]
+  jira_cli.py transition FRQ-1 "Plan Ready" --role techlead     (agents; human-only statuses refused)
+  jira_cli.py transition FRQ-1 Approved --as factory-aman        (FileJira demos only)
 
-Backend selection (jira_adapter.from_env): SOX_JIRA_BACKEND=file|cloud.
-With the file backend and SOX_JIRA_STORE_BRANCH set (Actions, demos), every write is a
-pull -> apply -> compare-and-swap push of jira.json on that branch through the Contents API,
-retried on conflict, so concurrent agents cannot overwrite each other. The token for the push is
-SOX_JIRA_STORE_TOKEN (the acme-jira-attestor App installation token in Actions).
+Backend (jira_adapter.from_env): SOX_JIRA_BACKEND=cloud (default) | file. Cloud credentials exist
+only in env jira-attestor (JIRA_API_TOKEN, SOX_JIRA_EMAIL) or locally in ~/.factory/secrets/jira.
+With the file backend and SOX_JIRA_STORE_BRANCH set, every write is a pull -> apply -> compare-and-swap
+push of jira.json on that branch through the Contents API (token SOX_JIRA_STORE_TOKEN).
 """
 import argparse
 import base64
@@ -23,11 +23,11 @@ from common import REPO, GitHub  # noqa: E402
 import jira_adapter  # noqa: E402
 
 STORE_FILE = "jira.json"
-# Workflow role -> Jira service account. The account always comes from this table (workflow code on
-# main), never from an LLM or an operation list.
-ROLE_ACCOUNTS = {"pm": "svc-pm-agent", "techlead": "svc-techlead-agent", "review": "svc-review-agent",
-                 "dev": "svc-dev-agent", "qa": "svc-qa-agent", "attestor": "svc-jira-attestor",
-                 "bundler": "svc-release-bundler"}
+ROLE_ACCOUNTS = jira_adapter.ROLE_ACCOUNTS
+
+
+def _file_backend():
+    return (os.environ.get("SOX_JIRA_BACKEND") or "cloud") == "file"
 
 
 def _branch():
@@ -71,28 +71,25 @@ def push(local, sha, message):
 
 
 def load(account=None):
-    if os.environ.get("SOX_JIRA_BACKEND", "file") == "file" and _branch():
+    if _file_backend() and _branch():
         pull(os.environ.setdefault("SOX_JIRA_FILE", "jira-fake/jira.json"))
-    return jira_adapter.from_env(account)
+    return jira_adapter.from_env()
 
 
-def write(ops, account, message):
-    """Apply ops as `account`. Returns (results, refs)."""
-    if os.environ.get("SOX_JIRA_BACKEND", "file") != "file":
-        return jira_adapter.apply_ops(jira_adapter.from_env(account), ops, account)
+def _file_write(fn, message):
     local = os.environ.setdefault("SOX_JIRA_FILE", "jira-fake/jira.json")
     if not _branch():
         j = jira_adapter.FileJira(local)
-        out = jira_adapter.apply_ops(j, ops, account)
+        out = fn(j)
         j.save()
         return out
     for attempt in range(6):
         sha = pull(local)
         j = jira_adapter.FileJira(local)
-        out = jira_adapter.apply_ops(j, ops, account)
+        out = fn(j)
         j.save()
         try:
-            push(local, sha, f"{message} [as {account}]")
+            push(local, sha, message)
             return out
         except RuntimeError as e:
             if ("HTTP 409" in str(e) or "HTTP 422" in str(e)) and attempt < 5:
@@ -102,14 +99,41 @@ def write(ops, account, message):
     raise RuntimeError("could not write the Jira store")
 
 
+def write(ops, role, message):
+    """Apply ops as agent `role`. Returns (results, refs)."""
+    if not _file_backend():
+        return jira_adapter.apply_ops(jira_adapter.from_env(), ops, role)
+    return _file_write(lambda j: jira_adapter.apply_ops(j, ops, role), f"{message} [as {role}]")
+
+
+def act(fn, actor, message):
+    """One adapter call as `actor` (an Actor). Humans are only allowed on the file backend."""
+    if not _file_backend():
+        if actor.human:
+            raise SystemExit("humans act in the Jira UI; the Cloud adapter writes only as an agent role")
+        return fn(jira_adapter.from_env())
+    return _file_write(fn, f"{message} [as {actor.account}]")
+
+
+def _actor(args):
+    if getattr(args, "human", None):
+        return jira_adapter.Actor(human=args.human)
+    return jira_adapter.Actor(role=args.role)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    a = sub.add_parser("apply"); a.add_argument("--ops", required=True); g = a.add_mutually_exclusive_group(required=True); g.add_argument("--as", dest="account"); g.add_argument("--role", choices=sorted(ROLE_ACCOUNTS)); a.add_argument("--out"); a.add_argument("--message", default="jira ops")
+    roles = sorted(jira_adapter.ROLES)
+    a = sub.add_parser("apply"); a.add_argument("--ops", required=True); a.add_argument("--role", choices=roles, required=True)
+    a.add_argument("--out"); a.add_argument("--message", default="jira ops")
     s = sub.add_parser("show"); s.add_argument("key")
-    l = sub.add_parser("list"); l.add_argument("--type"); l.add_argument("--status"); l.add_argument("--parent"); l.add_argument("--fix-version")
-    r = sub.add_parser("requirement"); r.add_argument("--summary", required=True); r.add_argument("--description", default=""); r.add_argument("--as", dest="account", required=True)
-    t = sub.add_parser("transition"); t.add_argument("key"); t.add_argument("status"); t.add_argument("--as", dest="account", required=True)
+    lst = sub.add_parser("list"); lst.add_argument("--type"); lst.add_argument("--status"); lst.add_argument("--parent"); lst.add_argument("--fix-version")
+    r = sub.add_parser("requirement"); r.add_argument("--summary", required=True); r.add_argument("--description", default="")
+    t = sub.add_parser("transition"); t.add_argument("key"); t.add_argument("status")
+    for p in (r, t):
+        g = p.add_mutually_exclusive_group(required=True)
+        g.add_argument("--role", choices=roles); g.add_argument("--as", dest="human")
     c = sub.add_parser("changelog"); c.add_argument("key")
     args = ap.parse_args(argv)
 
@@ -118,8 +142,7 @@ def main(argv=None):
             ops = json.load(f)
         if not ops:
             print("no operations"); return
-        account = args.account or ROLE_ACCOUNTS[args.role]
-        results, refs = write(ops, account, args.message)
+        results, refs = write(ops, args.role, args.message)
         out = {"results": results, "refs": refs}
         if args.out:
             with open(args.out, "w") as f:
@@ -134,11 +157,17 @@ def main(argv=None):
         for i in load().search(type=args.type, status=args.status, parent=args.parent, fix_version=args.fix_version):
             print(f"{i['key']}\t{i['type']}\t{i['status']}\t{i['summary']}")
     elif args.cmd == "requirement":
-        results, _ = write([{"op": "create", "type": "Requirement", "summary": args.summary, "description": args.description}],
-                           args.account, "new requirement")
-        print(results[0]["key"])
+        actor = _actor(args)
+
+        def mk(j):
+            key = j.create("Requirement", args.summary, args.description, actor)
+            if actor.role:
+                j.comment(key, f"{jira_adapter.role_prefix(actor.role)} Requirement filed through the {actor.role} channel.", actor)
+            return key
+        print(act(mk, actor, "new requirement"))
     elif args.cmd == "transition":
-        write([{"op": "transition", "key": args.key, "to": args.status}], args.account, f"transition {args.key}")
+        actor = _actor(args)
+        act(lambda j: j.transition(args.key, args.status, actor), actor, f"transition {args.key}")
         print(f"{args.key} -> {args.status}")
 
 

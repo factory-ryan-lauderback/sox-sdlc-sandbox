@@ -94,5 +94,30 @@
     "release_pr": null,
     "release_branch": null,
     "declared_services": null
+  },
+  "jira": {
+    "site": "https://factory-dev-testing.atlassian.net",
+    "project": "FRQ",
+    "approval_field": "status",
+    "approved_value": "Approved",
+    "approved_status_id": "10071",
+    "approach_approved_status_id": "10082",
+    "ecab_approved_status_id": "10089",
+    "agent_account_ids": [
+      "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
+    ],
+    "automation_identity": {
+      "accountId": "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
+    },
+    "acting_role": "sox.actor issue property and [sox:<role>] comment prefix (workflow-asserted; one shared agent account)",
+    "read_snapshot": ".github/workflows/sox-jira-read.yml (artifact snapshot.json, schema sox-jira-snapshot/v1, output digest)",
+    "write_path": ".github/workflows/sox-jira-write.yml",
+    "test_issue": null
+  },
+  "loops": {
+    "test_story_key": null
+  },
+  "human_batch": {
+    "release_pr": null
   }
 }

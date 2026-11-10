@@ -1,0 +1,58 @@
+name: sox-jira-read
+# Jira read snapshot. The only place agents read Jira: one job in the main-only jira-attestor
+# environment, which holds the single sandbox Jira credential. Produces artifact <artifact-name>
+# with snapshot.json (schema sox-jira-snapshot/v1, see .sox/agents/jira_snapshot.py) and the
+# output `digest` = "sha256:<hex>" of its exact bytes. A key-holding consumer that binds Jira facts
+# must check the artifact against `digest` from this job in the same run (or re-read Jira itself).
+# Callers: `uses: ./.github/workflows/sox-jira-read.yml` with `permissions: contents: read`.
+on:
+  workflow_call:
+    inputs:
+      preset:
+        description: "issues | releases | sweep"
+        type: string
+        required: true
+      keys:
+        description: "Comma-separated FRQ keys (preset issues)"
+        type: string
+        required: false
+        default: ""
+      artifact-name:
+        type: string
+        required: false
+        default: jira-snapshot
+    outputs:
+      digest:
+        value: ${{ jobs.read.outputs.digest }}
+      artifact-name:
+        value: ${{ inputs.artifact-name }}
+permissions: {}
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    environment: jira-attestor
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.snap.outputs.digest }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: snap
+        env:
+          SOX_JIRA_BACKEND: cloud
+          SOX_JIRA_EMAIL: ${{ vars.SOX_JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          PRESET: ${{ inputs.preset }}
+          KEYS: ${{ inputs.keys }}
+        run: python3 .sox/agents/jira_snapshot.py --preset "$PRESET" --keys "$KEYS" --out "$RUNNER_TEMP/jira/snapshot.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/jira/snapshot.json
+          retention-days: 30

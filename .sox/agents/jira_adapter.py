@@ -1,54 +1,115 @@
 """Jira adapter: one small interface, two backends.
 
-- FileJira: JSON file store (the fake). In Actions the file lives on branch `sox-jira-fake` and is
-  synced by jira_store.py. Identities recorded here are asserted by the writing workflow, so they
-  are weaker evidence than a real Jira changelog.
-- CloudJira: Jira Cloud REST v2 with one API token per service account. The adapter checks that
-  the token really belongs to the account it is asked to act as.
+- CloudJira (default): Jira Cloud REST v3 with the single sandbox API token, which belongs to the
+  automation account. Jira records that account as the author of every agent write, so the acting
+  agent role is recorded twice by the workflow: the `sox.actor` issue property set on create, and
+  a `[sox:<role>]` prefix on every agent comment. Both are workflow-asserted (production: one
+  Atlassian service account per agent role). Human approvals are never made through this adapter:
+  `Approved`, `Approach Approved` and `ECAB Approved` are human-only transitions in the Jira UI.
+- FileJira: a JSON file, for unit tests and offline demos only. Identities in it are asserted.
 
-Select with SOX_JIRA_BACKEND=file|cloud (default file). Switching is configuration only.
-Agents never call this with free-form identities: the account comes from the workflow, not the LLM.
+Select with SOX_JIRA_BACKEND=cloud|file (default cloud). Agents never pass free-form identities:
+the role comes from the workflow file on main, never from an LLM or an operation list.
 """
 import base64
 import copy
+import hashlib
 import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
-STATUSES = {
-    "Requirement": ["Draft", "Approved", "Planned"],
-    "Epic": ["Planning", "Plan Ready", "Approach Approved", "In Build", "Done"],
-    "Story": ["To Do", "Ready for Dev", "In Dev", "In Review", "In QA", "Done",
-              "Blocked - Human Escalation", "Re-plan"],
+SITE = "https://factory-dev-testing.atlassian.net"
+PROJECT = "FRQ"
+AUTOMATION_ACCOUNT = "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
+# One workflow for every FRQ work type, all statuses reachable by global transitions.
+STATUS_IDS = {
+    "Spec Review": "10070", "Approved": "10071", "In Progress": "3", "In Review": "10072", "Done": "10073",
+    "Draft": "10079", "Planning": "10080", "Plan Ready": "10081", "Approach Approved": "10082",
+    "Ready for Dev": "10083", "Blocked - Human Escalation": "10084", "Re-plan": "10085",
+    "Awaiting Release Approval": "10086", "Awaiting Train": "10087", "Released": "10088", "ECAB Approved": "10089",
 }
+STATUSES = list(STATUS_IDS)
+HUMAN_ONLY = {"Approved", "Approach Approved", "ECAB Approved"}
+TYPES = ("Requirement", "Epic", "Story", "Task", "Bug")
+# Until the "Requirement" work type exists, a requirement is a Story carrying this label.
+REQUIREMENT_LABEL = "sox-requirement"
 AGENT_FIELDS = ("storyType", "dependsOn", "requiredTests", "services", "idempotencyKey", "release")
+# intake: step 1, Requirements In, when a requirement is filed through the pipeline instead of the UI.
+ROLES = ("intake", "pm", "techlead", "review", "dev", "qa", "attestor", "bundler")
+# FileJira authors (asserted). Cloud authorship is always the token's account.
+ROLE_ACCOUNTS = {r: f"svc-{r}-agent" for r in ROLES} | {"attestor": "svc-jira-attestor", "bundler": "svc-release-bundler"}
+FAKE_HUMANS = {"factory-aman": "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"}
 
 
 def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def role_prefix(role):
+    return f"[sox:{role}]"
+
+
 class JiraError(RuntimeError):
     pass
 
 
+class IncompleteRead(JiraError):
+    """A paginated read could not be shown to be complete. Never sign or snapshot a partial history."""
+
+
+class Actor:
+    """Who is acting. Agents: role in ROLES. Humans exist only in FileJira (demo/test)."""
+
+    def __init__(self, role=None, human=None):
+        if (role is None) == (human is None):
+            raise JiraError("exactly one of role or human")
+        if role is not None and role not in ROLES:
+            raise JiraError(f"unknown role {role!r}")
+        self.role, self.human = role, human
+
+    @property
+    def account(self):
+        return self.human or ROLE_ACCOUNTS[self.role]
+
+
+def _as_actor(a):
+    if isinstance(a, Actor):
+        return a
+    if a in ROLES:
+        return Actor(role=a)
+    # Legacy svc-* names map back to their role.
+    for r, acct in ROLE_ACCOUNTS.items():
+        if a == acct:
+            return Actor(role=r)
+    return Actor(human=a)
+
+
 class JiraAdapter:
-    """Normalized issue: key, type, summary, description, status, reporter, creator, created,
-    updated, parent, labels, fixVersions, attachments[{id, filename, sha256}], plus AGENT_FIELDS."""
+    """Normalized issue: key, type, summary, description, status, statusId, reporter, creator (account
+    ids), created, updated, parent, labels, fixVersions (names), attachments[{id, filename, size,
+    created}], actor (sox.actor property), plus AGENT_FIELDS."""
 
     def get(self, key): raise NotImplementedError
-    def search(self, type=None, status=None, parent=None, fix_version=None, label=None): raise NotImplementedError
-    def create(self, type, summary, description, account, parent=None, fields=None, labels=None): raise NotImplementedError
-    def update(self, key, account, summary=None, description=None, fields=None): raise NotImplementedError
-    def transition(self, key, to_status, account): raise NotImplementedError
-    def comment(self, key, body, account): raise NotImplementedError
-    def attach(self, key, filename, content, account): raise NotImplementedError
+    def search(self, type=None, status=None, parent=None, fix_version=None, label=None, statuses=None): raise NotImplementedError
+    def create(self, type, summary, description, actor, parent=None, fields=None, labels=None): raise NotImplementedError
+    def update(self, key, actor, summary=None, description=None, fields=None): raise NotImplementedError
+    def transition(self, key, to_status, actor): raise NotImplementedError
+    def comment(self, key, body, actor): raise NotImplementedError
+    def attach(self, key, filename, content, actor): raise NotImplementedError
     def attachment_content(self, key, attachment_id): raise NotImplementedError
-    def set_fix_version(self, key, version, account): raise NotImplementedError
+    def set_fix_version(self, key, version, actor): raise NotImplementedError
+    def versions(self): raise NotImplementedError
     def changelog(self, key): raise NotImplementedError
     def comments(self, key): raise NotImplementedError
+
+    def version_id(self, name):
+        for v in self.versions():
+            if v["name"] == name:
+                return v["id"]
+        return None
 
     def find_by_idempotency(self, idem):
         for issue in self.search():
@@ -56,9 +117,22 @@ class JiraAdapter:
                 return issue
         return None
 
+    def _check_transition(self, to_status, actor):
+        if to_status not in STATUS_IDS:
+            raise JiraError(f"unknown status {to_status!r}")
+        if actor.role and to_status in HUMAN_ONLY:
+            raise JiraError(f"{to_status!r} is a human-only approval; agents cannot perform it")
+
+
+def _person_fake(name):
+    if name is None:
+        return None
+    return {"accountId": FAKE_HUMANS.get(name, name), "accountType": "atlassian" if name in FAKE_HUMANS else "fake",
+            "displayName": name}
+
 
 class FileJira(JiraAdapter):
-    def __init__(self, path, project="FRQ"):
+    def __init__(self, path, project=PROJECT):
         self.path, self.project = path, project
         if os.path.exists(path):
             with open(path) as f:
@@ -87,7 +161,10 @@ class FileJira(JiraAdapter):
     @staticmethod
     def _norm(issue):
         out = {k: copy.deepcopy(v) for k, v in issue.items() if k not in ("changelog", "comments")}
-        out["attachments"] = [{k: a[k] for k in ("id", "filename", "sha256")} for a in issue["attachments"]]
+        out["statusId"] = STATUS_IDS.get(issue.get("status"))
+        out["attachments"] = [{k: a.get(k) for k in ("id", "filename", "sha256", "size", "created")}
+                              for a in issue.get("attachments", [])]
+        out.setdefault("actor", None)
         for k in AGENT_FIELDS:
             out.setdefault(k, None)
         return out
@@ -95,20 +172,22 @@ class FileJira(JiraAdapter):
     def get(self, key):
         return self._norm(self._issue(key))
 
-    def search(self, type=None, status=None, parent=None, fix_version=None, label=None):
+    def search(self, type=None, status=None, parent=None, fix_version=None, label=None, statuses=None):
         res = []
         for key in sorted(self.db["issues"], key=lambda k: int(k.split("-")[1])):
             i = self.db["issues"][key]
             if type and i["type"] != type: continue
             if status and i["status"] != status: continue
+            if statuses and i["status"] not in statuses: continue
             if parent and i.get("parent") != parent: continue
-            if fix_version and fix_version not in i["fixVersions"]: continue
-            if label and label not in i["labels"]: continue
+            if fix_version and fix_version not in i.get("fixVersions", []): continue
+            if label and label not in i.get("labels", []): continue
             res.append(self._norm(i))
         return res
 
-    def create(self, type, summary, description, account, parent=None, fields=None, labels=None):
-        if type not in STATUSES:
+    def create(self, type, summary, description, actor, parent=None, fields=None, labels=None):
+        actor = _as_actor(actor)
+        if type not in TYPES:
             raise JiraError(f"unknown issue type {type}")
         if parent:
             self._issue(parent)
@@ -116,18 +195,21 @@ class FileJira(JiraAdapter):
         key = f"{self.project}-{self.db['seq']}"
         now = _now()
         issue = {"key": key, "type": type, "summary": summary, "description": description or "",
-                 "status": STATUSES[type][0], "reporter": account, "creator": account,
+                 "status": "Draft" if type == "Requirement" else ("Planning" if type == "Epic" else "Spec Review"),
+                 "reporter": actor.account, "creator": actor.account,
                  "created": now, "updated": now, "parent": parent, "labels": sorted(labels or []),
-                 "fixVersions": [], "attachments": [], "comments": [], "changelog": []}
+                 "fixVersions": [], "attachments": [], "comments": [], "changelog": [],
+                 "actor": {"role": actor.role} if actor.role else None}
         for k, v in (fields or {}).items():
             if k not in AGENT_FIELDS:
                 raise JiraError(f"unknown field {k}")
             issue[k] = v
         self.db["issues"][key] = issue
-        self._log(issue, account, [{"field": "created", "from": None, "to": key}])
+        self._log(issue, actor.account, [{"field": "created", "from": None, "to": key}])
         return key
 
-    def update(self, key, account, summary=None, description=None, fields=None):
+    def update(self, key, actor, summary=None, description=None, fields=None):
+        actor = _as_actor(actor)
         issue, items = self._issue(key), []
         for name, val in (("summary", summary), ("description", description)):
             if val is not None and issue[name] != val:
@@ -140,32 +222,35 @@ class FileJira(JiraAdapter):
                 items.append({"field": k, "from": issue.get(k), "to": v})
                 issue[k] = v
         if items:
-            self._log(issue, account, items)
+            self._log(issue, actor.account, items)
 
-    def transition(self, key, to_status, account):
+    def transition(self, key, to_status, actor):
+        actor = _as_actor(actor)
+        self._check_transition(to_status, actor)
         issue = self._issue(key)
-        if to_status not in STATUSES[issue["type"]]:
-            raise JiraError(f"{issue['type']} has no status {to_status!r}")
         if issue["status"] != to_status:
-            self._log(issue, account, [{"field": "status", "from": issue["status"], "to": to_status}])
+            self._log(issue, actor.account, [{"field": "status", "from": issue["status"], "to": to_status,
+                                              "fromId": STATUS_IDS.get(issue["status"]), "toId": STATUS_IDS[to_status]}])
             issue["status"] = to_status
 
-    def comment(self, key, body, account):
+    def comment(self, key, body, actor):
+        actor = _as_actor(actor)
         issue = self._issue(key)
         cid = f"{key}-c{len(issue['comments']) + 1}"
-        issue["comments"].append({"id": cid, "author": account, "body": body, "created": _now()})
+        issue["comments"].append({"id": cid, "author": actor.account, "body": body, "created": _now()})
         issue["updated"] = _now()
         return cid
 
-    def attach(self, key, filename, content, account):
-        import hashlib
+    def attach(self, key, filename, content, actor):
+        actor = _as_actor(actor)
         issue = self._issue(key)
         if isinstance(content, str):
             content = content.encode()
         aid = f"{key}-a{len(issue['attachments']) + 1}"
         issue["attachments"].append({"id": aid, "filename": filename, "sha256": hashlib.sha256(content).hexdigest(),
+                                     "size": len(content), "created": _now(),
                                      "content_b64": base64.b64encode(content).decode()})
-        self._log(issue, account, [{"field": "attachment", "from": None, "to": f"{aid}:{filename}"}])
+        self._log(issue, actor.account, [{"field": "Attachment", "from": None, "to": aid, "toString": filename}])
         return aid
 
     def attachment_content(self, key, attachment_id):
@@ -174,174 +259,375 @@ class FileJira(JiraAdapter):
                 return base64.b64decode(a["content_b64"])
         raise JiraError(f"no attachment {attachment_id} on {key}")
 
-    def set_fix_version(self, key, version, account):
+    def set_fix_version(self, key, version, actor):
+        actor = _as_actor(actor)
         issue = self._issue(key)
         self.db["versions"].setdefault(version, {"id": str(len(self.db["versions"]) + 1), "name": version, "released": False})
         if issue["fixVersions"] != [version]:
-            self._log(issue, account, [{"field": "fixVersion", "from": issue["fixVersions"], "to": [version]}])
+            self._log(issue, actor.account, [{"field": "Fix Version", "from": issue["fixVersions"], "to": [version]}])
             issue["fixVersions"] = [version]
 
+    def versions(self):
+        return [{"id": v["id"], "name": v["name"], "released": v.get("released", False), "archived": False,
+                 "releaseDate": None} for v in self.db.get("versions", {}).values()]
+
     def changelog(self, key):
-        return copy.deepcopy(self._issue(key)["changelog"])
+        """Snapshot/attestor shape: {id, created, author{accountId, accountType}, items[{field, from, to, fromString, toString}]}."""
+        out = []
+        for h in self._issue(key)["changelog"]:
+            p = _person_fake(h["author"])
+            items = [{"field": i["field"], "from": i.get("fromId", i.get("from")), "to": i.get("toId", i.get("to")),
+                      "fromString": i.get("fromString", i.get("from")), "toString": i.get("toString", i.get("to"))}
+                     for i in h["items"]]
+            out.append({"id": h["id"], "created": h["created"],
+                        "author": {"accountId": p["accountId"], "accountType": p["accountType"]}, "items": items})
+        return out
 
     def comments(self, key):
-        return copy.deepcopy(self._issue(key)["comments"])
+        return [{"id": c["id"], "created": c["created"], "author": _person_fake(c["author"]), "body": c["body"]}
+                for c in self._issue(key)["comments"]]
+
+    def people(self, key):
+        i = self._issue(key)
+        return _person_fake(i.get("reporter")), _person_fake(i.get("creator"))
+
+
+# --- Atlassian Document Format (v3 API) -------------------------------------------------------------
+
+def text_to_adf(text):
+    paras = []
+    for block in (text or "").split("\n\n"):
+        content = []
+        for n, line in enumerate(block.split("\n")):
+            if n:
+                content.append({"type": "hardBreak"})
+            if line:
+                content.append({"type": "text", "text": line})
+        paras.append({"type": "paragraph", "content": content})
+    return {"type": "doc", "version": 1, "content": paras or [{"type": "paragraph", "content": []}]}
+
+
+def adf_to_text(node):
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    t = node.get("type")
+    if t == "text":
+        return node.get("text", "")
+    if t == "hardBreak":
+        return "\n"
+    inner = "".join(adf_to_text(c) for c in node.get("content") or [])
+    if t in ("paragraph", "heading", "codeBlock", "blockquote", "rule"):
+        return inner + "\n\n"
+    if t == "listItem":
+        return "- " + inner.strip() + "\n"
+    if t in ("bulletList", "orderedList"):
+        return inner + "\n"
+    return inner
+
+
+def person(p):
+    if not p:
+        return None
+    return {"accountId": p.get("accountId"), "accountType": p.get("accountType"), "displayName": p.get("displayName")}
+
+
+ISSUE_FIELDS = ["summary", "description", "status", "issuetype", "labels", "fixVersions", "parent",
+                "reporter", "creator", "created", "updated", "attachment"]
 
 
 class CloudJira(JiraAdapter):
-    """Jira Cloud. Agent fields live in issue properties (`sox.agent`) so no custom fields are needed;
-    statuses come from the FRQ workflow and must match STATUSES (configure names in SOX_JIRA_STATUS_MAP)."""
-
-    def __init__(self, site, email, token, project="FRQ", expected_account=None):
+    def __init__(self, site, email, token, project=PROJECT, agent_accounts=None):
         self.site, self.project = site.rstrip("/"), project
         self.auth = base64.b64encode(f"{email}:{token}".encode()).decode()
-        self.status_map = json.loads(os.environ.get("SOX_JIRA_STATUS_MAP", "{}"))
+        self.agent_accounts = set(agent_accounts or [AUTOMATION_ACCOUNT])
         self._me = None
-        self.expected_account = expected_account
+        self._types = None
+        self._project_id = None
 
-    def _req(self, method, path, body=None, headers=None, raw=False, data=None):
-        req = urllib.request.Request(f"{self.site}{path}", method=method,
-                                     data=data if data is not None else (json.dumps(body).encode() if body is not None else None))
-        req.add_header("Authorization", f"Basic {self.auth}")
-        req.add_header("Accept", "application/json")
-        if body is not None:
-            req.add_header("Content-Type", "application/json")
-        for k, v in (headers or {}).items():
-            req.add_header(k, v)
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                payload = resp.read()
-                return payload if raw else (json.loads(payload) if payload else None)
-        except urllib.error.HTTPError as e:
-            raise JiraError(f"{method} {path}: HTTP {e.code} {e.read()[:300].decode(errors='replace')}") from None
+    # -- transport
+    def _req(self, method, path, body=None, headers=None, raw=False, data=None, ok404=False):
+        url = path if path.startswith("http") else f"{self.site}{path}"
+        payload = data if data is not None else (json.dumps(body).encode() if body is not None else None)
+        for attempt in range(5):
+            req = urllib.request.Request(url, method=method, data=payload)
+            req.add_header("Authorization", f"Basic {self.auth}")
+            req.add_header("Accept", "application/json" if not raw else "*/*")
+            if body is not None:
+                req.add_header("Content-Type", "application/json")
+            for k, v in (headers or {}).items():
+                req.add_header(k, v)
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    out = resp.read()
+                    return out if raw else (json.loads(out) if out else None)
+            except urllib.error.HTTPError as e:
+                if e.code == 404 and ok404:
+                    return None
+                if e.code in (429, 500, 502, 503, 504) and attempt < 4 and method == "GET":
+                    time.sleep(int(e.headers.get("Retry-After") or 2 ** attempt))
+                    continue
+                raise JiraError(f"{method} {path.split('?')[0]}: HTTP {e.code} {e.read()[:300].decode(errors='replace')}") from None
+            except urllib.error.URLError as e:
+                if attempt < 4 and method == "GET":
+                    time.sleep(2 ** attempt)
+                    continue
+                raise JiraError(f"{method} {path.split('?')[0]}: {e.reason}") from None
 
-    def _check_account(self, account):
+    def _check_agent_token(self):
+        """The token must belong to an agent (automation) account, never to a human approver."""
         if self._me is None:
-            self._me = self._req("GET", "/rest/api/2/myself")
-        names = {self._me.get("accountId"), self._me.get("displayName"), self._me.get("emailAddress")}
-        if account not in names:
-            raise JiraError(f"token belongs to {self._me.get('displayName')!r}, not {account!r}")
+            self._me = self._req("GET", "/rest/api/3/myself")
+        if self._me.get("accountId") not in self.agent_accounts:
+            raise JiraError("the Jira token does not belong to a configured agent account; refusing to write")
 
-    def _props(self, key):
-        try:
-            return self._req("GET", f"/rest/api/2/issue/{key}/properties/sox.agent")["value"]
-        except JiraError:
-            return {}
+    def _type_names(self):
+        if self._types is None:
+            p = self._req("GET", f"/rest/api/3/project/{self.project}")
+            self._project_id = p["id"]
+            self._types = {t["name"] for t in p.get("issueTypes", [])}
+        return self._types
 
+    def _jira_type(self, type):
+        if type == "Requirement" and "Requirement" not in self._type_names():
+            return "Story", [REQUIREMENT_LABEL]
+        return type, []
+
+    # -- reads
     def _norm(self, raw):
         f = raw["fields"]
-        out = {"key": raw["key"], "type": f["issuetype"]["name"], "summary": f.get("summary"),
-               "description": f.get("description") or "", "status": f["status"]["name"],
-               "reporter": (f.get("reporter") or {}).get("displayName"),
-               "creator": (f.get("creator") or {}).get("displayName"),
+        labels = sorted(f.get("labels") or [])
+        typ = f["issuetype"]["name"]
+        if REQUIREMENT_LABEL in labels and typ == "Story":
+            typ = "Requirement"
+        props = raw.get("properties") or {}
+        agent = props.get("sox.agent") or {}
+        out = {"key": raw["key"], "id": raw.get("id"), "type": typ, "summary": f.get("summary"),
+               "description": adf_to_text(f.get("description")).strip(), "status": f["status"]["name"],
+               "statusId": f["status"]["id"],
+               "reporter": (f.get("reporter") or {}).get("accountId"), "creator": (f.get("creator") or {}).get("accountId"),
                "created": f.get("created"), "updated": f.get("updated"),
-               "parent": (f.get("parent") or {}).get("key"), "labels": sorted(f.get("labels") or []),
+               "parent": (f.get("parent") or {}).get("key"), "labels": labels,
                "fixVersions": [v["name"] for v in f.get("fixVersions") or []],
-               "attachments": [{"id": a["id"], "filename": a["filename"], "sha256": None} for a in f.get("attachment") or []]}
-        props = self._props(raw["key"])
+               "attachments": [{"id": a["id"], "filename": a["filename"], "sha256": None, "size": a.get("size"),
+                                "created": a.get("created")} for a in f.get("attachment") or []],
+               "actor": props.get("sox.actor")}
         for k in AGENT_FIELDS:
-            out[k] = props.get(k)
+            out[k] = agent.get(k)
         return out
 
-    def get(self, key):
-        return self._norm(self._req("GET", f"/rest/api/2/issue/{key}"))
+    def raw(self, key):
+        q = urllib.parse.urlencode({"fields": ",".join(ISSUE_FIELDS), "properties": "sox.agent,sox.actor"})
+        return self._req("GET", f"/rest/api/3/issue/{urllib.parse.quote(key)}?{q}")
 
-    def search(self, type=None, status=None, parent=None, fix_version=None, label=None):
+    def get(self, key):
+        return self._norm(self.raw(key))
+
+    def jql(self, jql, limit=2000):
+        """All issues for a JQL query (new /search/jql endpoint, token pagination). Raw issues."""
+        out, token = [], None
+        for _ in range(limit // 100 + 2):
+            body = {"jql": jql, "maxResults": 100, "fields": ISSUE_FIELDS, "properties": ["sox.agent", "sox.actor"]}
+            if token:
+                body["nextPageToken"] = token
+            res = self._req("POST", "/rest/api/3/search/jql", body)
+            out.extend(res.get("issues", []))
+            if res.get("isLast", not res.get("nextPageToken")):
+                return out
+            token = res.get("nextPageToken")
+            if not token:
+                raise IncompleteRead(f"search: isLast false without nextPageToken ({jql})")
+        raise IncompleteRead(f"search exceeded {limit} issues ({jql})")
+
+    def search_jql(self, type=None, status=None, parent=None, fix_version=None, label=None, statuses=None):
         clauses = [f'project = "{self.project}"']
-        if type: clauses.append(f'issuetype = "{type}"')
-        if status: clauses.append(f'status = "{self.status_map.get(status, status)}"')
+        if type:
+            jt, labels = self._jira_type(type)
+            clauses.append(f'issuetype = "{jt}"')
+            for lab in labels:
+                clauses.append(f'labels = "{lab}"')
+            if type == "Story" and "Requirement" not in self._type_names():
+                clauses.append(f'(labels IS EMPTY OR labels != "{REQUIREMENT_LABEL}")')
+        if status: clauses.append(f'status = "{status}"')
+        if statuses: clauses.append("status in (" + ", ".join(f'"{s}"' for s in statuses) + ")")
         if parent: clauses.append(f'parent = "{parent}"')
         if fix_version: clauses.append(f'fixVersion = "{fix_version}"')
         if label: clauses.append(f'labels = "{label}"')
-        res = self._req("POST", "/rest/api/2/search", {"jql": " AND ".join(clauses) + " ORDER BY key ASC", "maxResults": 200})
-        return [self._norm(i) for i in res["issues"]]
+        for c in (type, status, parent, fix_version, label, *(statuses or [])):
+            if c and '"' in str(c):
+                raise JiraError("quote in a search value")
+        return " AND ".join(clauses) + " ORDER BY key ASC"
 
-    def create(self, type, summary, description, account, parent=None, fields=None, labels=None):
-        self._check_account(account)
-        body = {"fields": {"project": {"key": self.project}, "issuetype": {"name": type}, "summary": summary,
-                           "description": description or "", "labels": labels or []}}
+    def search(self, type=None, status=None, parent=None, fix_version=None, label=None, statuses=None):
+        return [self._norm(i) for i in self.jql(self.search_jql(type, status, parent, fix_version, label, statuses))]
+
+    def _paged(self, path, key):
+        """Offset-paginated list (changelog, comments) that must be provably complete."""
+        out, start = [], 0
+        while True:
+            sep = "&" if "?" in path else "?"
+            res = self._req("GET", f"{path}{sep}startAt={start}&maxResults=100")
+            items = res.get(key) or []
+            total = res.get("total")
+            if res.get("startAt", start) != start:
+                raise IncompleteRead(f"{path}: asked for startAt {start}, got {res.get('startAt')}")
+            out.extend(items)
+            start += len(items)
+            last = res.get("isLast")
+            if last is True or (last is None and total is not None and start >= total):
+                break
+            if not items:
+                raise IncompleteRead(f"{path}: empty page at {start} before the end (total {total})")
+        if total is not None and len(out) != total:
+            raise IncompleteRead(f"{path}: read {len(out)} of {total}")
+        ids = [x.get("id") for x in out]
+        if len(set(ids)) != len(ids):
+            raise IncompleteRead(f"{path}: duplicate entries across pages")
+        return out
+
+    def changelog(self, key):
+        entries = self._paged(f"/rest/api/3/issue/{urllib.parse.quote(key)}/changelog", "values")
+        return [{"id": h["id"], "created": h["created"],
+                 "author": {"accountId": (h.get("author") or {}).get("accountId"),
+                            "accountType": (h.get("author") or {}).get("accountType")},
+                 "items": [{"field": i.get("field"), "from": i.get("from"), "to": i.get("to"),
+                            "fromString": i.get("fromString"), "toString": i.get("toString")} for i in h.get("items", [])]}
+                for h in entries]
+
+    def comments(self, key):
+        res = self._paged(f"/rest/api/3/issue/{urllib.parse.quote(key)}/comment?orderBy=created", "comments")
+        return [{"id": c["id"], "created": c["created"], "author": person(c.get("author")),
+                 "body": adf_to_text(c.get("body")).strip()} for c in res]
+
+    def people(self, key):
+        f = self.raw(key)["fields"]
+        return person(f.get("reporter")), person(f.get("creator"))
+
+    def versions(self):
+        vs = self._req("GET", f"/rest/api/3/project/{self.project}/versions") or []
+        return [{"id": v["id"], "name": v["name"], "released": bool(v.get("released")), "archived": bool(v.get("archived")),
+                 "releaseDate": v.get("releaseDate")} for v in vs]
+
+    def attachment_content(self, key, attachment_id):
+        return self._req("GET", f"/rest/api/3/attachment/content/{urllib.parse.quote(str(attachment_id))}", raw=True)
+
+    # -- writes (agent token only)
+    def create(self, type, summary, description, actor, parent=None, fields=None, labels=None):
+        actor = _as_actor(actor)
+        if not actor.role:
+            raise JiraError("Cloud writes are agent-only; humans act in the Jira UI")
+        self._check_agent_token()
+        jt, extra = self._jira_type(type)
+        body = {"fields": {"project": {"key": self.project}, "issuetype": {"name": jt}, "summary": summary,
+                           "description": text_to_adf(description), "labels": sorted(set((labels or []) + extra))},
+                "properties": [{"key": "sox.actor", "value": {"role": actor.role, "run": _run_url()}}]}
+        if fields:
+            bad = [k for k in fields if k not in AGENT_FIELDS]
+            if bad:
+                raise JiraError(f"unknown field {bad}")
+            body["properties"].append({"key": "sox.agent", "value": fields})
         if parent:
             body["fields"]["parent"] = {"key": parent}
-        key = self._req("POST", "/rest/api/2/issue", body)["key"]
-        if fields:
-            self._req("PUT", f"/rest/api/2/issue/{key}/properties/sox.agent", fields)
-        return key
+        return self._req("POST", "/rest/api/3/issue", body)["key"]
 
-    def update(self, key, account, summary=None, description=None, fields=None):
-        self._check_account(account)
-        upd = {k: v for k, v in (("summary", summary), ("description", description)) if v is not None}
+    def update(self, key, actor, summary=None, description=None, fields=None):
+        actor = _as_actor(actor)
+        self._check_agent_token()
+        upd = {}
+        if summary is not None: upd["summary"] = summary
+        if description is not None: upd["description"] = text_to_adf(description)
         if upd:
-            self._req("PUT", f"/rest/api/2/issue/{key}", {"fields": upd})
+            self._req("PUT", f"/rest/api/3/issue/{key}", {"fields": upd})
         if fields:
-            props = self._props(key)
-            props.update(fields)
-            self._req("PUT", f"/rest/api/2/issue/{key}/properties/sox.agent", props)
+            bad = [k for k in fields if k not in AGENT_FIELDS]
+            if bad:
+                raise JiraError(f"unknown field {bad}")
+            cur = (self._req("GET", f"/rest/api/3/issue/{key}/properties/sox.agent", ok404=True) or {}).get("value") or {}
+            cur.update(fields)
+            self._req("PUT", f"/rest/api/3/issue/{key}/properties/sox.agent", cur)
 
-    def transition(self, key, to_status, account):
-        self._check_account(account)
-        target = self.status_map.get(to_status, to_status)
-        ts = self._req("GET", f"/rest/api/2/issue/{key}/transitions")["transitions"]
+    def transition(self, key, to_status, actor):
+        actor = _as_actor(actor)
+        self._check_transition(to_status, actor)
+        self._check_agent_token()
+        cur = self.raw(key)["fields"]["status"]["name"]
+        if cur == to_status:
+            return
+        ts = self._req("GET", f"/rest/api/3/issue/{key}/transitions")["transitions"]
         for t in ts:
-            if t["to"]["name"] == target:
-                return self._req("POST", f"/rest/api/2/issue/{key}/transitions", {"transition": {"id": t["id"]}})
-        raise JiraError(f"no transition from current status of {key} to {target!r}")
+            if t["to"]["id"] == STATUS_IDS[to_status]:
+                return self._req("POST", f"/rest/api/3/issue/{key}/transitions", {"transition": {"id": t["id"]}})
+        raise JiraError(f"no transition from {cur!r} of {key} to {to_status!r}")
 
-    def comment(self, key, body, account):
-        self._check_account(account)
-        return self._req("POST", f"/rest/api/2/issue/{key}/comment", {"body": body})["id"]
+    def comment(self, key, body, actor):
+        actor = _as_actor(actor)
+        self._check_agent_token()
+        return self._req("POST", f"/rest/api/3/issue/{key}/comment", {"body": text_to_adf(body)})["id"]
 
-    def attach(self, key, filename, content, account):
-        self._check_account(account)
+    def attach(self, key, filename, content, actor):
+        actor = _as_actor(actor)
+        self._check_agent_token()
         if isinstance(content, str):
             content = content.encode()
-        boundary = "soxboundary" + str(int(time.time()))
-        data = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
+        boundary = "soxboundary" + hashlib.sha256(content).hexdigest()[:24]
+        safe = filename.replace('"', "")
+        data = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{safe}\"\r\n"
                 f"Content-Type: application/octet-stream\r\n\r\n").encode() + content + f"\r\n--{boundary}--\r\n".encode()
-        res = self._req("POST", f"/rest/api/2/issue/{key}/attachments", data=data,
+        res = self._req("POST", f"/rest/api/3/issue/{key}/attachments", data=data,
                         headers={"X-Atlassian-Token": "no-check", "Content-Type": f"multipart/form-data; boundary={boundary}"})
         return res[0]["id"]
 
-    def attachment_content(self, key, attachment_id):
-        return self._req("GET", f"/rest/api/2/attachment/content/{attachment_id}", raw=True)
+    def set_fix_version(self, key, version, actor):
+        actor = _as_actor(actor)
+        self._check_agent_token()
+        if self.version_id(version) is None:
+            self._type_names()
+            self._req("POST", "/rest/api/3/version", {"name": version, "projectId": int(self._project_id)})
+        self._req("PUT", f"/rest/api/3/issue/{key}", {"update": {"fixVersions": [{"set": [{"name": version}]}]}})
 
-    def set_fix_version(self, key, version, account):
-        self._check_account(account)
-        self._req("PUT", f"/rest/api/2/issue/{key}", {"update": {"fixVersions": [{"set": [{"name": version}]}]}})
 
-    def changelog(self, key):
-        res = self._req("GET", f"/rest/api/2/issue/{key}/changelog?maxResults=100")
-        return [{"id": h["id"], "author": h["author"].get("displayName"), "created": h["created"],
-                 "items": [{"field": i["field"], "from": i.get("fromString"), "to": i.get("toString")} for i in h["items"]]}
-                for h in res["values"]]
-
-    def comments(self, key):
-        res = self._req("GET", f"/rest/api/2/issue/{key}/comment")
-        return [{"id": c["id"], "author": c["author"].get("displayName"), "body": c["body"], "created": c["created"]}
-                for c in res["comments"]]
+def _run_url():
+    s, r, i = os.environ.get("GITHUB_SERVER_URL"), os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_RUN_ID")
+    return f"{s}/{r}/actions/runs/{i}" if s and r and i else None
 
 
 def from_env(account=None):
-    backend = os.environ.get("SOX_JIRA_BACKEND", "file")
+    backend = os.environ.get("SOX_JIRA_BACKEND") or "cloud"
     if backend == "file":
         return FileJira(os.environ.get("SOX_JIRA_FILE", "jira-fake/jira.json"))
     if backend == "cloud":
-        token = os.environ.get("JIRA_API_TOKEN")
+        email, token = os.environ.get("SOX_JIRA_EMAIL"), os.environ.get("JIRA_API_TOKEN")
         if not token:
-            token_file = os.path.expanduser(os.environ.get("JIRA_API_TOKEN_FILE", "~/.factory/secrets/jira"))
-            with open(token_file) as f:
-                token = f.read().strip()
-        return CloudJira(os.environ.get("SOX_JIRA_SITE", "https://factory-dev-testing.atlassian.net"),
-                         os.environ["SOX_JIRA_EMAIL"], token, os.environ.get("SOX_JIRA_PROJECT", "FRQ"), account)
+            path = os.path.expanduser(os.environ.get("JIRA_CREDENTIALS_FILE", "~/.factory/secrets/jira"))
+            if not os.path.exists(path):
+                raise SystemExit("no Jira credentials: set JIRA_API_TOKEN and SOX_JIRA_EMAIL (env jira-attestor only)")
+            with open(path) as f:
+                lines = f.read().split("\n")
+            email, token = email or lines[0].strip(), lines[1].strip()
+        if not email:
+            raise SystemExit("SOX_JIRA_EMAIL is not set")
+        accounts = [a for a in os.environ.get("SOX_JIRA_AGENT_ACCOUNT_IDS", AUTOMATION_ACCOUNT).split(",") if a]
+        return CloudJira(os.environ.get("SOX_JIRA_SITE", SITE), email, token, os.environ.get("SOX_JIRA_PROJECT", PROJECT), accounts)
     raise SystemExit(f"unknown SOX_JIRA_BACKEND {backend!r}")
 
 
-def apply_ops(jira, ops, account):
-    """Apply a list of write operations as one service account. `$name` references resolve to keys
-    created earlier in the same list. Creates are idempotent through `idempotencyKey`."""
+def apply_ops(jira, ops, role):
+    """Apply a list of write operations as one agent role. `$name` references resolve to keys created
+    earlier in the same list. Creates are idempotent through `idempotencyKey`. Every create gets a
+    `[sox:<role>]` comment and every comment carries that prefix, so the acting role is visible in
+    Jira even though one account performs all agent writes."""
+    actor = _as_actor(role)
+    if not actor.role:
+        raise JiraError("apply_ops is for agent roles only")
+    prefix = role_prefix(actor.role)
     refs, results = {}, []
 
     def res(v):
         return refs.get(v[1:], v) if isinstance(v, str) and v.startswith("$") else v
+
+    def tagged(body):
+        return body if body.startswith(prefix) else f"{prefix} {body}"
 
     for op in ops:
         kind = op["op"]
@@ -349,26 +635,31 @@ def apply_ops(jira, ops, account):
             fields = dict(op.get("fields") or {})
             idem = fields.get("idempotencyKey")
             existing = jira.find_by_idempotency(idem) if idem else None
-            key = existing["key"] if existing else jira.create(op["type"], op["summary"], op.get("description", ""), account,
-                                                               parent=res(op.get("parent")), fields=fields, labels=op.get("labels"))
+            if existing:
+                key = existing["key"]
+            else:
+                key = jira.create(op["type"], op["summary"], op.get("description", ""), actor,
+                                  parent=res(op.get("parent")), fields=fields, labels=op.get("labels"))
+                run = _run_url()
+                jira.comment(key, tagged(f"Created by the {actor.role} agent" + (f" in {run}" if run else "") + "."), actor)
             if op.get("ref"):
                 refs[op["ref"]] = key
             results.append({"op": "create", "key": key, "existing": bool(existing)})
         elif kind == "update":
             fields = {k: ([res(x) for x in v] if k == "dependsOn" and isinstance(v, list) else v)
                       for k, v in (op.get("fields") or {}).items()}
-            jira.update(res(op["key"]), account, op.get("summary"), op.get("description"), fields)
+            jira.update(res(op["key"]), actor, op.get("summary"), op.get("description"), fields)
             results.append({"op": "update", "key": res(op["key"])})
         elif kind == "transition":
-            jira.transition(res(op["key"]), op["to"], account)
+            jira.transition(res(op["key"]), op["to"], actor)
             results.append({"op": "transition", "key": res(op["key"]), "to": op["to"]})
         elif kind == "comment":
-            results.append({"op": "comment", "key": res(op["key"]), "id": jira.comment(res(op["key"]), op["body"], account)})
+            results.append({"op": "comment", "key": res(op["key"]), "id": jira.comment(res(op["key"]), tagged(op["body"]), actor)})
         elif kind == "attach":
             results.append({"op": "attach", "key": res(op["key"]),
-                            "id": jira.attach(res(op["key"]), op["filename"], op["content"], account)})
+                            "id": jira.attach(res(op["key"]), op["filename"], op["content"], actor)})
         elif kind == "fixVersion":
-            jira.set_fix_version(res(op["key"]), op["version"], account)
+            jira.set_fix_version(res(op["key"]), op["version"], actor)
             results.append({"op": "fixVersion", "key": res(op["key"]), "version": op["version"]})
         else:
             raise JiraError(f"unknown op {kind}")
