@@ -20,17 +20,13 @@ CHECK_NAME = "sox/review-agent"
 MAX_ROUNDS = int(os.environ.get("SOX_MAX_REVIEW_ROUNDS", "10"))
 MAX_DIFF_BYTES = 400_000
 SWEEP_LIMIT = 5
-FIXTURE_SHA = "4de627863b24da9d1588afb81d1275ab5fe72d27"
 
 
 def resolve(args):
     gh = GitHub()
     event = os.environ.get("GITHUB_EVENT_NAME", "")
     if event == "workflow_dispatch":
-        raw = os.environ.get("INPUT_PR", "").strip()
-        if raw == "0":
-            set_output("fixture", "true"); set_output("prs", "[]"); return
-        prs = [positive_int(raw, "pr")]
+        prs = [positive_int(os.environ.get("INPUT_PR", "").strip(), "pr")]
     elif event == "schedule":
         prs = []
         for pr in gh.paginate(f"/repos/{REPO}/pulls?state=open&sort=updated&direction=desc", limit=100):
@@ -43,7 +39,6 @@ def resolve(args):
                 break
     else:
         raise SystemExit(f"unsupported trigger {event}")
-    set_output("fixture", "false")
     set_output("prs", json.dumps(prs))
 
 
@@ -316,29 +311,6 @@ def check_finish(args):
     print(f"{CHECK_NAME} -> {conclusion}")
 
 
-def fixture(args):
-    """Verifier test data only: a genuine main-signed review-verdict over the fixed subjects that the
-    branch-minted forgery uses (pr:0, commit:4de6278...). PR 0 cannot exist, so no real gate binds to it."""
-    sha = FIXTURE_SHA
-    predicate = {
-        "schema": "sox/common/v1", "repo": REPO, "prNumber": 0, "headSha": sha, "baseSha": sha,
-        "baseRef": "refs/heads/main", "jiraKeys": ["FRQ-0"], "release": "testdata", "step": "SDLC-06",
-        "actor": {"type": "workflow", "login": "sox-review-agent.yml", "source": "verifier testdata fixture, no App token"},
-        "inputs": [], "inputsDigest": digest_of([]), "outcome": "pass", "round": 1, "loopKey": "pr:0",
-        "observedAt": now_utc(),
-        "attestor": {"workflow": ".github/workflows/sox-review-agent.yml", "ref": os.environ.get("GITHUB_REF"),
-                     "runId": int(os.environ.get("GITHUB_RUN_ID", "0")), "runAttempt": int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")),
-                     "codeSha": os.environ.get("GITHUB_SHA")},
-        "upstream": [], "verdict": "pass", "findingsDigest": digest_of([]), "diffDigest": digest_of([]),
-        "checkRunId": 0, "reviewerAppId": 0, "authorAppId": 0, "fixture": True, "findings": [],
-        "agentClaims": {"summary": "Verifier testdata: genuine review-verdict minted by sox-review-agent.yml on refs/heads/main. Must PASS signer verification; binds to no real PR."},
-    }
-    os.makedirs(args.out, exist_ok=True)
-    dump_json(f"{args.out}/predicate.json", predicate)
-    with open(f"{args.out}/subjects.txt", "w") as f:
-        f.write(subject_lines([("commit", sha), ("pr", 0)]))
-
-
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -348,10 +320,9 @@ def main():
     r = sub.add_parser("record"); r.add_argument("--dir", required=True); r.add_argument("--out", required=True)
     s = sub.add_parser("check-start"); s.add_argument("--out", required=True)
     t = sub.add_parser("check-finish"); t.add_argument("--out", required=True)
-    f = sub.add_parser("fixture"); f.add_argument("--out", required=True)
     args = ap.parse_args()
     {"resolve": resolve, "prepare": prepare, "parse": parse, "record": record, "check-start": check_start,
-     "check-finish": check_finish, "fixture": fixture}[args.cmd](args)
+     "check-finish": check_finish}[args.cmd](args)
 
 
 if __name__ == "__main__":
