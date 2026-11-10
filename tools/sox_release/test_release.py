@@ -206,8 +206,32 @@ def pr(n, head_ref, head, merge, base="main"):
             "head": {"ref": head_ref, "sha": head}}
 
 
+CHECK_PREDS = {"sox/evidence-gate": ("gate-decision", "conclusion", "success", 3),
+               "sox/review-agent": ("review-verdict", "verdict", "pass", 1),
+               "sox/qa-agent": ("qa-result", "outcome", "pass", 2)}
+
+
+def paired_checks(head, n, mutate=None):
+    """merge-record.checks[] and the attestations each check pairs with, for PR n at head."""
+    checks, atts = [], {}
+    for i, (name, (pred, field, want, app)) in enumerate(sorted(CHECK_PREDS.items())):
+        run_id, cr = 9000 + n * 10 + i, 500 + n * 10 + i
+        dig = f"sha256:{n:02d}{i}" + "a" * 61
+        checks.append({"name": name, "checkRunId": cr, "appId": app, "conclusion": "success", "externalId": str(run_id),
+                       "pairedAttestation": dig, "paired": True})
+        a = att({"checkRunId": cr, "headSha": head, field: want}, digest=dig)
+        a["run"] = f"https://github.com/{common.REPO}/actions/runs/{run_id}/attempts/1"
+        atts[pred] = [a]
+    if mutate:
+        mutate(checks, atts)
+    return checks, atts
+
+
 class Train(unittest.TestCase):
     today = dt.date(2026, 11, 11)
+    POLICY = {"apps": {"review": {"id": 1}, "qa": {"id": 2}, "gate": {"id": 3}},
+              "requiredChecks": {"sox/review-agent": "review", "sox/qa-agent": "qa", "sox/evidence-gate": "gate"},
+              "predicates": {"review-verdict": {"checkName": "sox/review-agent"}, "qa-result": {"checkName": "sox/qa-agent"}}}
 
     def gh(self, prs_by_commit, files):
         routes = {f"/repos/{common.REPO}/compare/{M1}...{M3}": {
@@ -221,14 +245,21 @@ class Train(unittest.TestCase):
             routes[f"/repos/{common.REPO}/pulls/{n}/files"] = [{"filename": f} for f in fl]
         return FakeGH(routes)
 
-    def fetch_factory(self, approved=True, prod_state=None, missing=()):
+    def fetch_factory(self, approved=True, prod_state=None, missing=(), mutate=None):
+        heads = {10: "h" * 40, 11: H}
+        paired = {n: paired_checks(h, n, mutate if n == 11 else None) for n, h in heads.items()}
+
         def fetch(subject, name):
             kind, ident = subject.split(":", 1)
             if name in missing:
                 return []
             if name == "merge-record" and kind == "commit":
                 n = {M2: 10, M3: 11}[ident]
-                return [att({"mergeCommitSha": ident, "prNumber": n, "treeMatch": True, "jiraKeys": [f"FRQ-{n}"]})]
+                return [att({"mergeCommitSha": ident, "prNumber": n, "treeMatch": True, "jiraKeys": [f"FRQ-{n}"],
+                             "checks": paired[n][0]})]
+            if name in ("gate-decision", "review-verdict", "qa-result"):
+                n = next((k for k, h in heads.items() if kind == "commit" and ident == h), None)
+                return paired[n][1].get(name, []) if n else []
             if name == "human-approval":
                 n = int(ident)
                 return [att({"commitId": {10: "h" * 40, 11: H}[n], "prNumber": n, "baseRef": "refs/heads/main",
@@ -257,7 +288,7 @@ class Train(unittest.TestCase):
 
     def test_order_and_only_changed(self):
         p = train.plan(self.standard_gh(), self.fetch_factory(prod_state={"db": D_OLD["db"], "api": D["api"], "ui": D_OLD["ui"]}),
-                       M3, self.today, M1)
+                       M3, self.today, M1, policy=self.POLICY)
         self.assertEqual(p["outcome"], "planned", p["problems"])
         self.assertEqual(p["order"], ["db", "ui"])
         self.assertEqual(p["restore"], {"api": D["api"]})
@@ -265,28 +296,64 @@ class Train(unittest.TestCase):
         self.assertEqual(p["previousTrainCutoffSha"], M1)
 
     def test_first_train_deploys_all_in_dependency_order(self):
-        p = train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1)
+        p = train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1, policy=self.POLICY)
         self.assertEqual(p["order"], ["db", "api", "ui"])
 
     def test_whole_train_refuses_on_any_unapproved_merge(self):
         gh = self.gh({M2: pr(10, "release/a", "h" * 40, M2), M3: pr(11, "release/b", H, M3)}, {10: [], 11: []})
-        p = train.plan(gh, self.fetch_factory(missing=("human-approval",)), M3, self.today, M1)
+        p = train.plan(gh, self.fetch_factory(missing=("human-approval",)), M3, self.today, M1, policy=self.POLICY)
         self.assertEqual((p["outcome"], p["order"]), ("refused", []))
         gh = self.gh({M2: None, M3: pr(11, "release/b", H, M3)}, {11: []})
-        self.assertEqual(train.plan(gh, self.fetch_factory(), M3, self.today, M1)["outcome"], "refused")
+        self.assertEqual(train.plan(gh, self.fetch_factory(), M3, self.today, M1, policy=self.POLICY)["outcome"], "refused")
 
     def test_refuses_without_release_approval(self):
-        p = train.plan(self.standard_gh(), self.fetch_factory(approved=False), M3, self.today, M1)
+        p = train.plan(self.standard_gh(), self.fetch_factory(approved=False), M3, self.today, M1, policy=self.POLICY)
         self.assertEqual(p["outcome"], "refused")
         self.assertTrue(any("release-approval" in x for x in p["problems"]))
 
+    def test_refuses_unpaired_or_mismatched_check(self):
+        self.assertEqual(train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1, policy=self.POLICY)["outcome"], "planned")
+
+        def drop(checks, atts):
+            checks[:] = [c for c in checks if c["name"] != "sox/qa-agent"]
+
+        def unpaired(checks, atts):
+            checks[0]["paired"] = False
+
+        def no_attestation(checks, atts):
+            atts["review-verdict"] = []
+
+        def other_run(checks, atts):
+            atts["gate-decision"][0]["run"] = f"https://github.com/{common.REPO}/actions/runs/1/attempts/1"
+
+        def other_check_run(checks, atts):
+            atts["qa-result"][0]["predicate"]["checkRunId"] = 1
+
+        def other_head(checks, atts):
+            atts["review-verdict"][0]["predicate"]["headSha"] = M1
+
+        def failed_outcome(checks, atts):
+            atts["qa-result"][0]["predicate"]["outcome"] = "fail"
+
+        def foreign_app(checks, atts):
+            checks[1]["appId"] = 99
+
+        cases = {"missing": drop, "unpaired": unpaired, "no attestation": no_attestation, "run": other_run,
+                 "checkRunId": other_check_run, "head": other_head, "outcome": failed_outcome, "app": foreign_app}
+        for label, mutate in cases.items():
+            p = train.plan(self.standard_gh(), self.fetch_factory(mutate=mutate), M3, self.today, M1, policy=self.POLICY)
+            self.assertEqual((p["outcome"], p["order"]), ("refused", []), label)
+            self.assertTrue(any(x.startswith("PR #11 sox/") for x in p["problems"]), (label, p["problems"]))
+        null_ids = dict(self.POLICY, apps={"review": {"id": None}, "qa": {"id": 2}, "gate": {"id": 3}})
+        self.assertEqual(train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1, policy=null_ids)["outcome"], "refused")
+
     def test_story_branch_merged_into_main_refuses(self):
         gh = self.gh({M2: pr(10, "story/FRQ-1-x", "h" * 40, M2), M3: pr(11, "release/b", H, M3)}, {10: [], 11: []})
-        self.assertEqual(train.plan(gh, self.fetch_factory(), M3, self.today, M1)["outcome"], "refused")
+        self.assertEqual(train.plan(gh, self.fetch_factory(), M3, self.today, M1, policy=self.POLICY)["outcome"], "refused")
 
     def test_plan_digest_stable(self):
-        a = train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1)
-        b = train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1)
+        a = train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1, policy=self.POLICY)
+        b = train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1, policy=self.POLICY)
         self.assertEqual(train.plan_digest(a), train.plan_digest(b))
 
 
