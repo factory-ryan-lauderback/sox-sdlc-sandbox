@@ -1,0 +1,54 @@
+name: sox-gate-relay
+# Secret-less relay for sox/evidence-gate. It holds only a GITHUB_TOKEN with actions: write and
+# does one thing: dispatch sox-gate.yml on main with a PR number. It never checks out code,
+# passes no other event data, and is never a signer (the trust-policy loader refuses relay files).
+# pull_request_target and pull_request_review run this file from the PR's base branch, which is
+# why the gate itself (which holds the Gate App key in the main-only sox-gate environment) is a
+# separate workflow_dispatch workflow. A dropped event is repaired by the 15-minute sweep; until
+# then the check stays expected or in_progress, so the PR stays blocked.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review, closed]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  check_run:
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          dispatch() {
+            case "$1" in ''|*[!0-9]*) echo "skip non-numeric PR '$1'"; return 0;; esac
+            gh workflow run sox-gate.yml --repo "$GITHUB_REPOSITORY" --ref main -f pr="$1"
+          }
+          case "$EVENT" in
+            pull_request_target|pull_request_review)
+              dispatch "$PR" ;;
+            check_run)
+              # Only the agent checks the gate depends on; never the gate's own check (that
+              # would loop). Lookup hint only: the gate re-reads checks and the PR from the API.
+              jq -r 'select(.check_run.app.slug == "acme-review-agent" or .check_run.app.slug == "acme-qa-agent")
+                     | .check_run.pull_requests[]?.number' "$GITHUB_EVENT_PATH" | sort -u |
+                while read -r n; do dispatch "$n"; done ;;
+            schedule)
+              since=$(date -u -d '-2 days' +%Y-%m-%dT%H:%M:%SZ)
+              {
+                gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" --paginate --jq '.[].number'
+                gh api "repos/$GITHUB_REPOSITORY/pulls?state=closed&base=main&sort=updated&direction=desc&per_page=100" \
+                  --jq ".[] | select(.merged_at != null and .merged_at >= \"$since\") | .number"
+              } | sort -un | while read -r n; do dispatch "$n"; done ;;
+          esac
