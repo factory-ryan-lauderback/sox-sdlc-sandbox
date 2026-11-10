@@ -1,0 +1,9 @@
+# Only human approvers appear here. GitHub Apps cannot be code owners, and the repository owner
+# account is Platform Admin only, so it is deliberately absent.
+*                 @factory-aman
+/.github/         @factory-aman
+/.sox/            @factory-aman
+/.factory/        @factory-aman
+/tools/           @factory-aman
+/CODEOWNERS       @factory-aman
+/.github/CODEOWNERS @factory-aman

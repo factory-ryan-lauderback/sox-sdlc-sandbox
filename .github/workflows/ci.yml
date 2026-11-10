@@ -1,0 +1,36 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: |
+          python -m unittest discover -s services -p "test_*.py" -t . -v
+          python -m unittest discover -s tools -p "test_*.py" -t . -v
+      - name: Deploy order
+        run: python tools/deploy_order.py --json
+  docker-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [db, api, ui]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build image
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: docker build -t "acme-lending/$SERVICE:ci" "services/$SERVICE"

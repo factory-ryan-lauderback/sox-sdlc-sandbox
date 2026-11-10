@@ -1,0 +1,7 @@
+name: ui
+description: Loan list UI
+port: 8003
+depends_on: [api]
+paths:
+  - services/ui/**
+image: acme-lending/ui

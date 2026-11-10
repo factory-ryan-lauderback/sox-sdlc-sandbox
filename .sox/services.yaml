@@ -1,0 +1,10 @@
+# Index of deployable services. Dependencies are declared in each service's own manifest;
+# tools/deploy_order.py combines them and fails on unknown or cyclic dependencies.
+version: 1
+services:
+  - name: db
+    manifest: services/db/service.yaml
+  - name: api
+    manifest: services/api/service.yaml
+  - name: ui
+    manifest: services/ui/service.yaml

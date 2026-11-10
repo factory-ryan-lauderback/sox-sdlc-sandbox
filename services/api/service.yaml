@@ -1,0 +1,7 @@
+name: api
+description: Loan API
+port: 8002
+depends_on: [db]
+paths:
+  - services/api/**
+image: acme-lending/api

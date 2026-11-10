@@ -1,0 +1,7 @@
+name: db
+description: In-memory loan store
+port: 8001
+depends_on: []
+paths:
+  - services/db/**
+image: acme-lending/db
