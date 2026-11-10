@@ -294,6 +294,9 @@ class TestRealCrypto(unittest.TestCase):
     def test_good_review_verdict_verifies(self):
         att = Verifier.load(POLICY).verify(load(GOOD), predicate="review-verdict")
         self.assertEqual(att.identity["sourceRepositoryRef"], "refs/heads/main")
+        # Minted as a fixture: verifiable, but never evidence for a gate rule.
+        from soxlib.evidence import is_fixture
+        self.assertTrue(is_fixture(att))
 
 
 class TestImageSubjects(unittest.TestCase):

@@ -47,7 +47,10 @@
       "rounds": "LOOP-R/LOOP-Q count distinct heads (F11)",
       "loop_h": "per release: CHANGES_REQUESTED (incl. dismissed) on any PR from the same head branch into main, plus attested human-changes-requested for release:<slug>, pr:<n>, and jira:<key> of every story and epic in the release (F14, BP-39g); cleared only by a new techlead-plan per epic with an unused digest attested after the request, and a new head (BP-39)",
       "scope": "every PR: each changed path maps through .sox/services.yaml on main (service manifest paths, the shared section, control paths -> pseudo-service controls). Failures: SDLC-04.unmapped-path, SDLC-04.out-of-scope (touched service, incl. controls, not in the latest verified release-manifest), SDLC-04.manifest-stale (servicesMapDigest is not the git blob of .sox/services.yaml on main), SDLC-04.story-not-in-manifest, SDLC-04.story-in-two-releases (BP-38a-f)",
-      "approval_packet": "human-approval.packet binds releaseManifest (digest of the latest verified release-manifest), stories[], declaredServices[], planDigests; an approval given on an earlier packet for the same head fails with SDLC-09.approval-stale until the new packet is presented and approved (BP-38e)"
+      "approval_packet": "human-approval.packet binds releaseManifest (digest of the latest verified release-manifest), stories[], declaredServices[], planDigests; an approval given on an earlier packet for the same head fails with SDLC-09.approval-stale until the new packet is presented and approved (BP-38e)",
+      "jira_identities": "Jira identities are Atlassian accountIds. SDLC-01 requirement, SDLC-03b approach and CC-04 ECAB approvals are re-derived from the changelog in the attestation: the latest transition to jira.approvalStatuses[type] (10071, 10082, 10089) after the last change to jira.contentFields (summary, description, Attachment), whose author has accountType atlassian, is listed in jira.humanApprovers[type], is not in jira.neverApprovers or the sharedAutomationAccount, and is not the issue reporter or creator. Agent-created Epics and stories (SDLC-02, SDLC-03) need creator == jira.agentAccounts[role], or creator == jira.sharedAutomationAccount with actingRole == role (issue property sox.actingRole) and actingRoleComment true ([sox:<role>] comment); the shared case is recorded as facts.jiraSharedIdentity (jira-shared-identity) and reported by reconciliation",
+      "fixtures": "a verified attestation whose predicate has fixture set to anything but null/false is never evidence: it is dropped before any gate rule, approval, verdict or LOOP-R/LOOP-Q round count, and kept aside for reconciliation to report",
+      "story_type": "SDLC-03.plan requires the story's type in the techlead-plan to be dev or qa; the plan is the only source of the type (never Jira labels or issue types); recorded as facts.storyTypes"
     }
   },
   "verifier": {
@@ -67,7 +70,8 @@
     ],
     "testdata": {
       "good": ".sox/testdata/good-review-verdict.bundle.json",
-      "branch_minted": ".sox/testdata/branch-minted-review-verdict.bundle.json"
+      "branch_minted": ".sox/testdata/branch-minted-review-verdict.bundle.json",
+      "good_is_fixture": true
     },
     "attestation_digest": "sha256 of the in-toto statement bytes (base64-decoded DSSE payload)",
     "loader_rules": "the whole policy is rejected if a signer file name contains relay/observer/probe or is not an allowlisted sox-*.yml signer, any predicate allows pull_request/pull_request_target/push, a sox-gate.yml predicate allows anything but workflow_dispatch, a sourceRef is not refs/heads/main, or a human role list contains a neverApprovers login"
@@ -77,5 +81,18 @@
     "index_path": "https://github.com/factory-ryan-lauderback/sox-sdlc-evidence/blob/main/reports/index.json",
     "immutable_store": "rekor+github: every report is attested (predicate https://acme-lending.example/sox/reconciliation-report/v1, Sigstore public-good Rekor) and stored create-only in factory-ryan-lauderback/sox-sdlc-evidence (repo id 1453113434), written only by acme-sox-evidence-writer",
     "workflow": ".github/workflows/sox-reconcile.yml"
+  },
+  "scope": {
+    "$comment": "Gates/evidence fills map, rules and code; Release fills release_pr, release_branch and declared_services after the go-live end-to-end run.",
+    "map": ".sox/services.yaml",
+    "map_digest": "git blob SHA of .sox/services.yaml on main; release-manifest.servicesMapDigest must equal it (SDLC-04.manifest-stale)",
+    "rules": "every PR: each changed path maps through .sox/services.yaml on main (service manifest paths, the shared section, control paths -> pseudo-service controls). Failures: SDLC-04.unmapped-path, SDLC-04.out-of-scope (touched service, incl. controls, not in the latest verified release-manifest), SDLC-04.manifest-stale (servicesMapDigest is not the git blob of .sox/services.yaml on main), SDLC-04.story-not-in-manifest, SDLC-04.story-in-two-releases (BP-38a-f)",
+    "code": [
+      ".sox/soxlib/scope.py",
+      ".sox/soxlib/gate.py"
+    ],
+    "release_pr": null,
+    "release_branch": null,
+    "declared_services": null
   }
 }
