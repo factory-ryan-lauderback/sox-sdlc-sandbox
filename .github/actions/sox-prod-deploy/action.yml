@@ -1,0 +1,128 @@
+name: sox-prod-deploy
+description: >
+  Deploy a verified train or emergency plan to the simulated production cluster (kind, namespace
+  svc-prod, Kyverno prod policy requiring build provenance and release-approval), one service at
+  a time in plan order, and sign one deploy-result per service. Used only by the pinned
+  deploy-result signers (sox-deploy-train.yml, sox-deploy-emergency.yml) inside their production
+  environment job. The job needs contents:read, packages:read, deployments:read, id-token:write
+  and attestations:write.
+inputs:
+  plan:
+    description: Path to the verified plan JSON
+    required: true
+  environment:
+    description: production or production-emergency (the job's environment)
+    required: true
+  workflow:
+    description: Calling workflow path, recorded in the predicate
+    required: true
+  github-token:
+    required: true
+outputs:
+  outcome:
+    description: success when every planned service deployed and read back correctly
+    value: ${{ steps.deploy.outputs.outcome }}
+runs:
+  using: composite
+  steps:
+    - name: Namespace spec
+      shell: bash
+      run: echo '{"envId":"svc-prod","images":[]}' > "$RUNNER_TEMP/svc-prod.json"
+    - uses: ./.github/actions/sox-env-up
+      with:
+        spec: ${{ runner.temp }}/svc-prod.json
+        policy: prod
+        deploy: none
+        registry-token: ${{ inputs.github-token }}
+    - name: Deploy in order (stop at first failure)
+      id: deploy
+      shell: bash
+      env:
+        PLAN: ${{ inputs.plan }}
+      run: |
+        set -uo pipefail
+        rc=0
+        python3 -m tools.sox_release.prod deploy --plan "$PLAN" --out "$RUNNER_TEMP/results.json" || rc=$?
+        if [ "$rc" = 0 ]; then echo "outcome=success" >> "$GITHUB_OUTPUT"; else echo "outcome=failure" >> "$GITHUB_OUTPUT"; fi
+        n=$(jq '.results | length' "$RUNNER_TEMP/results.json")
+        [ "$n" -le 3 ] || { echo "more than 3 services; add result slots"; exit 1; }
+        echo "count=$n" >> "$GITHUB_OUTPUT"
+        kubectl -n svc-prod get pods -o wide || true
+    - name: Deployment record
+      id: dep
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        ENVIRONMENT: ${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        dep=$(python3 -m tools.sox_release.prod deployment-id --environment "$ENVIRONMENT" --sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" || true)
+        echo "id=$dep" >> "$GITHUB_OUTPUT"
+        echo "deployment record: ${dep:-not found}"
+    - name: deploy-result 1
+      id: r1
+      if: steps.deploy.outputs.count >= 1
+      shell: bash
+      env:
+        PLAN: ${{ inputs.plan }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        WORKFLOW: ${{ inputs.workflow }}
+        DEP: ${{ steps.dep.outputs.id }}
+      run: |
+        set -euo pipefail
+        run=$(jq -n --arg w "$WORKFLOW" --arg r "$GITHUB_RUN_ID" --arg a "$GITHUB_RUN_ATTEMPT" --arg s "$GITHUB_SHA" --arg t "$GITHUB_EVENT_NAME" \
+          '{workflow:$w, ref:"refs/heads/main", runId:($r|tonumber), runAttempt:($a|tonumber), codeSha:$s, trigger:$t}')
+        python3 -m tools.sox_release.prod result --plan "$PLAN" --results "$RUNNER_TEMP/results.json" --slot 0 \
+          ${DEP:+--deployment-id "$DEP"} --run "$run" --environment "$ENVIRONMENT" \
+          --predicate-out "$RUNNER_TEMP/dr1.json" --subjects-out "$RUNNER_TEMP/dr1.txt"
+    - if: steps.deploy.outputs.count >= 1
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+      with:
+        subject-checksums: ${{ runner.temp }}/dr1.txt
+        predicate-type: https://acme-lending.example/sox/deploy-result/v1
+        predicate-path: ${{ runner.temp }}/dr1.json
+    - name: deploy-result 2
+      if: steps.deploy.outputs.count >= 2
+      shell: bash
+      env:
+        PLAN: ${{ inputs.plan }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        WORKFLOW: ${{ inputs.workflow }}
+        DEP: ${{ steps.dep.outputs.id }}
+      run: |
+        set -euo pipefail
+        run=$(jq -n --arg w "$WORKFLOW" --arg r "$GITHUB_RUN_ID" --arg a "$GITHUB_RUN_ATTEMPT" --arg s "$GITHUB_SHA" --arg t "$GITHUB_EVENT_NAME" \
+          '{workflow:$w, ref:"refs/heads/main", runId:($r|tonumber), runAttempt:($a|tonumber), codeSha:$s, trigger:$t}')
+        python3 -m tools.sox_release.prod result --plan "$PLAN" --results "$RUNNER_TEMP/results.json" --slot 1 \
+          ${DEP:+--deployment-id "$DEP"} --run "$run" --environment "$ENVIRONMENT" \
+          --predicate-out "$RUNNER_TEMP/dr2.json" --subjects-out "$RUNNER_TEMP/dr2.txt"
+    - if: steps.deploy.outputs.count >= 2
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+      with:
+        subject-checksums: ${{ runner.temp }}/dr2.txt
+        predicate-type: https://acme-lending.example/sox/deploy-result/v1
+        predicate-path: ${{ runner.temp }}/dr2.json
+    - name: deploy-result 3
+      if: steps.deploy.outputs.count >= 3
+      shell: bash
+      env:
+        PLAN: ${{ inputs.plan }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        WORKFLOW: ${{ inputs.workflow }}
+        DEP: ${{ steps.dep.outputs.id }}
+      run: |
+        set -euo pipefail
+        run=$(jq -n --arg w "$WORKFLOW" --arg r "$GITHUB_RUN_ID" --arg a "$GITHUB_RUN_ATTEMPT" --arg s "$GITHUB_SHA" --arg t "$GITHUB_EVENT_NAME" \
+          '{workflow:$w, ref:"refs/heads/main", runId:($r|tonumber), runAttempt:($a|tonumber), codeSha:$s, trigger:$t}')
+        python3 -m tools.sox_release.prod result --plan "$PLAN" --results "$RUNNER_TEMP/results.json" --slot 2 \
+          ${DEP:+--deployment-id "$DEP"} --run "$run" --environment "$ENVIRONMENT" \
+          --predicate-out "$RUNNER_TEMP/dr3.json" --subjects-out "$RUNNER_TEMP/dr3.txt"
+    - if: steps.deploy.outputs.count >= 3
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+      with:
+        subject-checksums: ${{ runner.temp }}/dr3.txt
+        predicate-type: https://acme-lending.example/sox/deploy-result/v1
+        predicate-path: ${{ runner.temp }}/dr3.json
+    - name: Keep results
+      shell: bash
+      run: cp "$RUNNER_TEMP/results.json" deploy-results.json

@@ -1,0 +1,125 @@
+name: sox-deploy-train
+# SDLC-11 daily deploy train. Collects every release merged into main since the last completed
+# train, refuses the whole train if any merge in the window lacks verified merge-record and
+# human-approval evidence, and deploys each changed service once, in dependency order (db -> api
+# -> ui), through the `production` environment (required reviewer, prevent self-review).
+#
+# Signs train-plan (plan job) and deploy-result per service (deploy job). Runs only from main on
+# schedule or a no-input workflow_dispatch: nothing a dispatcher supplies changes the plan.
+on:
+  schedule:
+    - cron: "30 14 * * *"
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: sox-production
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      attestations: write
+      id-token: write
+    outputs:
+      outcome: ${{ steps.plan.outputs.outcome }}
+    steps:
+      - name: Refuse non-main refs
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = "refs/heads/main" ] || { echo "sox-deploy-train runs only from refs/heads/main, not $REF"; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Plan the train
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOX_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -m tools.sox_release.train --mode train --cutoff "$GITHUB_SHA" --out train-plan.json --subjects-out train-subjects.txt
+          echo "outcome=$(jq -r .outcome train-plan.json)" >> "$GITHUB_OUTPUT"
+          jq '{trainId, outcome, cutoffSha, previousTrainCutoffSha, order, releases: [.releases[] | {prNumber, slug, mergeCommitSha}], problems}' train-plan.json
+      - name: Attest train-plan
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: train-subjects.txt
+          predicate-type: https://acme-lending.example/sox/train-plan/v1
+          predicate-path: train-plan.json
+      - name: Keep the bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE" train-plan.bundle.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: train-plan
+          path: |
+            train-plan.json
+            train-plan.bundle.json
+      - name: Refused trains fail
+        env:
+          OUTCOME: ${{ steps.plan.outputs.outcome }}
+        run: '[ "$OUTCOME" != refused ] || { echo "train refused; see problems in the signed train-plan"; exit 1; }'
+
+  deploy:
+    needs: plan
+    if: needs.plan.outputs.outcome == 'planned'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: production
+    permissions:
+      contents: read
+      pull-requests: read
+      packages: read
+      deployments: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Refuse non-main refs
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = "refs/heads/main" ] || { echo "runs only from refs/heads/main"; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: train-plan
+      - name: Verify the signed plan and re-plan after the approval wait
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOX_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          day=$(jq -r .trainDate train-plan.json)
+          python3 .sox/verify_evidence.py --bundle train-plan.bundle.json --predicate train-plan \
+            --expect "train:$day" --expect "commit:$GITHUB_SHA" > verified.json
+          signed=$(jq -r .predicateFields.planDigest verified.json)
+          [ "$signed" = "$(jq -r .planDigest train-plan.json)" ] || { echo "plan file differs from the signed plan"; exit 1; }
+          python3 -m tools.sox_release.train --mode train --cutoff "$GITHUB_SHA" --today "$day" --out replan.json --subjects-out replan-subjects.txt
+          [ "$(jq -r .planDigest replan.json)" = "$signed" ] || { echo "evidence or production state changed since the plan was signed; refusing"; jq .problems replan.json; exit 1; }
+          jq --arg d "$(jq -r .digest verified.json)" '. + {trainPlanAttestation: $d}' train-plan.json > plan.json
+      - id: prod
+        uses: ./.github/actions/sox-prod-deploy
+        with:
+          plan: plan.json
+          environment: production
+          workflow: .github/workflows/sox-deploy-train.yml
+          github-token: ${{ github.token }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: deploy-results
+          path: deploy-results.json
+          if-no-files-found: ignore
+      - name: Fail when any service failed
+        env:
+          OUTCOME: ${{ steps.prod.outputs.outcome }}
+        run: '[ "$OUTCOME" = success ] || { echo "deploy failed; deploy-results attested"; exit 1; }'

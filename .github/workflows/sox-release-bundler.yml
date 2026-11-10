@@ -1,0 +1,62 @@
+name: sox-release-bundler
+# SDLC-04 Release Bundler and SDLC-10 Shipping Dock (tools/sox_release/bundler.py). One idempotent
+# sweep per run: create release/<slug> for each Jira fix version with a verified release-manifest,
+# sync main into it, squash-merge story PRs whose required checks passed on their head, keep the
+# draft release PR in sync, and merge the approved release PR into main with a merge commit.
+# Writes use the Release Bundler App (contents and pull requests only), whose key lives in the
+# main-only `release-bundler` environment. No dispatch inputs.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  check_run:
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: sox-release-bundler
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release-bundler
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      attestations: read
+    steps:
+      - name: Refuse non-main refs
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = "refs/heads/main" ] || { echo "sox-release-bundler runs only from refs/heads/main, not $REF"; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.BUNDLER_APP_ID }}
+          private-key: ${{ secrets.BUNDLER_APP_PRIVATE_KEY }}
+      - name: Sweep
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOX_GITHUB_TOKEN: ${{ github.token }}
+          SOX_BUNDLER_TOKEN: ${{ steps.app.outputs.token }}
+          SOX_JIRA_BACKEND: ${{ vars.SOX_JIRA_BACKEND || 'file' }}
+          SOX_JIRA_STORE_BRANCH: sox-jira-fake
+          SOX_JIRA_FILE: ${{ runner.temp }}/jira-fake/jira.json
+        run: |
+          set -euo pipefail
+          python3 -m tools.sox_release.bundler --out bundler-run.json --jira-ops-out bundler-jira-ops.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: jira-ops-bundler
+          path: bundler-jira-ops.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundler-run
+          path: bundler-run.json

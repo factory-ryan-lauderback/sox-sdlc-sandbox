@@ -1,0 +1,372 @@
+name: sox-env-deploy
+# SDLC-07. Builds each service image once (content-addressed by its source tree), signs build
+# provenance, deploys a story or shared QA environment with `tilt ci` on kind, reads the running
+# digests back from the cluster, and signs an env-deploy attestation.
+#
+# Runs only from main (check_run, workflow_dispatch, schedule). PR code is checked out only in the
+# `build` job, which has no write permissions and no OIDC token. Signing happens in jobs that
+# never execute PR code. Dispatch input is a PR number used as a lookup key; everything else is
+# re-read from the API.
+on:
+  check_run:
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number (lookup key only)
+        required: true
+        type: string
+  schedule:
+    - cron: "7,37 * * * *"
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      attestations: read
+    outputs:
+      pr: ${{ steps.sel.outputs.pr }}
+    steps:
+      - name: Refuse non-main refs
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = "refs/heads/main" ] || { echo "sox-env-deploy runs only from refs/heads/main, not $REF"; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: sel
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOX_GITHUB_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_PR: ${{ inputs.pr }}
+        run: python3 -m tools.sox_release.envselect --event-name "$EVENT_NAME" --dispatch-pr "$DISPATCH_PR"
+
+  plan:
+    needs: select
+    if: needs.select.outputs.pr != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      packages: read
+      attestations: read
+    outputs:
+      build: ${{ steps.reuse.outputs.build }}
+      any_build: ${{ steps.reuse.outputs.any_build }}
+      head: ${{ steps.plan.outputs.head }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOX_GITHUB_TOKEN: ${{ github.token }}
+          PR: ${{ needs.select.outputs.pr }}
+        run: |
+          set -euo pipefail
+          python3 -m tools.sox_release.envplan --pr "$PR" --out plan.json
+          echo "head=$(jq -r .headSha plan.json)" >> "$GITHUB_OUTPUT"
+      - id: reuse
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOX_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -m tools.sox_release.envspec reuse --plan plan.json --out reuse.json
+          echo "build=$(jq -c '[.build[] | {service, sourceTree}]' reuse.json)" >> "$GITHUB_OUTPUT"
+          echo "any_build=$(jq -r '(.build | length) > 0' reuse.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan
+          path: |
+            plan.json
+            reuse.json
+
+  build:
+    # Untrusted: executes the PR's Dockerfile. No write permissions, no OIDC token, no secrets.
+    needs: plan
+    if: needs.plan.outputs.any_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.build) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.head }}
+          persist-credentials: false
+      - name: Build
+        env:
+          SERVICE: ${{ matrix.service }}
+          TREE: ${{ matrix.sourceTree }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse "HEAD:services/$SERVICE")" = "$TREE" ] || { echo "source tree mismatch"; exit 1; }
+          docker build --pull -t "sox-build/$SERVICE:$TREE" "services/$SERVICE"
+          docker save "sox-build/$SERVICE:$TREE" -o "image-$SERVICE.tar"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ matrix.service }}
+          path: image-${{ matrix.service }}.tar
+          retention-days: 1
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.any_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.build) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-${{ matrix.service }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Push
+        id: push
+        env:
+          SERVICE: ${{ matrix.service }}
+          TREE: ${{ matrix.sourceTree }}
+        run: |
+          set -euo pipefail
+          docker load -i "image-$SERVICE.tar"
+          ref="$REGISTRY/$SERVICE:tree-$TREE"
+          docker tag "sox-build/$SERVICE:$TREE" "$ref"
+          docker push "$ref" >/dev/null
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" | grep "^$REGISTRY/$SERVICE@" | head -1 | cut -d@ -f2)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "no digest"; exit 1; }
+          head=$(jq -r .headSha plan.json); pr=$(jq -r .prNumber plan.json)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          python3 - "$SERVICE" "$TREE" "$digest" "$head" "$pr" <<'PY'
+          import json, sys
+          from tools.sox_release.common import REPO, now_iso, subject_key
+          svc, tree, digest, head, pr = sys.argv[1:]
+          hexd = digest.split(":", 1)[1]
+          json.dump({"service": svc, "sourceTree": tree, "digest": digest}, open(f"digest-{svc}.json", "w"))
+          with open("prov-subjects.txt", "w") as f:
+              f.write(f"{hexd}  ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox/{svc}\n")
+              f.write(f"{subject_key('commit', head)}  sox:commit:{head}\n")
+          with open("build-subjects.txt", "w") as f:
+              f.write(f"{hexd}  ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox/{svc}\n")
+              f.write(f"{subject_key('commit', head)}  sox:commit:{head}\n")
+              f.write(f"{subject_key('pr', pr)}  sox:pr:{pr}\n")
+          plan = json.load(open("plan.json"))
+          json.dump({"schema": "sox/common/v1", "repo": REPO, "step": "SDLC-07", "outcome": "recorded",
+                     "observedAt": now_iso(),
+                     "prNumber": int(pr), "headSha": head, "baseRef": plan["baseRef"], "baseSha": plan["baseSha"],
+                     "jiraKeys": plan["jiraKeys"], "release": plan["release"],
+                     "service": svc, "sourceCommit": head, "sourceTree": tree, "sourcePath": f"services/{svc}",
+                     "imageDigest": digest, "imageRef": f"ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox/{svc}@{digest}"},
+                    open("image-build.json", "w"), indent=2, sort_keys=True)
+          PY
+      - name: Build provenance (registry referrer, read by Kyverno)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ matrix.service }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Build provenance (commit subject, read by the gate)
+        id: prov
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: prov-subjects.txt
+      - name: Record the provenance attestation digest
+        env:
+          SERVICE: ${{ matrix.service }}
+          BUNDLE: ${{ steps.prov.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          python3 - "$SERVICE" "$BUNDLE" <<'PY'
+          import base64, hashlib, json, sys
+          svc, bundle = sys.argv[1:]
+          payload = base64.b64decode(json.load(open(bundle))["dsseEnvelope"]["payload"])
+          rec = json.load(open(f"digest-{svc}.json"))
+          rec["provenanceAttestation"] = "sha256:" + hashlib.sha256(payload).hexdigest()
+          json.dump(rec, open(f"digest-{svc}.json", "w"))
+          PY
+      - name: Image build record (digest -> source tree)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: build-subjects.txt
+          predicate-type: https://acme-lending.example/sox/image-build/v1
+          predicate-path: image-build.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.service }}
+          path: digest-${{ matrix.service }}.json
+
+  deploy:
+    # Runs PR images inside kind (PSA restricted, Kyverno admission). No OIDC token: it cannot sign.
+    needs: [select, plan, publish]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+      - name: Assemble environment spec
+        env:
+          CONTROLS_SHA: ${{ github.sha }}
+        run: python3 -m tools.sox_release.envspec assemble --plan plan.json --reuse reuse.json --digests-dir digests --controls-sha "$CONTROLS_SHA" --out env-spec.json
+      - id: env
+        uses: ./.github/actions/sox-env-up
+        with:
+          spec: env-spec.json
+          policy: nonprod
+          registry-token: ${{ github.token }}
+      - name: Keep readback
+        if: always()
+        env:
+          RB: ${{ steps.env.outputs.readback }}
+        run: if [ -n "$RB" ] && [ -f "$RB" ]; then cp "$RB" readback.json; fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: readback
+          path: readback.json
+          if-no-files-found: ignore
+
+  record:
+    needs: [select, plan, publish, deploy]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      deployments: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: readback
+      - name: Rebuild the spec and record the outcome
+        id: rec
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          SOX_GITHUB_TOKEN: ${{ github.token }}
+          CONTROLS_SHA: ${{ github.sha }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          python3 -m tools.sox_release.envspec assemble --plan plan.json --reuse reuse.json --digests-dir digests --controls-sha "$CONTROLS_SHA" --out env-spec.json > /dev/null
+          pr=$(jq -r .prNumber plan.json); head=$(jq -r .headSha plan.json); ref=$(jq -r .headRef plan.json)
+          head_now=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr" --jq .head.sha)
+          spec_digest="sha256:$(sha256sum env-spec.json | cut -d' ' -f1)"
+          dep_id=$(jq -n --arg ref "$ref" --arg d "$spec_digest" --argjson pr "$pr" --arg env "$(jq -r .envId plan.json)" \
+            '{ref:$ref, environment:"qa", auto_merge:false, required_contexts:[], transient_environment:true,
+              description:("sox-env-deploy " + $env), payload:{envSpecDigest:$d, prNumber:$pr}}' \
+            | gh api -X POST "repos/$GITHUB_REPOSITORY/deployments" --input - --jq '.id // empty' || true)
+          [[ "$dep_id" =~ ^[0-9]+$ ]] || { echo "could not create a qa deployment record"; dep_id=""; }
+          if [ -n "$dep_id" ]; then
+            dep_sha=$(gh api "repos/$GITHUB_REPOSITORY/deployments/$dep_id" --jq .sha)
+            [ "$dep_sha" = "$head" ] || { echo "deployment record resolved $ref to $dep_sha, not $head"; dep_id=""; }
+          fi
+          outcome=success; [ "$DEPLOY_RESULT" = success ] || outcome=failure
+          run=$(jq -n --arg r "$RUN_ID" --arg a "$RUN_ATTEMPT" --arg s "$CONTROLS_SHA" --arg t "$EVENT_NAME" \
+            '{workflow:".github/workflows/sox-env-deploy.yml", ref:"refs/heads/main", runId:($r|tonumber), runAttempt:($a|tonumber), codeSha:$s, trigger:$t}')
+          rc=0
+          python3 -m tools.sox_release.envspec record --spec env-spec.json --readback readback.json \
+            ${dep_id:+--deployment-id "$dep_id"} --outcome "$outcome" --head-now "$head_now" --run "$run" \
+            --predicate-out env-deploy.json --subjects-out env-subjects.txt > /dev/null || rc=$?
+          echo "outcome=$(jq -r .outcome env-deploy.json)" >> "$GITHUB_OUTPUT"
+          echo "deployment=$dep_id" >> "$GITHUB_OUTPUT"
+          jq '{outcome, envId, mode, images, problems}' env-deploy.json
+      - name: Attest env-deploy
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: env-subjects.txt
+          predicate-type: https://acme-lending.example/sox/env-deploy/v1
+          predicate-path: env-deploy.json
+      - name: Deployment status
+        if: steps.rec.outputs.deployment != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEP: ${{ steps.rec.outputs.deployment }}
+          OUTCOME: ${{ steps.rec.outputs.outcome }}
+          LOG_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          state=success; [ "$OUTCOME" = pass ] || state=failure
+          gh api -X POST "repos/$GITHUB_REPOSITORY/deployments/$DEP/statuses" -f state="$state" -f log_url="$LOG_URL" \
+            -f description="env-deploy $OUTCOME" > /dev/null
+      - name: Publish env-spec for the QA agent
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE" env-deploy.bundle.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: env-spec
+          path: |
+            env-spec.json
+            env-deploy.json
+            env-deploy.bundle.json
+      - name: Fail when the environment failed
+        env:
+          OUTCOME: ${{ steps.rec.outputs.outcome }}
+        run: '[ "$OUTCOME" = pass ] || { echo "environment failed; env-deploy attested with outcome fail"; exit 1; }'

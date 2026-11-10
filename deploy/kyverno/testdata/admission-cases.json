@@ -1,0 +1,8 @@
+{
+  "$comment": "TEST DATA ONLY. Images in ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox/admission-testdata minted on branch release-eng/admission-testdata by a branch workflow. branchMinted carries build provenance and a release-approval with production-looking fields, both signed by that branch workflow; unsigned carries no attestations. sox-admission-demo.yml must see both denied. Never trust these attestations.",
+  "image": "ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox/admission-testdata",
+  "branchMinted": "sha256:650833b4d16b06bdf2b9fab491c52e997aeb87d2909eb33c8f20a04901d68980",
+  "unsigned": "sha256:ceb90f2de11e93e415f506d49a9579e3c3e0aafa60e012a8f737f3e2fdbf161e",
+  "mintedBy": "https://github.com/factory-ryan-lauderback/sox-sdlc-sandbox/actions/runs/42894279807",
+  "signer": "https://github.com/factory-ryan-lauderback/sox-sdlc-sandbox/.github/workflows/release-eng-admission-testdata.yml@refs/heads/release-eng/admission-testdata"
+}

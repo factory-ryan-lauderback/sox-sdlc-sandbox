@@ -1,0 +1,85 @@
+# Production admission policy (namespace svc-prod). Stand-in for the EKS policy in the production
+# architecture: an image runs only if it was built by this repository's pipeline on main AND the
+# gate attested a release approval for that exact digest when the approved release merged.
+# failurePolicy Fail: if Kyverno is unavailable, nothing is admitted.
+#
+# Signer identity: each attestation type is pinned to issuer + exact certificate subject, which
+# encodes repository name, workflow file and refs/heads/main. Kyverno 1.19 SigstoreBundle does not
+# enforce keyless additionalExtensions (measured: a policy requiring githubWorkflowTrigger
+# workflow_dispatch admitted a push-signed bundle), so trigger and numeric repository/owner IDs are
+# not pinned at this layer. They are pinned by the SOX verifier (.sox/trust-policy.yaml), which the
+# deploy train runs before anything reaches the cluster.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: sox-prod-require-release-approval
+spec:
+  background: false
+  webhookConfiguration: {failurePolicy: Fail, timeoutSeconds: 30}
+  rules:
+    - name: registry-and-digest-only
+      match: {any: [{resources: {kinds: [Pod], namespaces: ["svc-*"]}}]}
+      validate:
+        failureAction: Enforce
+        message: "production images must be ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox/<service>@sha256:<digest>"
+        foreach:
+          - list: "request.object.spec.[initContainers, containers, ephemeralContainers][]"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ starts_with(element.image, 'ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox/') }}"
+                    operator: Equals
+                    value: false
+                  - key: "{{ contains(element.image, '@sha256:') }}"
+                    operator: Equals
+                    value: false
+    - name: provenance-and-release-approval
+      match: {any: [{resources: {kinds: [Pod], namespaces: ["svc-*"]}}]}
+      verifyImages:
+        - imageReferences: ["ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox/*"]
+          type: SigstoreBundle
+          failureAction: Enforce
+          mutateDigest: false
+          verifyDigest: true
+          required: true
+          imageRegistryCredentials: {secrets: [ghcr-pull]}
+          attestations:
+            - type: https://slsa.dev/provenance/v1
+              attestors:
+                - entries:
+                    - keyless:
+                        issuer: https://token.actions.githubusercontent.com
+                        subject: https://github.com/factory-ryan-lauderback/sox-sdlc-sandbox/.github/workflows/sox-env-deploy.yml@refs/heads/main
+                        rekor: {url: https://rekor.sigstore.dev}
+              conditions:
+                - all:
+                    - key: "{{ buildDefinition.buildType }}"
+                      operator: Equals
+                      value: https://actions.github.io/buildtypes/workflow/v1
+                    - key: "{{ buildDefinition.externalParameters.workflow.repository }}"
+                      operator: Equals
+                      value: https://github.com/factory-ryan-lauderback/sox-sdlc-sandbox
+                    - key: "{{ buildDefinition.externalParameters.workflow.ref }}"
+                      operator: Equals
+                      value: refs/heads/main
+            - type: https://acme-lending.example/sox/release-approval/v1
+              attestors:
+                - entries:
+                    - keyless:
+                        issuer: https://token.actions.githubusercontent.com
+                        subject: https://github.com/factory-ryan-lauderback/sox-sdlc-sandbox/.github/workflows/sox-gate.yml@refs/heads/main
+                        rekor: {url: https://rekor.sigstore.dev}
+              conditions:
+                - all:
+                    - key: "{{ repo }}"
+                      operator: Equals
+                      value: factory-ryan-lauderback/sox-sdlc-sandbox
+                    - key: "{{ environment }}"
+                      operator: Equals
+                      value: production
+                    - key: "{{ humanApproval || '' }}"
+                      operator: NotEquals
+                      value: ""
+                    - key: "{{ mergeCommitSha || '' }}"
+                      operator: NotEquals
+                      value: ""

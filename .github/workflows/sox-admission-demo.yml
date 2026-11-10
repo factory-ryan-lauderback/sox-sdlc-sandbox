@@ -1,0 +1,56 @@
+name: sox-admission-demo
+# Demonstrates production admission control (deploy/kyverno/prod-policy.yaml) on a fresh kind
+# cluster: only images built by sox-env-deploy.yml on main AND release-approved by sox-gate.yml on
+# main are admitted. Holds no signing permissions (no id-token, no attestations:write), so it can
+# never create evidence; its run log and summary are the demonstration record.
+# Cases come from deploy/kyverno/testdata/admission-cases.json and from verified evidence.
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "15 6 * * 1"
+
+permissions: {}
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    steps:
+      - name: Refuse non-main refs
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = "refs/heads/main" ] || { echo "runs only from refs/heads/main, not $REF"; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Collect cases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOX_GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -m tools.sox_release.admission cases --out cases.json
+      - name: Namespace spec
+        run: echo '{"envId":"svc-prod","images":[]}' > "$RUNNER_TEMP/svc-prod.json"
+      - uses: ./.github/actions/sox-env-up
+        with:
+          spec: ${{ runner.temp }}/svc-prod.json
+          policy: prod
+          deploy: none
+          registry-token: ${{ github.token }}
+      - name: Try every case against the admission controller
+        run: python3 -m tools.sox_release.admission run --cases cases.json --out admission-results.json --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: admission-results
+          path: |
+            cases.json
+            admission-results.json
