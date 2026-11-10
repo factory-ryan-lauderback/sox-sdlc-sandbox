@@ -23,8 +23,8 @@ from common import JIRA_KEY_RE, now_utc, set_output  # noqa: E402
 SCHEMA = "sox-jira-snapshot/v1"
 MAX_ISSUES = 300
 MAX_PLAN_BYTES = 200_000
-SWEEP_STATUSES = ["Approved", "Planning", "Plan Ready", "Approach Approved", "Ready for Dev", "Re-plan",
-                  "Blocked - Human Escalation"]
+SWEEP_STATUSES = ["Approved", "Planning", "Plan Ready", "Approach Approved", "Ready for Dev", "In Progress",
+                  "In Review", "Re-plan", "Blocked - Human Escalation"]
 DONE = ("Done", "Released")
 
 

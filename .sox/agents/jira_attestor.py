@@ -40,6 +40,9 @@ STEP = {"requirement-approval": "SDLC-01", "pm-decomposition": "SDLC-02", "techl
         "approach-approval": "SDLC-03", "release-manifest": "SDLC-04", "emergency-change": "CC-04"}
 OUTCOME = {"requirement-approval": "approved", "approach-approval": "approved", "emergency-change": "approved"}
 HOOK = os.path.join(ROOT, ".sox", "release", "manifest_predicate.py")
+# Jira accountId -> GitHub login of the human Tech Leads (trust policy humans.techLeads). The policy
+# pins Jira approvers by accountId and humans by GitHub login but has no join between the two.
+TECH_LEADS = {"712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd": "factory-aman"}
 MAX_CANDIDATES = 40
 
 
@@ -81,6 +84,19 @@ def approval_entry(changelog, status_id):
     moves = [h for h in changelog if any(i.get("field") == "status" and str(i.get("to")) == status_id for i in h["items"])
              and (last is None or _time(h["created"]) > last)]
     return max(moves, key=lambda h: (_time(h["created"]), str(h["id"]))) if moves else None
+
+
+def human_replan(j, keys, leads=None):
+    """Latest transition to Re-plan by a human Tech Lead on any of the issues: (entry, login, key) or None."""
+    leads = TECH_LEADS if leads is None else leads
+    target, best = ja.STATUS_IDS["Re-plan"], None
+    for k in keys:
+        for h in j.changelog(k):
+            who = (h.get("author") or {}).get("accountId")
+            if who in leads and any(i.get("field") == "status" and str(i.get("to")) == target for i in h["items"]):
+                if best is None or _time(h["created"]) > _time(best[0]["created"]):
+                    best = (h, leads[who], k)
+    return best
 
 
 def attachment_digests(j, issue):
@@ -239,7 +255,14 @@ def build_plan(j, key, lk):
               "epicActing": acting(j, epic)}
     fields["dedupeKey"] = digest_of({k: fields[k] for k in ("planDigest", "stories", "epicLabels")})
     prev = lk.latest("jira", key, "techlead-plan")
-    if prev and prev.predicate.get("dedupeKey") == fields["dedupeKey"]:
+    # A human Tech Lead's Re-plan newer than the last plan attestation is recorded once, on the next
+    # plan attestation (the gate restarts LOOP-R from it). Later plans do not repeat it.
+    rp = human_replan(j, [key] + [s["key"] for s in entries])
+    if rp and (prev is None or _time(rp[0]["created"]) > (prev.integrated_time or 0)):
+        fields["replanApprovedBy"] = rp[1]
+        fields["replanApproval"] = {"issueKey": rp[2], "changelogId": str(rp[0]["id"]), "at": rp[0]["created"],
+                                    "accountId": (rp[0].get("author") or {}).get("accountId")}
+    elif prev and prev.predicate.get("dedupeKey") == fields["dedupeKey"]:
         return None, f"unchanged since {prev.digest}"
     upstream = []
     if epic.get("requirementKey"):

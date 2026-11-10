@@ -30,7 +30,8 @@ from common import REPO, GitHub, digest_of, dump_json, jira_key, load_json, set_
 ROLES = ("pm", "techlead")
 PLANNING = ("Planning", "Re-plan")
 PLANNED = ("Plan Ready", "Approach Approved", "Ready for Dev", "In Progress", "In Review")
-STORY_REWORK = ("Re-plan", "Blocked - Human Escalation")
+# Blocked - Human Escalation is not here: an escalated story waits until a human moves it to Re-plan.
+STORY_REWORK = ("Re-plan",)
 MAX_EPICS = 5
 MAX_STORIES = 15
 TEST_ID = re.compile(r"^services\.(db|api|ui)\.[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*){0,3}$")

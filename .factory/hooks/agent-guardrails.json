@@ -1,0 +1,12 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Create|Edit|MultiEdit|ApplyPatch",
+      "hooks": [{"type": "command", "command": "python3 __SOX_HOOKS_DIR__/guard.py", "timeout": 30}]
+    },
+    {
+      "matcher": "Execute",
+      "hooks": [{"type": "command", "command": "python3 __SOX_HOOKS_DIR__/guard.py", "timeout": 30}]
+    }
+  ]
+}

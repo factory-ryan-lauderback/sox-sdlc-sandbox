@@ -1,0 +1,278 @@
+name: sox-dev-agent
+# SDLC-05 Dev Agent (and the QA Agent for `qa` stories, which the plan types). Runs only from main:
+# a 15-minute schedule sweep, workflow_dispatch with an optional story key (a lookup hint only), and
+# workflow_run after each review run so LOOP-R rework starts promptly.
+#
+#   jira-context (env jira-attestor: Jira read snapshot, digest output)
+#   -> select (no secrets: one work item from Jira + GitHub; context directory + digest; housekeeping ops)
+#   -> code (env agent-llm: FACTORY_API_KEY only, read-only token; droid exec --auto high on a checkout of
+#      the base commit; the change leaves the job only as a patch artifact + digest)
+#   -> push-dev | push-qa (env agent-dev | agent-qa: that role's App token; never runs repository code:
+#      re-checks the patch, git apply on the exact base, commit as the App, push, open the PR)
+#   -> jira-dev | jira-qa (sox-jira-write.yml with the role fixed here)
+#
+# Nothing here is evidence. The pushed head is judged by sox-review-agent.yml (LOOP-R), QA and the gate.
+# Recovery for a burned head is a new commit, which needs its own review, QA and approval: select's
+# `rekick` mode pushes an empty commit for that, at most three times per PR before escalating.
+on:
+  schedule:
+    - cron: "2,17,32,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      key:
+        description: "Optional story key (FRQ-n). Lookup hint only."
+        required: false
+        type: string
+  workflow_run:
+    workflows: [sox-review-agent]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: sox-dev-agent
+  cancel-in-progress: false
+
+jobs:
+  jira-context:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.head_branch == 'main'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sox-jira-read.yml
+    secrets:
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+    with:
+      preset: sweep
+      artifact-name: jira-snapshot-dev
+
+  select:
+    needs: jira-context
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: read
+    outputs:
+      mode: ${{ steps.s.outputs.mode }}
+      key: ${{ steps.s.outputs.key }}
+      role: ${{ steps.s.outputs.role }}
+      llm: ${{ steps.s.outputs.llm }}
+      base_sha: ${{ steps.s.outputs.base_sha }}
+      context_digest: ${{ steps.s.outputs.context_digest }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: jira-snapshot-dev
+          path: ${{ runner.temp }}/jira
+      - id: s
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          JIRA_SNAPSHOT_DIGEST: ${{ needs.jira-context.outputs.digest }}
+          HINT: ${{ inputs.key }}
+        run: python3 .sox/agents/dev_agent.py select --snapshot "$RUNNER_TEMP/jira/snapshot.json" --out "$RUNNER_TEMP/ctx" --ops "$RUNNER_TEMP/ops" --key "$HINT"
+      - if: steps.s.outputs.mode != 'none'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dev-context
+          path: ${{ runner.temp }}/ctx
+          retention-days: 30
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jira-ops-dev-select
+          path: ${{ runner.temp }}/ops/jira-ops.json
+          retention-days: 30
+
+  # LLM job: FACTORY_API_KEY and a read-only token only. No App key, no id-token. This job runs code
+  # from the base commit (the agent runs the tests), so nothing it outputs is trusted: push re-checks
+  # the patch and pushes only to the branch select named.
+  code:
+    needs: select
+    if: needs.select.outputs.llm == 'true'
+    runs-on: ubuntu-latest
+    environment: agent-llm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      patch_digest: ${{ steps.p.outputs.patch_digest }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dev-context
+          path: ${{ runner.temp }}/ctx
+      - name: Check the context is the one select produced
+        env:
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+        run: python3 -c 'import os,sys; sys.path.insert(0,".sox/agents"); import planning_agent as p; sys.exit(p.dir_digest(os.environ["RUNNER_TEMP"]+"/ctx") != os.environ["CONTEXT_DIGEST"])'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.select.outputs.base_sha }}
+          path: work
+          persist-credentials: false
+      - name: Install droid with guardrail hooks from main
+        uses: ./.github/actions/sox-droid-setup
+        with:
+          hooks: .factory/hooks/agent-guardrails.json
+      - name: Coding agent (droid exec --auto high)
+        env:
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
+          MODEL: ${{ vars.SOX_DEV_MODEL }}
+          SOX_WORK_DIR: ${{ github.workspace }}/work
+        working-directory: work
+        run: |
+          allowed=$(python3 -c 'import json,os; print(",".join("services/%s/" % s for s in json.load(open(os.environ["RUNNER_TEMP"]+"/ctx/context.json"))["services"]))')
+          export SOX_ALLOWED_PATHS="$allowed"
+          { cat "$GITHUB_WORKSPACE/.sox/agents/prompts/dev.md"; printf '\n---\n\n'; cat "$RUNNER_TEMP/ctx/context.md"; } > "$RUNNER_TEMP/prompt.md"
+          args=(exec --auto high -o json -f "$RUNNER_TEMP/prompt.md")
+          if [ -n "$MODEL" ]; then args+=(-m "$MODEL"); fi
+          timeout 2400 droid "${args[@]}" > "$RUNNER_TEMP/droid.json" 2> "$RUNNER_TEMP/droid.err" || echo "droid exited $?"
+      - id: p
+        name: Package the change
+        env:
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+        run: python3 .sox/agents/dev_agent.py package --ctx "$RUNNER_TEMP/ctx" --work "$GITHUB_WORKSPACE/work" --droid "$RUNNER_TEMP/droid.json" --out "$RUNNER_TEMP/patch"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dev-patch
+          path: ${{ runner.temp }}/patch
+          retention-days: 30
+
+  # Key-holding: Dev App token. Checks out main only; the patch is data applied with git apply.
+  push-dev:
+    needs: [select, code]
+    if: >-
+      always() && needs.select.result == 'success' && needs.select.outputs.role == 'dev' &&
+      (needs.select.outputs.mode == 'rekick' || needs.select.outputs.mode == 'carry' ||
+       (needs.select.outputs.llm == 'true' && (needs.code.result == 'success' || needs.code.result == 'failure')))
+    runs-on: ubuntu-latest
+    environment: agent-dev
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dev-context
+          path: ${{ runner.temp }}/ctx
+      - if: needs.code.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dev-patch
+          path: ${{ runner.temp }}/patch
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.DEV_APP_ID }}
+          private-key: ${{ secrets.DEV_APP_PRIVATE_KEY }}
+      - env:
+          ROLE: dev
+          GITHUB_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+          PATCH_DIGEST: ${{ needs.code.outputs.patch_digest }}
+          CODE_RESULT: ${{ needs.code.result }}
+        run: python3 .sox/agents/dev_agent.py push --ctx "$RUNNER_TEMP/ctx" --patch "$RUNNER_TEMP/patch" --out "$RUNNER_TEMP/out"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jira-ops-dev-push
+          path: ${{ runner.temp }}/out/jira-ops.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Key-holding: QA App token, for stories the plan types `qa`. Same steps as push-dev.
+  push-qa:
+    needs: [select, code]
+    if: >-
+      always() && needs.select.result == 'success' && needs.select.outputs.role == 'qa' &&
+      (needs.select.outputs.mode == 'rekick' || needs.select.outputs.mode == 'carry' ||
+       (needs.select.outputs.llm == 'true' && (needs.code.result == 'success' || needs.code.result == 'failure')))
+    runs-on: ubuntu-latest
+    environment: agent-qa
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dev-context
+          path: ${{ runner.temp }}/ctx
+      - if: needs.code.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dev-patch
+          path: ${{ runner.temp }}/patch
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.QA_APP_ID }}
+          private-key: ${{ secrets.QA_APP_PRIVATE_KEY }}
+      - env:
+          ROLE: qa
+          GITHUB_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+          PATCH_DIGEST: ${{ needs.code.outputs.patch_digest }}
+          CODE_RESULT: ${{ needs.code.result }}
+        run: python3 .sox/agents/dev_agent.py push --ctx "$RUNNER_TEMP/ctx" --patch "$RUNNER_TEMP/patch" --out "$RUNNER_TEMP/out"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jira-ops-qa-push
+          path: ${{ runner.temp }}/out/jira-ops.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  jira-dev:
+    needs: [select, push-dev]
+    if: ${{ !cancelled() && needs.select.result == 'success' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sox-jira-write.yml
+    secrets:
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+    with:
+      role: dev
+      artifact-pattern: jira-ops-dev-*
+
+  jira-qa:
+    needs: push-qa
+    if: ${{ !cancelled() && needs.push-qa.result != 'skipped' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sox-jira-write.yml
+    secrets:
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+    with:
+      role: qa
+      artifact-pattern: jira-ops-qa-*
