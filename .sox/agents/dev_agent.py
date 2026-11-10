@@ -16,8 +16,8 @@
 - rebuild: a story PR older than the story's latest verified plan (the gate needs the plan to predate
            the branch's first push): a new branch, and the old PR is closed. A story the plan left unchanged
            is carried over (its PR diff re-applied, no model); a changed one is built again.
-- rekick:  a burned head (a review run failed or hung without a failing verdict): an empty commit so the
-           head gets a fresh review. After REKICK_LIMIT of those the story is escalated instead.
+- rekick:  a burned head (a review or QA run failed or hung without a failing verdict): an empty commit so
+           the head gets a fresh review and QA. After REKICK_LIMIT of those the story is escalated instead.
 Stories in Blocked - Human Escalation or Re-plan are left alone until a human or the Tech Lead acts.
 
 The model runs in a job with FACTORY_API_KEY and a read-only token only; it returns a patch as an
@@ -48,6 +48,7 @@ import rounds  # noqa: E402
 from planning_agent import dir_digest, slug  # noqa: E402
 
 REVIEW_CHECK = "sox/review-agent"
+QA_CHECK = "sox/qa-agent"
 MAX_ROUNDS = int(os.environ.get("SOX_MAX_REVIEW_ROUNDS", "10"))
 MAX_QA_ROUNDS = int(os.environ.get("SOX_MAX_QA_ROUNDS", "10"))
 MAX_PATCH_BYTES = 400_000
@@ -196,9 +197,15 @@ class Repo:
                  if a.get("activity_type") in ("push", "force_push", "branch_creation")]
         return min(times, default=None)
 
+    def _app_runs(self, head, name, role):
+        res = self.gh.get(f"/repos/{REPO}/commits/{head}/check-runs?check_name={name}&filter=all&per_page=100")
+        return [r for r in res.get("check_runs", []) if (r.get("app") or {}).get("slug") == app_slug(role)]
+
     def review_runs(self, head):
-        res = self.gh.get(f"/repos/{REPO}/commits/{head}/check-runs?check_name={REVIEW_CHECK}&filter=all&per_page=100")
-        return [r for r in res.get("check_runs", []) if (r.get("app") or {}).get("slug") == app_slug("review")]
+        return self._app_runs(head, REVIEW_CHECK, "review")
+
+    def qa_runs(self, head):
+        return self._app_runs(head, QA_CHECK, "qa")
 
     def marks(self, number, bots):
         """Dev Agent markers on the PR: heads already attempted without a change, and rekick count."""
@@ -357,17 +364,23 @@ def scan(issues, repo, hint=None, fetch=None, now=None):
             log.append(f"PR #{n} {key}: verified failing qa-result on {head[:12]} -> rework (QA round {done + 1})")
             return {**base, "mode": "rework", "trigger": "qa", "baseSha": head, "head": head, "branch": branch,
                     "qaResult": qa, "round": done + 1}, ops, log
-        stale = state == "open" and all(r.get("started_at") and now - _time(r["started_at"]) > STALE_OPEN_SECONDS
-                                        for r in runs if r["status"] != "completed")
-        if (state == "burned" and verdict is None) or stale:
+        def stale(rs, st):
+            return st == "open" and all(r.get("started_at") and now - _time(r["started_at"]) > STALE_OPEN_SECONDS
+                                        for r in rs if r["status"] != "completed")
+        qa_runs = repo.qa_runs(head)
+        qstate = checks.head_state(qa_runs)
+        review_burned = (state == "burned" and verdict is None) or stale(runs, state)
+        qa_burned = (qstate == "burned" and qa is None) or stale(qa_runs, qstate)
+        if review_burned or qa_burned:
+            what = REVIEW_CHECK if review_burned else QA_CHECK
             if rekicks >= REKICK_LIMIT:
                 log.append(f"PR #{n} {key}: head {head[:12]} burned again after {rekicks} fresh-review commits -> escalate")
                 ops += [{"op": "transition", "key": key, "to": ESCALATED},
                         {"op": "comment", "key": key, "body": f"Dev Agent: PR #{n} head {head[:12]} has a failed or hung "
-                         f"{REVIEW_CHECK} run without a verdict after {rekicks} fresh-review commits. A human must "
-                         "look at the review workflow, then move the story to Re-plan."}]
+                         f"{what} run without a verdict after {rekicks} fresh-review commits. A human must "
+                         "look at that workflow, then move the story to Re-plan."}]
                 continue
-            log.append(f"PR #{n} {key}: head {head[:12]} is burned without a verdict -> rekick")
+            log.append(f"PR #{n} {key}: head {head[:12]} is burned by a {what} run without a verdict -> rekick")
             return {**base, "mode": "rekick", "baseSha": head, "head": head, "branch": branch}, ops, log
         log.append(f"PR #{n} {key}: review state {state}; waiting")
     for rpr in repo.open_release_prs():
@@ -700,7 +713,8 @@ def push(args, pusher=commit_and_push):
         summary = f"Carried over from PR #{n} unchanged: the story is the same in the new plan."
     else:
         allow_empty = True
-        summary = "Empty commit: the previous head's review run failed or hung without a verdict, so it needs a fresh review."
+        summary = ("Empty commit: a review or QA run on the previous head failed or hung without a verdict, so the "
+                   "change needs a fresh head with its own review and QA.")
 
     title = f"{key}: {ctx['summary']}"[:120]
     message = (f"{title}\n\n{summary}\n\nSox-Story: {key}\nSox-Mode: {mode}\nSox-Plan: {ctx['planAttestation']}\n"

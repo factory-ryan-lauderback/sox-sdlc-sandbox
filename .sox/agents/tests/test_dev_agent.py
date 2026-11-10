@@ -47,9 +47,9 @@ def entry(key, typ="dev", deps=(), services=("api",)):
 
 
 class FakeRepo:
-    def __init__(self, prs=(), branches=None, merged=(), first_push=None, runs=(), marks=(set(), 0), release_prs=()):
+    def __init__(self, prs=(), branches=None, merged=(), first_push=None, runs=(), marks=(set(), 0), release_prs=(), qa_runs=()):
         self.prs, self.branches, self.merged = list(prs), dict({f"release/{REL}": REL_SHA} if branches is None else branches), set(merged)
-        self.first, self.runs, self._marks, self.rprs = first_push, list(runs), marks, list(release_prs)
+        self.first, self.runs, self._marks, self.rprs, self.qruns = first_push, list(runs), marks, list(release_prs), list(qa_runs)
 
     def open_story_prs(self): return self.prs
     def open_release_prs(self): return self.rprs
@@ -57,6 +57,7 @@ class FakeRepo:
     def merged_story_keys(self, base): return self.merged
     def first_push_at(self, b): return self.first
     def review_runs(self, head): return self.runs
+    def qa_runs(self, head): return self.qruns
     def marks(self, n, bots): return self._marks
     def prs_for_head(self, b, state="all"): return []
     def free_branch(self, key, summary): return f"story/{key}-{da.slug(summary, 40)}"
@@ -223,6 +224,25 @@ class SelectQaLoopTest(unittest.TestCase):
         # A re-plan after the qa-fix branch: no rebuild onto a qa-fix branch.
         item, _, log = scan(iss, FakeRepo([fix], first_push=T0 - 100), self.plans, verdict=cr)
         self.assertIsNone(item)
+
+
+class QaBurnedTest(unittest.TestCase):
+    def test_qa_run_failed_without_verdict_gets_fresh_commit(self):
+        iss = issues(story("FRQ-15", status="In Review"))
+        plans = [plan([entry("FRQ-15")], t=T0 - 50)]
+        ok = att("review-verdict", {"outcome": "pass", "findings": []}, T0, 3)
+        passed = [{"status": "completed", "conclusion": "success"}]
+        burned = [{"status": "completed", "conclusion": "failure"}]
+        item, _, log = scan(iss, FakeRepo([pr()], first_push=T0 - 10, runs=passed, qa_runs=burned), plans, verdict=ok)
+        self.assertEqual(item["mode"], "rekick")
+        self.assertIn("sox/qa-agent", "\n".join(log))
+        # With a verified failing qa-result the head is reworked instead, not rekicked.
+        item, _, _ = scan(iss, FakeRepo([pr()], first_push=T0 - 10, runs=passed, qa_runs=burned), plans, verdict=ok, qa=qa_fail())
+        self.assertEqual((item["mode"], item["trigger"]), ("rework", "qa"))
+        # A passing or still-running QA run is left alone.
+        for q in (passed, [{"status": "in_progress", "started_at": "2027-01-15T08:00:00Z"}]):
+            self.assertIsNone(scan(iss, FakeRepo([pr()], first_push=T0 - 10, runs=passed, qa_runs=q), plans, verdict=ok,
+                                   now=da._time("2027-01-15T08:30:00Z"))[0])
 
 
 class PathTest(unittest.TestCase):
