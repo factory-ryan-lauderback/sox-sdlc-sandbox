@@ -97,8 +97,8 @@ def prepare(args):
     os.makedirs(out, exist_ok=True)
     ctx = {"pr": number, "headSha": head, "baseSha": pr["base"]["sha"], "baseRef": binding["baseRef"],
            "diffDigest": "sha256:" + sha256_hex(diff), "binding": binding, "jiraKeys": jira_keys}
-    existing = rounds.verdict_for_head(binding["loopKey"], head, binding["baseRef"])
-    prior = rounds.changes_requested_heads(binding["loopKey"])
+    existing = rounds.verdict_for_head(head, binding["baseRef"])
+    prior, _ = rounds.failing_heads(tuple(binding["loopKey"]))
     mode = "llm"
     if existing:
         mode = "reuse"
@@ -190,15 +190,18 @@ def record(args):
         plan["action"] = "superseded"
         return finish("Superseded", "Diff changed during review.")
 
-    existing = rounds.verdict_for_head(binding["loopKey"], head, binding["baseRef"])
+    existing = rounds.verdict_for_head(head, binding["baseRef"])
     if existing:
-        p = existing["statement"]["predicate"]
-        plan["conclusion"] = "success" if p["verdict"] == "pass" else "failure"
-        return finish(f"Review: {p['verdict']} (round {p['round']}, existing verified verdict)",
-                      "A verified review-verdict already exists for this head SHA and base; it is re-posted, not re-run.",
-                      f"Attestation run: {existing['cert'].get('runInvocationURI')}")
+        p = existing.predicate
+        plan["conclusion"] = "success" if p.get("outcome") == "pass" else "failure"
+        return finish(f"Review: {p.get('outcome')} (round {p.get('round')}, existing verified verdict)",
+                      "A verified review-verdict already exists for this head SHA and base. It is re-posted, not re-run; "
+                      "a failing verdict for a head can never be replaced by a later pass.",
+                      f"Attestation {existing.digest}, run {existing.identity.get('runInvocationURI')}")
 
-    prior = rounds.changes_requested_heads(binding["loopKey"]) - {head}
+    prior, forgeries = rounds.failing_heads(tuple(binding["loopKey"]))
+    prior = prior - {head}
+    plan["forgeryAttempts"] = forgeries
     if len(prior) >= MAX_ROUNDS:
         plan["escalate"] = True
         loop_key = ":".join(binding["loopKey"])
@@ -247,10 +250,9 @@ def record(args):
         "agentClaims": {**verdict.get("agent", {}), "summary": verdict["summary"][:1000],
                         "model": os.environ.get("SOX_REVIEW_MODEL") or "default"},
     }
-    bindings = [("commit", head), ("pr", number)] + [("jira", k) for k in jira_keys]
-    if binding["release"]:
-        bindings.append(("release", binding["release"]))
-    bindings.append(tuple(binding["loopKey"]))
+    # Story PRs bind to their story key (the LOOP-R counter subject). Release PRs bind to the release
+    # slug only, so a release-level verdict never counts as a round against each of its stories.
+    bindings = [("commit", head), ("pr", number), tuple(binding["loopKey"])]
     with open(f"{out}/subjects.txt", "w") as f:
         f.write(subject_lines(bindings))
     dump_json(f"{out}/predicate.json", predicate)
@@ -259,8 +261,9 @@ def record(args):
         dump_json(f"{out}/jira-ops.json", [{"op": "comment", "key": binding["story"],
                                             "body": f"Review Agent round {round_no} on PR #{number} @ {head[:12]}: {verdict['verdict']}. {verdict['summary'][:500]}"}])
     lines = [f"- **{f['severity']}** `{f['path']}`{':' + str(f['line']) if f['line'] else ''}: {f['title']}\n  {f['body']}" for f in verdict["findings"]]
+    note = f"\n\n{forgeries} attestation(s) for {':'.join(binding['loopKey'])} failed signer verification (forgery-attempt) and were not counted." if forgeries else ""
     finish(f"Review: {verdict['verdict']} (round {round_no}/{MAX_ROUNDS})", verdict["summary"] or verdict["verdict"],
-           "\n".join(lines) or "No findings.")
+           ("\n".join(lines) or "No findings.") + note)
 
 
 def check_start(args):
