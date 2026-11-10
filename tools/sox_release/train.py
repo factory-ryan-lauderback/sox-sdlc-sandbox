@@ -5,6 +5,8 @@ The plan is computed only from primary sources and verified evidence:
 - every commit in the window must be the merge of a release (or emergency) PR with a verified
   merge-record and human-approval, otherwise the WHOLE train refuses, because main's tree
   contains every commit in the window;
+- the merge-record must pair every required check with a verified attestation from the run that
+  posted it (paired evidence, F16); the train re-checks each pairing against the verifier;
 - images come from the env-deploy of the last release head (what QA tested), and each needs a
   verified release-approval naming the cutoff merge;
 - each service deploys at most once, in dependency order, and only if production does not
@@ -15,6 +17,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
 import sys
 
 from tools.sox_release import evidence
@@ -23,6 +26,72 @@ from tools.sox_release.common import (HOTFIX_BRANCH, RELEASE_BRANCH, REPO, ROOT,
 from tools.sox_release.gh import GitHub
 
 LOOKBACK_DAYS = 45
+# Predicate field and value that a paired success check's attestation must carry.
+CHECK_OUTCOME = {"gate-decision": ("conclusion", "success"), "review-verdict": ("verdict", "pass"),
+                 "qa-result": ("outcome", "pass")}
+RUN_URI = re.compile(r"^https://github\.com/[^/]+/[^/]+/actions/runs/(\d+)/attempts/\d+$")
+
+
+def trust_policy(path=None):
+    return json.loads(pathlib.Path(path or ROOT / ".sox" / "trust-policy.yaml").read_text())
+
+
+def check_predicates(policy):
+    """{required check name: predicate that pairs with it}."""
+    out = {"sox/evidence-gate": "gate-decision"}
+    out.update({v["checkName"]: k for k, v in (policy.get("predicates") or {}).items()
+                if isinstance(v, dict) and v.get("checkName")})
+    return out
+
+
+def unpaired_checks(fetch, mr_pred, pr_number, head, policy):
+    """Problems with merge-record.checks[]: every required check must appear once, from its pinned
+    App, as a paired success, and the paired attestation must verify and match the check run
+    (certificate run ID = externalId, checkRunId, headSha, outcome)."""
+    problems, apps, preds = [], policy.get("apps") or {}, check_predicates(policy)
+    recorded = [c for c in mr_pred.get("checks") or [] if isinstance(c, dict)]
+    required = {n: r for n, r in (policy.get("requiredChecks") or {}).items() if not n.startswith("$")}
+    if not required:
+        return [f"PR #{pr_number}: trust policy lists no required checks"]
+    for name, role in sorted(required.items()):
+        tag = f"PR #{pr_number} {name}"
+        entries = [c for c in recorded if c.get("name") == name]
+        if len(entries) != 1:
+            problems.append(f"{tag}: {len(entries)} entries in merge-record.checks (need exactly 1)")
+            continue
+        c = entries[0]
+        app_id = (apps.get(role) or {}).get("id")
+        if not isinstance(app_id, int):
+            problems.append(f"{tag}: App id for role {role} not set in the trust policy")
+            continue
+        if c.get("appId") != app_id:
+            problems.append(f"{tag}: check posted by App {c.get('appId')}, pinned App is {app_id}")
+            continue
+        if (c.get("paired") is not True or c.get("conclusion") != "success" or not isinstance(c.get("checkRunId"), int)
+                or not str(c.get("externalId") or "").isdigit() or not c.get("pairedAttestation")):
+            problems.append(f"{tag}: unpaired or not a success in merge-record (check-without-evidence)")
+            continue
+        pred = preds.get(name)
+        if pred not in CHECK_OUTCOME:
+            problems.append(f"{tag}: no pairing predicate known for this check")
+            continue
+        field, want = CHECK_OUTCOME[pred]
+        try:
+            items = fetch(f"commit:{head}", pred)
+            match = [i for i in items if i.get("digest") == c["pairedAttestation"]]
+            if not match:
+                match = [i for i in fetch(f"pr:{pr_number}", pred) if i.get("digest") == c["pairedAttestation"]]
+        except evidence.EvidenceUnavailable as e:
+            problems.append(f"{tag}: verifier unavailable: {e}")
+            continue
+        if not match:
+            problems.append(f"{tag}: paired attestation {c['pairedAttestation']} is not a verified {pred}")
+            continue
+        p, run = match[0]["predicate"], RUN_URI.match(match[0].get("run") or "")
+        if not (p.get("checkRunId") == c["checkRunId"] and p.get("headSha") == head and p.get(field) == want
+                and run and run.group(1) == str(c["externalId"])):
+            problems.append(f"{tag}: paired {pred} does not match the check run (run, checkRunId, head or outcome)")
+    return problems
 
 
 def train_dates(today, days=LOOKBACK_DAYS):
@@ -86,7 +155,7 @@ def _verified(fetch, subject, name, check):
     return evidence.latest(items), None
 
 
-def release_for_commit(gh, fetch, sha, svc):
+def release_for_commit(gh, fetch, sha, svc, policy):
     problems = []
     prs = [p for p in gh.get(f"/repos/{{repo}}/commits/{sha}/pulls")
            if p.get("merged_at") and p["base"]["ref"] == "main" and p.get("merge_commit_sha") == sha]
@@ -101,6 +170,8 @@ def release_for_commit(gh, fetch, sha, svc):
                         lambda p: p.get("mergeCommitSha") == sha and p.get("prNumber") == n and p.get("treeMatch") is True)
     if err:
         problems.append(f"PR #{n}: {err}")
+    else:
+        problems += unpaired_checks(fetch, mr["predicate"], n, head, policy)
     ha, err = _verified(fetch, f"pr:{n}", "human-approval",
                         lambda p: p.get("commitId") == head and p.get("prNumber") == n and p.get("baseRef") == "refs/heads/main"
                         and (p.get("sod") or {}).get("result") == "pass")
@@ -148,9 +219,10 @@ def desired_images(fetch, rel, cutoff, svc, only=None):
     return images, ed.get("digest"), problems
 
 
-def plan(gh, fetch, cutoff, today, baseline, mode="train", emergency_pr=None, root=None):
+def plan(gh, fetch, cutoff, today, baseline, mode="train", emergency_pr=None, root=None, policy=None):
     if not SHA.match(cutoff or ""):
         raise RefusedError("cutoff must be a commit SHA")
+    policy = policy if policy is not None else trust_policy()
     svc = services(root) if root else services()
     state, prev = deployed_state(fetch, today)
     prev_sha = (prev or {}).get("cutoffSha") or baseline
@@ -166,7 +238,7 @@ def plan(gh, fetch, cutoff, today, baseline, mode="train", emergency_pr=None, ro
             raise RefusedError(f"emergency merge {target} is not on main")
     window = first_parent_window(gh, prev_sha, target)
     for sha in window:
-        rec, errs = release_for_commit(gh, fetch, sha, svc)
+        rec, errs = release_for_commit(gh, fetch, sha, svc, policy)
         problems += errs
         if rec:
             releases.append(rec)
