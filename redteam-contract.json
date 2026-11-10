@@ -1,0 +1,30 @@
+{
+  "$comment": "Fields consumed by the red team harness. Gates/evidence owner maintains gate_checks, gate, verifier, reconciliation. Other owners add their own keys.",
+  "gate_checks": ["sox/evidence-gate"],
+  "gate": {
+    "check_name": "sox/evidence-gate",
+    "source_app": "acme-sox-gate",
+    "workflow": ".github/workflows/sox-gate.yml",
+    "relay": ".github/workflows/sox-gate-relay.yml",
+    "triggers": ["workflow_dispatch (pr number only, via relay)", "schedule (every 15 min)", "check_run completed (re-read via API, review/qa Apps only)"],
+    "conclusions": ["success", "failure"],
+    "evaluates": "all open PRs whose head is the SHA; success only if every one passes",
+    "code": [".sox/gate.py", ".sox/soxlib/gate.py"]
+  },
+  "verifier": {
+    "sources": [".sox/verify_evidence.py", ".sox/soxlib/verify.py", ".sox/soxlib/policy.py", ".sox/soxlib/der.py", ".sox/soxlib/subject.py"],
+    "policy": ".sox/trust-policy.yaml",
+    "command": ["python3", ".sox/verify_evidence.py", "--bundle", "{bundle}"],
+    "testdata": {
+      "good": ".sox/testdata/good-review-verdict.bundle.json",
+      "branch_minted": ".sox/testdata/branch-minted-review-verdict.bundle.json"
+    },
+    "attestation_digest": "sha256 of the in-toto statement bytes (base64-decoded DSSE payload)"
+  },
+  "reconciliation": {
+    "latest": "https://github.com/factory-ryan-lauderback/sox-sdlc-evidence/blob/main/reports/latest.json",
+    "index_path": "https://github.com/factory-ryan-lauderback/sox-sdlc-evidence/blob/main/reports/index.json",
+    "immutable_store": "rekor+github: every report is attested (predicate https://acme-lending.example/sox/reconciliation-report/v1, Sigstore public-good Rekor) and stored create-only in factory-ryan-lauderback/sox-sdlc-evidence (repo id 1453113434), written only by acme-sox-evidence-writer",
+    "workflow": ".github/workflows/sox-reconcile.yml"
+  }
+}

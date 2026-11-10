@@ -1,0 +1,23 @@
+name: sox-gates-ci
+# Unit tests for the verifier, gate and reconciler library. No secrets, no id-token, no App keys:
+# this workflow is not an attestation signer and must never request id-token or attestations.
+on:
+  pull_request:
+    paths: [".sox/**", ".github/workflows/sox-gate*.yml", ".github/workflows/sox-reconcile.yml", "redteam-contract.json"]
+  push:
+    branches: [main]
+    paths: [".sox/**"]
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Trust policy loads and pins every predicate
+        run: python3 .sox/verify_evidence.py policy-check
+      - name: Unit tests
+        run: python3 -m unittest discover -s .sox/tests -p 'test_*.py' -v
