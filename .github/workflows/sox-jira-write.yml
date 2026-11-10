@@ -3,7 +3,7 @@ name: sox-jira-write
 # pattern of artifacts holding operation lists. Runs in the main-only jira-attestor environment,
 # the only place the single sandbox Jira credential exists. Jira records the automation account as
 # the author of every write; the acting role is recorded by jira_adapter.apply_ops in the
-# `sox.actor` issue property and a `[sox:<role>]` comment prefix (workflow-asserted).
+# `sox.actingRole` issue property and a `[sox:<role>]` comment prefix (workflow-asserted).
 # Backend `file` (unit tests and offline demos only) writes jira.json on branch sox-jira-fake.
 on:
   workflow_call:

@@ -1,0 +1,101 @@
+name: sox-jira-attestor
+# Signs the Jira-stage predicates: requirement-approval (SDLC-01), pm-decomposition (SDLC-02),
+# techlead-plan and approach-approval (SDLC-03), release-manifest (SDLC-04, predicate from Release's
+# .sox/release/manifest_predicate.py hook) and emergency-change (CC-04). See .sox/agents/jira_attestor.py.
+#
+# Sandbox trigger: the 15-minute schedule (no Jira-to-GitHub push exists). workflow_dispatch and
+# repository_dispatch accept only a Jira key as a lookup hint; everything signed is re-read from Jira
+# by the signing job itself. No job runs PR code or an LLM. Jira credentials exist only in env
+# jira-attestor (main only). A changelog that cannot be read completely fails the run.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      key:
+        description: "Optional Jira key (FRQ-n) to look at first. Lookup hint only."
+        required: false
+        type: string
+  repository_dispatch:
+    types: [jira-issue]
+
+permissions: {}
+
+concurrency:
+  group: sox-jira-attestor
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    environment: jira-attestor
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      attestations: read
+    outputs:
+      candidates: ${{ steps.plan.outputs.candidates }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: plan
+        env:
+          SOX_JIRA_BACKEND: cloud
+          SOX_JIRA_EMAIL: ${{ vars.SOX_JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          HINT: ${{ inputs.key || github.event.client_payload.key }}
+        run: python3 .sox/agents/jira_attestor.py plan --key "$HINT"
+
+  sign:
+    needs: plan
+    if: needs.plan.outputs.candidates != '[]' && needs.plan.outputs.candidates != ''
+    runs-on: ubuntu-latest
+    environment: jira-attestor
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.candidates) }}
+    concurrency:
+      group: sox-jira-attestor-${{ matrix.kind }}-${{ matrix.key }}-${{ matrix.release }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: build
+        env:
+          SOX_JIRA_BACKEND: cloud
+          SOX_JIRA_EMAIL: ${{ vars.SOX_JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          KIND: ${{ matrix.kind }}
+          KEY: ${{ matrix.key }}
+          RELEASE: ${{ matrix.release }}
+        run: python3 .sox/agents/jira_attestor.py build --kind "$KIND" --key "$KEY" --release "$RELEASE" --out "$RUNNER_TEMP/out"
+      - id: attest
+        if: steps.build.outputs.attest == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/out/subjects.txt
+          predicate-type: ${{ steps.build.outputs.predicate_type }}
+          predicate-path: ${{ runner.temp }}/out/predicate.json
+      - if: steps.build.outputs.attest == 'true'
+        env:
+          URL: ${{ steps.attest.outputs.attestation-url }}
+          KIND: ${{ matrix.kind }}
+          KEY: ${{ matrix.key }}
+        run: echo "$KIND $KEY -> $URL"
