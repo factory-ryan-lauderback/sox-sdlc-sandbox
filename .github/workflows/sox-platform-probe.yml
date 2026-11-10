@@ -1,0 +1,36 @@
+name: sox-platform-probe
+# Platform probe: verifies that actions/attest accepts derived (non-file) subject keys and that
+# the attestations API returns every attestation for a key. No App keys, no PR code.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Derive subject keys
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          key() { printf 'sox-subject/v1\n%s\n%s\n%s' "$REPO" "$1" "$2" | sha256sum | cut -d' ' -f1; }
+          {
+            echo "$(key commit "$SHA")  sox:commit:$SHA"
+            echo "$(key pr 0)  sox:pr:0"
+          } > subjects.txt
+          cat subjects.txt
+          jq -n --arg repo "$REPO" --arg sha "$SHA" --arg run "$GITHUB_RUN_ID" \
+            '{schema:"sox/platform-probe/v1", repo:$repo, headSha:$sha, runId:($run|tonumber), outcome:"recorded"}' > predicate.json
+      - id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: subjects.txt
+          predicate-type: https://acme-lending.example/sox/platform-probe/v1
+          predicate-path: predicate.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: probe-bundle
+          path: ${{ steps.attest.outputs.bundle-path }}
