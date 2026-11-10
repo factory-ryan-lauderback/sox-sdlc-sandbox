@@ -1,0 +1,77 @@
+name: app-inventory
+# GitHub App inventory for go-live (trust policy goLive block): per App the private-key
+# fingerprint in the format the App settings page shows, the App's permissions, and its
+# installations with their repositories. Each key is used only inside its own main-only
+# environment; nothing secret is printed or uploaded. The summary job checks the expected
+# install targets and that the Reconciler has no write anywhere. Fixed, no dispatch inputs.
+# Never a signer or a required check; no id-token or attestations permission.
+on:
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: app-inventory
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { role: review, environment: agent-review, prefix: REVIEW }
+          - { role: qa, environment: agent-qa, prefix: QA }
+          - { role: dev, environment: agent-dev, prefix: DEV }
+          - { role: techlead, environment: agent-techlead, prefix: TECHLEAD }
+          - { role: gate, environment: sox-gate, prefix: GATE }
+          - { role: release_bundler, environment: release-bundler, prefix: BUNDLER }
+          - { role: reconciler, environment: reconciler, prefix: RECONCILER }
+          - { role: evidence_writer, environment: evidence-writer, prefix: EVIDENCE_WRITER }
+          - { role: jira_attestor, environment: jira-attestor, prefix: JIRA_ATTESTOR }
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: ${{ matrix.environment }}
+    permissions:
+      contents: read
+    steps:
+      - name: Refuse non-main refs
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = "refs/heads/main" ] || { echo "app-inventory runs only from refs/heads/main, not $REF"; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Collect ${{ matrix.role }}
+        env:
+          APP_ID: ${{ vars[format('{0}_APP_ID', matrix.prefix)] }}
+          APP_PRIVATE_KEY: ${{ secrets[format('{0}_APP_PRIVATE_KEY', matrix.prefix)] }}
+        run: python3 .github/platform/app_inventory.py collect "${{ matrix.role }}" "app-${{ matrix.role }}.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: app-${{ matrix.role }}
+          path: app-${{ matrix.role }}.json
+          retention-days: 30
+
+  summary:
+    needs: collect
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: app-*
+          path: inventory
+      - run: python3 .github/platform/app_inventory.py summarize inventory app-inventory.json
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: app-inventory
+          path: app-inventory.json
+          retention-days: 90
