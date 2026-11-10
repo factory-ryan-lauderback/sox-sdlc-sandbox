@@ -111,10 +111,9 @@ def upstream_closure(svc, names):
 
 
 def services_map_digest(root=ROOT):
-    """Digest over the service index and every manifest, the inputs that define scope and order."""
-    root = pathlib.Path(root)
-    files = [".sox/services.yaml"] + [e["manifest"] for e in parse_yaml((root / ".sox/services.yaml").read_text())["services"]]
-    return digest_of({f: sha256_hex((root / f).read_bytes()) for f in files})
+    """Git blob id of .sox/services.yaml: the gate compares it with the blob on main."""
+    data = (pathlib.Path(root) / ".sox/services.yaml").read_bytes()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
 def now_iso():

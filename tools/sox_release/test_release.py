@@ -2,6 +2,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -66,6 +67,30 @@ class Common(unittest.TestCase):
         self.assertEqual(common.ordered(svc, touched), ["db", "ui"])
         self.assertEqual(other, ["README.md"])
         self.assertEqual(common.ordered(svc, common.upstream_closure(svc, {"ui"})), ["db", "api", "ui"])
+
+    def test_services_map_digest_is_git_blob(self):
+        out = subprocess.run(["git", "hash-object", str(ROOT / ".sox/services.yaml")], capture_output=True, text=True, check=True)
+        self.assertEqual(common.services_map_digest(), out.stdout.strip())
+
+    def test_fetch_no_attestations_is_empty(self):
+        sys.path.insert(0, str(ROOT / ".sox"))
+        from soxlib.ghapi import APIError
+
+        class V:
+            def __init__(self, status):
+                self.status = status
+
+            def fetch(self, api, kind, ident, predicate):
+                raise APIError(self.status, "https://api.github.com/repos/x/attestations/sha256:ab?per_page=100", "")
+        saved = evidence._verifier
+        try:
+            evidence._verifier = (V(404), lambda token: None)
+            self.assertEqual(evidence.fetch("commit:" + H, "release-approval"), [])
+            evidence._verifier = (V(500), lambda token: None)
+            with self.assertRaises(evidence.EvidenceUnavailable):
+                evidence.fetch("commit:" + H, "release-approval")
+        finally:
+            evidence._verifier = saved
 
     def test_slug(self):
         self.assertEqual(common.slugify("Auto Pay 2026.11"), "auto-pay-2026-11")
