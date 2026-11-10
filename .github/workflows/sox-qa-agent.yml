@@ -1,0 +1,263 @@
+name: sox-qa-agent
+# SDLC-08 QA Agent. Runs only from main: workflow_run after each sox-env-deploy run, a schedule
+# sweep, and workflow_dispatch with an optional release PR number (a lookup hint only).
+#
+#   select (read-only: one open release PR whose head has a verified passing env-deploy to qa and no
+#     sox/qa-agent run yet; the env spec and plan-required tests are derived from verified attestations)
+#   -> open (env agent-qa: QA App token; creates the in_progress sox/qa-agent check run, external_id =
+#      this run's ID, before any test runs; LOOP-Q exhaustion escalates instead)
+#   -> test (no App key, no id-token: re-creates the environment from the env-deploy image digests
+#      with the controls from main, then runs the required tests from the release head checkout)
+#   -> record (env agent-qa: re-derives everything it signs, attests qa-result, then completes the
+#      check run with the attested outcome; any other ending completes it as failure)
+#   -> jira (sox-jira-write.yml, role qa)
+#
+# The test job executes release-head code, so its results are reported by that job, not proven.
+# A failed, cancelled or unattested run blocks the head for good (F13). Recovery is a new head on the
+# release branch, which then needs its own review, QA and approval.
+on:
+  workflow_run:
+    workflows: [sox-env-deploy]
+    types: [completed]
+  schedule:
+    - cron: "23,53 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Optional release PR number. Lookup key only; everything else is re-read from the API."
+        required: false
+        type: string
+
+permissions: {}
+
+# Never cancel-in-progress: a cancelled run after `open` would block the head (F13).
+concurrency:
+  group: sox-qa-agent
+  cancel-in-progress: false
+
+jobs:
+  select:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      attestations: read
+    outputs:
+      pr: ${{ steps.s.outputs.pr }}
+      head: ${{ steps.s.outputs.head }}
+      context_digest: ${{ steps.s.outputs.context_digest }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: s
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_PR: ${{ inputs.pr }}
+        run: python3 .sox/agents/qa_agent.py select --out "$RUNNER_TEMP/ctx" --pr "$INPUT_PR"
+      - if: steps.s.outputs.pr != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qa-context
+          path: ${{ runner.temp }}/ctx
+          retention-days: 30
+
+  # Key-holding: QA App token. Checks out main only. Opens the binding check run before any test runs.
+  open:
+    needs: select
+    if: needs.select.outputs.pr != ''
+    runs-on: ubuntu-latest
+    environment: agent-qa
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      attestations: read
+    outputs:
+      mode: ${{ steps.open.outputs.mode }}
+      check_run_id: ${{ steps.open.outputs.check_run_id }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: qa-context
+          path: ${{ runner.temp }}/ctx
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.QA_APP_ID }}
+          private-key: ${{ secrets.QA_APP_PRIVATE_KEY }}
+      - id: open
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          QA_APP_ID: ${{ vars.QA_APP_ID }}
+          QA_APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+        run: python3 .sox/agents/qa_agent.py open --ctx "$RUNNER_TEMP/ctx" --out "$RUNNER_TEMP/out"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jira-ops-qa-open
+          path: ${{ runner.temp }}/out/jira-ops.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Unkeyed: no App key, no id-token, no Jira token. Executes release-head test code, so its only
+  # output (the results) is a report that record treats as data.
+  test:
+    needs: [select, open]
+    if: needs.open.outputs.mode == 'test'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      results: ${{ steps.enc.outputs.results }}
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: qa-context
+          path: ${{ runner.temp }}/ctx
+      - name: Check the context is the one select produced
+        env:
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+        run: python3 -c 'import os,sys; sys.path.insert(0,".sox/agents"); import planning_agent as p; sys.exit(p.dir_digest(os.environ["RUNNER_TEMP"]+"/ctx") != os.environ["CONTEXT_DIGEST"])'
+      # The environment comes up from main's controls before any release-head code is checked out.
+      - id: env
+        name: Re-create the env-deploy environment (image digests from the verified attestation)
+        uses: ./.github/actions/sox-env-up
+        with:
+          spec: ${{ runner.temp }}/ctx/env-spec.json
+          policy: nonprod
+          registry-token: ${{ github.token }}
+          controls-root: .
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.select.outputs.head }}
+          path: work
+          persist-credentials: false
+      - name: Run the plan-required tests
+        working-directory: work
+        env:
+          DB_URL: ${{ steps.env.outputs.db-url }}
+          API_URL: ${{ steps.env.outputs.api-url }}
+          UI_URL: ${{ steps.env.outputs.ui-url }}
+          HEAD_SHA: ${{ needs.select.outputs.head }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          timeout 1500 python3 "$GITHUB_WORKSPACE/.sox/agents/qa_agent.py" runtests --ids "$RUNNER_TEMP/ctx/required-tests.json" --out "$RUNNER_TEMP/results.json"
+      - id: enc
+        run: python3 .sox/agents/qa_agent.py encode --results "$RUNNER_TEMP/results.json"
+
+  # Key-holding: QA App token, id-token, attestations. Checks out main only; never runs release code.
+  record:
+    needs: [select, open, test]
+    if: always() && needs.open.outputs.check_run_id != ''
+    runs-on: ubuntu-latest
+    environment: agent-qa
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: qa-context
+          path: ${{ runner.temp }}/ctx
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.QA_APP_ID }}
+          private-key: ${{ secrets.QA_APP_PRIVATE_KEY }}
+      - id: rec
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          QA_APP_ID: ${{ vars.QA_APP_ID }}
+          QA_APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
+          CHECK_RUN_ID: ${{ needs.open.outputs.check_run_id }}
+          TEST_RESULT: ${{ needs.test.result }}
+          RESULTS_B64: ${{ needs.test.outputs.results }}
+        run: python3 .sox/agents/qa_agent.py record --ctx "$RUNNER_TEMP/ctx" --out "$RUNNER_TEMP/out"
+      - id: attest1
+        if: steps.rec.outputs.attest == 'true'
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/out/subjects.txt
+          predicate-type: https://acme-lending.example/sox/qa-result/v1
+          predicate-path: ${{ runner.temp }}/out/predicate.json
+      - id: attest2
+        if: steps.rec.outputs.attest == 'true' && steps.attest1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/out/subjects.txt
+          predicate-type: https://acme-lending.example/sox/qa-result/v1
+          predicate-path: ${{ runner.temp }}/out/predicate.json
+      # Runs whatever happened above: without a plan the check run completes as failure.
+      - name: Complete check run
+        if: always() && steps.app.outcome == 'success'
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          CHECK_RUN_ID: ${{ needs.open.outputs.check_run_id }}
+          ATTEST_OUTCOME: ${{ steps.attest1.outcome == 'success' && 'success' || steps.attest2.outcome }}
+          ATTESTATION_URL: ${{ steps.attest1.outputs.attestation-url || steps.attest2.outputs.attestation-url }}
+        run: python3 .sox/agents/qa_agent.py finish --out "$RUNNER_TEMP/out"
+      # The report whose digest is a qa-result subject, kept for the release bundle.
+      - if: steps.rec.outputs.attest == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qa-report
+          path: |
+            ${{ runner.temp }}/out/qa-report.json
+            ${{ runner.temp }}/out/predicate.json
+          retention-days: 90
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: jira-ops-qa-record
+          path: ${{ runner.temp }}/out/jira-ops.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  jira:
+    needs: [open, record]
+    if: ${{ !cancelled() && needs.open.result == 'success' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sox-jira-write.yml
+    secrets:
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+    with:
+      role: qa
+      artifact-pattern: jira-ops-qa-*
