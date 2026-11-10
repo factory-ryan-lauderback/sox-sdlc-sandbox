@@ -136,7 +136,7 @@ def push(actor, after, at):
 
 def check(name, app, at):
     return {"name": name, "app": {"id": IDS[app], "slug": f"x-{app}"}, "conclusion": "success",
-            "started_at": t(at - 5), "completed_at": t(at), "id": at}
+            "status": "completed", "started_at": t(at - 5), "completed_at": t(at), "id": at}
 
 
 class World:
@@ -483,6 +483,87 @@ class TestLoopH(unittest.TestCase):
         ev, ctx = w.evaluate(20)
         self.assertEqual([e for e in R.plan_open(ev, ctx) if e.name == "human-changes-requested"], [])
 
+
+class TestEveryCheckRunBinds(unittest.TestCase):
+    """F13, BP-41d: every Review/QA App run on the head binds it; a newer success does not
+    clear an earlier run that is in flight, cancelled, or failed before attesting."""
+
+    def _eval(self, earlier, name="sox/review-agent", role="review", as_of=None, merged=False):
+        w = World()
+        w.release_merged = merged
+        runs = [check("sox/review-agent", "review", 460), check("sox/qa-agent", "qa", 510)]
+        runs += [dict(check(name, role, at), **kw) for at, kw in earlier]
+        w.extra_routes = {f"/repos/{REPO}/commits/{R1}/check-runs":
+                          {"check_runs": runs, "total_count": len(runs)}}
+        ev, _ = w.evaluate(20, as_of=as_of)
+        return failed(ev)
+
+    def test_earlier_unfinished_or_failed_run_blocks(self):
+        for name, role in (("sox/review-agent", "review"), ("sox/qa-agent", "qa")):
+            for kw in ({"status": "in_progress", "conclusion": None, "completed_at": None},
+                       {"status": "completed", "conclusion": "cancelled"},
+                       {"status": "completed", "conclusion": "failure"},
+                       {"status": "completed", "conclusion": "neutral"},
+                       {"status": "completed", "conclusion": "skipped"}):
+                self.assertIn(f"CC-02.check:{name}", self._eval([(450, kw)], name, role), (name, kw))
+
+    def test_all_success_passes(self):
+        f = self._eval([(450, {"status": "completed"})])
+        self.assertNotIn("CC-02.check:sox/review-agent", f)
+
+    def test_later_failure_blocks(self):
+        self.assertIn("CC-02.check:sox/review-agent",
+                      self._eval([(470, {"status": "completed", "conclusion": "failure"})]))
+
+    def test_same_name_from_other_app_is_ignored(self):
+        other = {"status": "completed", "conclusion": "failure", "app": {"id": 999, "slug": "spoof"}}
+        self.assertNotIn("CC-02.check:sox/review-agent", self._eval([(450, other)]))
+
+    def test_as_of_merge(self):
+        # Started after the merge: cannot have influenced it.
+        late = {"status": "completed", "conclusion": "failure"}
+        self.assertNotIn("CC-02.check:sox/review-agent",
+                         self._eval([(950, late)], as_of=T0 + 900, merged=True))
+        # Started before the merge, still running at the merge.
+        running = {"status": "completed", "conclusion": "success", "completed_at": t(950)}
+        self.assertIn("CC-02.check:sox/review-agent",
+                      self._eval([(440, running)], as_of=T0 + 900, merged=True))
+
+    def test_more_runs_than_one_page_fails_closed(self):
+        w = World()
+        w.extra_routes = {f"/repos/{REPO}/commits/{R1}/check-runs":
+                          {"check_runs": [check("sox/review-agent", "review", 460)], "total_count": 101}}
+        with self.assertRaises(RuntimeError):
+            w.evaluate(20)
+
+
+class TestLoopHBindsStoriesAndEpics(unittest.TestCase):
+    """F14, BP-39g: a changes request on one release binds the stories and Epics it covered, so
+    re-bundling them under another slug and branch still needs a re-plan."""
+
+    def _world(self):
+        w = World()
+        w.atts.append(Att("human-changes-requested",
+                          [("commit", "8" * 40), ("pr", "19"), ("release", "alpha"),
+                           ("jira", "FRQ-5"), ("jira", "FRQ-6")],
+                          {"prNumber": 19, "reviewId": 77, "commitId": "8" * 40,
+                           "reviewer": dict(AMAN), "submittedAt": t(350)}, 355))
+        return w
+
+    def test_rebundle_without_replan_blocks(self):
+        ev, _ = self._world().evaluate(20)
+        self.assertIn("LOOP-H", failed(ev))
+        self.assertEqual([c["pr"] for c in ev.facts["humanChangesRequested"]], [19])
+
+    def test_rebundle_with_replan_clears(self):
+        w = self._world()
+        plan = copy.deepcopy(w.atts[2].predicate)
+        plan["planDigest"] = "sha256:plan2"
+        w.atts.append(Att("techlead-plan", [("jira", "FRQ-5"), ("jira", "FRQ-6")], plan, 370))
+        w.present_packet(600)
+        w.review(AMAN, "APPROVED", 700)
+        ev, _ = w.evaluate(20)
+        self.assertTrue(ev.ok, failed(ev))
 
 class TestMergedRelease(unittest.TestCase):
     def _merged(self):
