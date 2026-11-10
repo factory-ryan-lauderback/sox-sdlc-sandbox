@@ -123,6 +123,11 @@ class GitHub:
                     continue
                 detail = e.read()[:500].decode(errors="replace")
                 raise RuntimeError(f"{method} {path}: HTTP {e.code} {detail}") from None
+            except urllib.error.URLError as e:
+                if attempt < 3:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(f"{method} {path}: URLError {e.reason}") from None
 
     def get(self, path, **kw):
         return self.request("GET", path, **kw)

@@ -3,6 +3,9 @@ name: sox-review-agent
 # and a schedule sweep). Not triggered by pull_request_target directly: for story PRs that event runs
 # the base branch's (release/*) copy of this file, whose certificate ref would not be refs/heads/main.
 # No job checks out or executes PR code; the diff is fetched through the API as data.
+# Check runs follow .sox/agents/checks.py: one is created only for a verdict about to be attested.
+# A head whose sox/review-agent run ended non-success without an attested verdict is blocked for
+# good (gate F13); recovery is a new commit, which then needs its own review, QA and approval.
 on:
   workflow_dispatch:
     inputs:
@@ -15,6 +18,8 @@ on:
 
 permissions: {}
 
+# Never cancel-in-progress: every Review App check run on a head binds it (gate F13), so a cancelled
+# run would block the head until a new commit. Queued runs replaced in a group never opened a check run.
 concurrency:
   group: sox-review-agent-${{ inputs.pr || 'sweep' }}
   cancel-in-progress: false
@@ -106,6 +111,11 @@ jobs:
     runs-on: ubuntu-latest
     environment: agent-review
     timeout-minutes: 15
+    # One judging job per PR at a time across dispatch and sweep runs, so two runs never both see
+    # "no verdict yet" for the same head.
+    concurrency:
+      group: sox-review-record-${{ matrix.pr }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -139,23 +149,35 @@ jobs:
           REVIEWER_APP_ID: ${{ vars.REVIEW_APP_ID }}
           REVIEWER_APP_SLUG: ${{ steps.app.outputs.app-slug }}
         run: python3 .sox/agents/review_agent.py record --dir "$RUNNER_TEMP/review" --out "$RUNNER_TEMP/out"
+      # Everything that can fail for infrastructure reasons runs before this step, which opens the
+      # check run only for an attest action. No check run means the head stays reviewable.
       - name: Open check run
         env:
           APP_TOKEN: ${{ steps.app.outputs.token }}
         run: python3 .sox/agents/review_agent.py check-start --out "$RUNNER_TEMP/out"
-      - id: attest
+      - id: attest1
         if: steps.rec.outputs.attest == 'true'
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/out/subjects.txt
+          predicate-type: https://acme-lending.example/sox/review-verdict/v1
+          predicate-path: ${{ runner.temp }}/out/predicate.json
+      # One retry: once the check run is open, a failed attest blocks the head for good.
+      - id: attest2
+        if: steps.rec.outputs.attest == 'true' && steps.attest1.outcome == 'failure'
+        continue-on-error: true
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: ${{ runner.temp }}/out/subjects.txt
           predicate-type: https://acme-lending.example/sox/review-verdict/v1
           predicate-path: ${{ runner.temp }}/out/predicate.json
       - name: Complete check run
-        if: always()
+        if: always() && steps.rec.outcome == 'success'
         env:
           APP_TOKEN: ${{ steps.app.outputs.token }}
-          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
-          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+          ATTEST_OUTCOME: ${{ steps.attest1.outcome == 'success' && 'success' || steps.attest2.outcome }}
+          ATTESTATION_URL: ${{ steps.attest1.outputs.attestation-url || steps.attest2.outputs.attestation-url }}
         run: python3 .sox/agents/review_agent.py check-finish --out "$RUNNER_TEMP/out"
       - name: Stage Jira operations
         if: always()
