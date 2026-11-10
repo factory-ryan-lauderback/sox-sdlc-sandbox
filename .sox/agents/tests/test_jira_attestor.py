@@ -171,6 +171,25 @@ class Chain(unittest.TestCase):
         p_now = dict(p, changelog=self.j.changelog(epic))
         self.assertFalse(gate.jira_human_approval(POLICY, p_now, "approachApproval")[0])
 
+    def test_human_replan_is_recorded_once_for_the_loop_reset(self):
+        req, epic, refs, ra, pm, tp = self.full_chain()
+        tp.integrated_time = att._time(ja._now())
+        s1 = refs["s1"]
+        ja.apply_ops(self.j, [{"op": "transition", "key": s1, "to": "Blocked - Human Escalation"}], "review")
+        ja.apply_ops(self.j, [{"op": "transition", "key": s1, "to": "Re-plan"}], "techlead")
+        self.assertIsNone(att.build(self.j, "techlead-plan", epic, "", self.lk)[0], "an agent's Re-plan is not a reset")
+        self.j.transition(s1, "Blocked - Human Escalation", "review")
+        self.j.transition(s1, "Re-plan", "factory-aman")
+        tp2 = self.sign("techlead-plan", epic)
+        p = tp2.predicate
+        self.assertEqual((p["replanApprovedBy"], p["replanApproval"]["issueKey"], p["replanApproval"]["accountId"]),
+                         ("factory-aman", s1, AMAN))
+        self.assertIn(p["replanApprovedBy"], POLICY.humans("techLeads"))
+        tp2.integrated_time = att._time(ja._now())
+        self.assertIsNone(att.build(self.j, "techlead-plan", epic, "", self.lk)[0], "recorded once")
+        ja.apply_ops(self.j, [{"op": "attach", "key": epic, "filename": "plan.md", "content": "# plan v2"}], "techlead")
+        self.assertNotIn("replanApprovedBy", self.sign("techlead-plan", epic).predicate)
+
     def test_agents_cannot_approve(self):
         req = self.requirement()
         for s in ("Approved", "Approach Approved", "ECAB Approved"):

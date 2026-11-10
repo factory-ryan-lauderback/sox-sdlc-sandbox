@@ -28,13 +28,25 @@ def fetch(kind, ident, predicate):
     return v.fetch(api, kind, ident, predicate)
 
 
+def replan_since(story):
+    """Integrated time of the latest verified techlead-plan for the story that records a human Tech
+    Lead's re-plan (`replanApprovedBy` in the policy's techLeads), or None. The gate's LOOP-R rule
+    counts rounds only after it, so a human re-plan after escalation restarts the loop."""
+    v, _ = _ctx()
+    leads = set(v.policy.humans("techLeads"))
+    verified, _ = fetch("jira", story, "techlead-plan")
+    return max((a.integrated_time for a in verified if a.predicate.get("replanApprovedBy") in leads), default=None)
+
+
 def failing_heads(loop_key, predicate="review-verdict"):
-    """Distinct head SHAs with a verified failing verdict for the loop key, plus forgery count."""
+    """Distinct head SHAs with a verified failing verdict for the loop key, plus forgery count.
+    Story loops count only since the last human re-plan (gate LOOP-R)."""
     kind, ident = loop_key
     v, api = _ctx()
     outcome = FAILING[predicate]
     if kind == "jira":
-        _, items, rejected = v.count_rounds(api, ident, predicate, outcome=outcome)
+        since = replan_since(ident) if predicate == "review-verdict" else None
+        _, items, rejected = v.count_rounds(api, ident, predicate, outcome=outcome, since=since)
     else:
         # Release and PR loop keys: same rule (verified only, distinct heads) over that subject.
         verified, rejected = fetch(kind, ident, predicate)
