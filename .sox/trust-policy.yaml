@@ -534,7 +534,40 @@
       "releaseApprovers": "frq-release-approvers",
       "techLeads": "frq-tech-leads",
       "ecab": "frq-ecab"
-    }
+    },
+    "$commentIdentities": "Every Jira identity is an Atlassian accountId. Sandbox: one shared automation account (the owner's) acts for every agent role; it never counts as an approval and is in neverApprovers. The gate reads a human approval from the attested changelog: the latest transition to approvalStatuses[type] after the last change to contentFields, by an atlassian account listed in humanApprovers[type], never the reporter or creator. Issues the shared account creates need the acting-role property and the comment prefix and are marked jira-shared-identity.",
+    "sharedAutomationAccount": "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457",
+    "neverApprovers": [
+      "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
+    ],
+    "humanApprovers": {
+      "$comment": "factory-aman. Requirement, approach and ECAB transitions are also restricted to this account in Jira (FRQ-9, FRQ-10); domain approvals are enforced here only.",
+      "requirementApproval": [
+        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+      ],
+      "approachApproval": [
+        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+      ],
+      "emergencyApproval": [
+        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+      ],
+      "domainApproval": [
+        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+      ]
+    },
+    "approvalStatuses": {
+      "$comment": "Jira status ID entered by the approving transition: Approved (transition 21), Approach Approved (91), ECAB Approved (161).",
+      "requirementApproval": "10071",
+      "approachApproval": "10082",
+      "emergencyApproval": "10089"
+    },
+    "contentFields": [
+      "summary",
+      "description",
+      "Attachment"
+    ],
+    "actingRoleProperty": "sox.actingRole",
+    "actingRoleCommentPrefix": "[sox:<role>]"
   },
   "loops": {
     "maxReviewRounds": 10,

@@ -21,6 +21,7 @@ HOTFIX_RE = re.compile(r"^hotfix/(FRQ-[0-9]{1,9})-[A-Za-z0-9._-]+$")
 NOT_PASSING = {"neutral", "skipped", "cancelled", "stale", "action_required", "timed_out",
                "startup_failure", "failure", None}
 PASSED = {"passed", "pass"}
+STORY_TYPES = ("dev", "qa")
 MAX_COMMITS = 250
 MAX_FILES = 3000
 
@@ -127,6 +128,55 @@ class Context:
         return runs
 
 
+def _jira_time(s):
+    try:
+        return parse_time(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def jira_human_approval(policy, pred, kind):
+    """(ok, detail) for a human Jira approval, re-derived from the attested changelog: the latest
+    transition into approvalStatuses[kind] after the last change to a content field (a later edit
+    reopens the approval), by an atlassian account in humanApprovers[kind] that is not an
+    automation or never-approver account, the reporter, or the creator."""
+    j = policy.jira
+    status = (j.get("approvalStatuses") or {}).get(kind)
+    allowed = set((j.get("humanApprovers") or {}).get(kind) or [])
+    if not status or not allowed:
+        return False, f"jira.approvalStatuses/humanApprovers.{kind} not pinned in the trust policy"
+    hist = pred.get("changelog")
+    if not isinstance(hist, list):
+        return False, "no Jira changelog in the attestation"
+    fields = set(j.get("contentFields") or [])
+    changed = [_jira_time(h.get("created")) for h in hist
+               if any((i or {}).get("field") in fields for i in h.get("items") or [])]
+    if any(c is None for c in changed):
+        return False, "a content change in the changelog has no readable time"
+    last_change = max(changed, default=None)
+    moves = [h for h in hist if any((i or {}).get("field") == "status" and str((i or {}).get("to")) == str(status)
+                                    for i in h.get("items") or [])]
+    moves = [h for h in moves if _jira_time(h.get("created")) is not None
+             and (last_change is None or _jira_time(h.get("created")) > last_change)]
+    if not moves:
+        return False, (f"no transition to status {status} after the last content change"
+                       + (f" at {iso(last_change)}" if last_change else ""))
+    h = max(moves, key=lambda h: (_jira_time(h.get("created")), str(h.get("id"))))
+    author = h.get("author") or {}
+    acct = author.get("accountId")
+    why = []
+    if author.get("accountType") != "atlassian":
+        why.append(f"author accountType {author.get('accountType')!r} is not atlassian")
+    if acct in set(j.get("neverApprovers") or []) or acct == j.get("sharedAutomationAccount"):
+        why.append("author is an automation identity (jira.neverApprovers)")
+    if acct not in allowed:
+        why.append(f"author is not in jira.humanApprovers.{kind}")
+    if acct in (pred.get("reporter"), pred.get("creator")):
+        why.append("author is the issue's reporter or creator")
+    return not why, (f"changelog entry {h.get('id')} moved to status {status} at {h.get('created')} "
+                     f"by {acct}" + ("; " + "; ".join(why) if why else ""))
+
+
 def classify(pd, policy):
     if pd.base_ref == "main":
         if RELEASE_RE.match(pd.head_ref):
@@ -231,6 +281,25 @@ class Evaluation:
                  f"APPROVE reviews by agent Apps with contents:write: {bad}" if bad else
                  "no agent App with contents:write approved")
 
+    def jira_agent(self, rid, entry, role):
+        """An agent-created Jira issue: by the role's own account, or (sandbox) by the shared
+        automation account with the acting role in the issue property and a comment prefix,
+        which is weaker and marked jira-shared-identity."""
+        j = self.policy.jira
+        creator, shared = entry.get("creator"), j.get("sharedAutomationAccount")
+        own = (j.get("agentAccounts") or {}).get(role)
+        if creator and creator == own and creator != shared:
+            return True, f"creator {creator} (agentAccounts.{role})"
+        if creator and creator == shared:
+            ok = entry.get("actingRole") == role and entry.get("actingRoleComment") is True
+            if ok:
+                self.facts.setdefault("jiraSharedIdentity", []).append(rid)
+            return ok, (f"creator is the shared automation account, {j.get('actingRoleProperty')} "
+                        f"{entry.get('actingRole')!r} (expected {role!r}), [sox:{role}] comment "
+                        f"{'present' if entry.get('actingRoleComment') is True else 'missing'} "
+                        "(jira-shared-identity)")
+        return False, f"creator {creator!r} is neither agentAccounts.{role} nor the shared automation account"
+
     # ---------- story chain (SDLC-01..04) ----------
     def story_chain(self, story, slug, first_push_at, tag=""):
         pol = self.policy
@@ -243,12 +312,15 @@ class Evaluation:
             return None
         p = plan.predicate
         sentry = next(s for s in p.get("stories", []) if s.get("key") == story)
-        tl = pol.data["jira"]["agentAccounts"]["techlead"]
         early = first_push_at is None or plan.integrated_time < first_push_at
+        # The plan is the only source of a story's Dev/QA type, never Jira labels or issue types.
+        stype = sentry.get("type")
+        self.facts.setdefault("storyTypes", {})[story] = stype
+        c_ok, c_detail = self.jira_agent(f"SDLC-03.plan{t}", sentry, "techlead")
         self.req(f"SDLC-03.plan{t}", "SDLC-03",
-                 sentry.get("creator") == tl and early and p.get("planDigest"),
-                 f"plan {p.get('planDigest')} for epic {p.get('epicKey')}, story creator "
-                 f"{sentry.get('creator')}, plan at {plan.time_iso}, first push "
+                 c_ok and early and p.get("planDigest") and stype in STORY_TYPES,
+                 f"plan {p.get('planDigest')} for epic {p.get('epicKey')}, story type {stype!r} "
+                 f"(dev or qa, from the plan), {c_detail}, plan at {plan.time_iso}, first push "
                  f"{iso(first_push_at) if first_push_at else 'n/a'}", [plan.digest])
         epic = p.get("epicKey")
         self.facts["epics"][epic] = {"planDigest": p.get("planDigest"), "plan": plan.digest,
@@ -261,10 +333,10 @@ class Evaluation:
             self.req(f"SDLC-02.pm{t}", "SDLC-02", False, f"missing: pm-decomposition for {epic}")
             return plan
         e = next(x for x in pm.predicate["epics"] if x.get("key") == epic)
-        pmacct = pol.data["jira"]["agentAccounts"]["pm"]
-        self.req(f"SDLC-02.pm{t}", "SDLC-02", e.get("creator") == pmacct,
-                 f"epic {epic} creator {e.get('creator')} (expected {pmacct}), requirement "
-                 f"{pm.predicate.get('requirementKey')}", [pm.digest])
+        c_ok, c_detail = self.jira_agent(f"SDLC-02.pm{t}", e, "pm")
+        self.req(f"SDLC-02.pm{t}", "SDLC-02", c_ok,
+                 f"epic {epic}: {c_detail}, requirement {pm.predicate.get('requirementKey')}",
+                 [pm.digest])
         rk, rdig = pm.predicate.get("requirementKey"), pm.predicate.get("requirementContentDigest")
         ra = self.get("jira", rk, "requirement-approval",
                       where=lambda a: a.predicate.get("issueKey") == rk
@@ -274,22 +346,19 @@ class Evaluation:
             self.req(f"SDLC-01.req{t}", "SDLC-01", False,
                      f"missing: requirement-approval {rk} with content digest {rdig}")
         else:
-            q = ra.predicate
-            agents = set(pol.data["jira"]["agentAccounts"].values())
-            po = pol.data["jira"]["groups"]["productOwners"]
-            ok = (q.get("approver") and q.get("approver") != q.get("reporter")
-                  and q.get("approver") not in agents and po in (q.get("approverGroups") or [])
-                  and ra.integrated_time <= pm.integrated_time)
-            self.req(f"SDLC-01.req{t}", "SDLC-01", ok,
-                     f"{rk} approved by {q.get('approver')} (reporter {q.get('reporter')}, groups "
-                     f"{q.get('approverGroups')}) at {ra.time_iso}", [ra.digest])
+            a_ok, a_detail = jira_human_approval(pol, ra.predicate, "requirementApproval")
+            in_order = ra.integrated_time <= pm.integrated_time
+            self.req(f"SDLC-01.req{t}", "SDLC-01", a_ok and in_order,
+                     f"{rk}: {a_detail}; attested {ra.time_iso}"
+                     + ("" if in_order else " (after the pm-decomposition)"), [ra.digest])
         if "risk-high" in (p.get("epicLabels") or []):
             aa = self.get("jira", epic, "approach-approval",
                           where=lambda a: a.predicate.get("planDigest") == p.get("planDigest"))
-            self.req(f"SDLC-03b.approach{t}", "SDLC-03", aa is not None and
-                     aa.predicate.get("approver") in pol.humans("techLeads"),
-                     "risk-high epic needs approach-approval of the current plan digest",
-                     [aa.digest] if aa else [])
+            a_ok, a_detail = (jira_human_approval(pol, aa.predicate, "approachApproval") if aa else
+                              (False, "missing: approach-approval of the current plan digest"))
+            self.req(f"SDLC-03b.approach{t}", "SDLC-03", a_ok,
+                     f"risk-high epic {epic} needs approach-approval of plan {p.get('planDigest')}: "
+                     + a_detail, [aa.digest] if aa else [])
         return plan
 
     # ---------- SDLC-04 scope (every PR) ----------
@@ -458,10 +527,10 @@ class Evaluation:
             self.facts.update({"emergency": key, "stories": [key]})
             ec = self.get("jira", key, "emergency-change")
             self.use(f"emergency-change:{key}", ec)
-            self.req("CC-04.ecab", "CC-04", ec is not None and
-                     ec.predicate.get("ecabApprover") in pol.humans("ecab"),
-                     f"emergency-change {key} approved by "
-                     f"{ec.predicate.get('ecabApprover') if ec else 'missing'}")
+            e_ok, e_detail = (jira_human_approval(pol, ec.predicate, "emergencyApproval") if ec else
+                              (False, f"missing: emergency-change for {key}"))
+            self.req("CC-04.ecab", "CC-04", e_ok, f"emergency-change {key}: {e_detail}",
+                     [ec.digest] if ec else [])
             self.check_pushers(pd, "hotfix")
         else:
             slug = RELEASE_RE.match(pd.head_ref).group(1)

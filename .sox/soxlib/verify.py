@@ -423,6 +423,8 @@ class Verifier:
         verified, rejected = self.fetch(api, "jira", story_key, predicate)
         heads, items = set(), []
         for a in verified:
+            if a.predicate.get("fixture") not in (None, False):
+                continue
             if a.predicate.get("outcome") != outcome or (since is not None and a.integrated_time <= since):
                 continue
             items.append(a)

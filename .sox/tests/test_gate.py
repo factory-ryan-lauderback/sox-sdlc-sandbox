@@ -33,6 +33,32 @@ DEV, QA, BUNDLER = "acme-dev-agent[bot]", "acme-qa-agent[bot]", "acme-release-bu
 AMAN = {"login": "factory-aman", "id": 320644755}
 RIYA = {"login": "factory-riya-bhivare", "id": 351550958}
 OWNER = {"login": "factory-ryan-lauderback", "id": 344896283}
+AMAN_J = "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+SHARED_J = "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
+PO_J = "712020:00000000-0000-0000-0000-0000000000po"
+
+
+def jira_entry(eid, at, account, items, account_type="atlassian"):
+    return {"id": str(eid), "created": t(at), "author": {"accountId": account, "accountType": account_type},
+            "items": items}
+
+
+def to_status(status, frm="10070"):
+    return {"field": "status", "fieldtype": "jira", "from": frm, "to": str(status)}
+
+
+def edit(field="description"):
+    return {"field": field, "fieldtype": "jira", "from": None, "to": None}
+
+
+def req_approval(changelog, reporter=PO_J, creator=PO_J, at=10):
+    return Att("requirement-approval", [("jira", "FRQ-1")],
+               {"issueKey": "FRQ-1", "contentDigest": "sha256:req", "reporter": reporter,
+                "creator": creator, "changelog": changelog}, at)
+
+
+def approved_log():
+    return [jira_entry(1, 2, PO_J, [edit()]), jira_entry(2, 5, AMAN_J, [to_status("10071")])]
 
 
 def policy():
@@ -156,12 +182,10 @@ class World:
         self.release_merged = False
         tl, pm = "svc-techlead-agent", "svc-pm-agent"
         plan = {"epicKey": "FRQ-5", "planDigest": "sha256:plan1",
-                "stories": [{"key": "FRQ-6", "creator": tl, "dependsOn": [],
+                "stories": [{"key": "FRQ-6", "creator": tl, "type": "dev", "dependsOn": [],
                              "requiredTests": ["T-1", "T-2"]}]}
         self.atts = [
-            Att("requirement-approval", [("jira", "FRQ-1")],
-                {"issueKey": "FRQ-1", "contentDigest": "sha256:req", "reporter": "pat",
-                 "approver": "olive", "approverGroups": ["frq-product-owners"]}, 10),
+            req_approval(approved_log()),
             Att("pm-decomposition", [("jira", "FRQ-1"), ("jira", "FRQ-5")],
                 {"requirementKey": "FRQ-1", "requirementContentDigest": "sha256:req",
                  "epics": [{"key": "FRQ-5", "creator": pm}]}, 20),
@@ -721,6 +745,141 @@ class TestApprovalStale(unittest.TestCase):
         w.atts.append(w.manifest(["api", "db"], 750))
         ev, _ = w.evaluate(20)
         self.assertIn("SDLC-09.approval-stale", failed(ev))
+
+class TestJiraIdentities(unittest.TestCase):
+    """Jira approvals are re-derived from the attested changelog; agent-created issues need the
+    role's own account or the shared account with the acting-role marker."""
+
+    def _sdlc01(self, changelog, **kw):
+        w = World()
+        w.atts[0] = req_approval(changelog, **kw)
+        ev, _ = w.evaluate(10)
+        return [r for r in ev.reqs if r.id.startswith("SDLC-01.req")][0]
+
+    def test_human_approval_passes(self):
+        r = self._sdlc01(approved_log())
+        self.assertTrue(r.ok, r.detail)
+
+    def test_rejected_approvals(self):
+        cases = {
+            "automation author": [jira_entry(2, 5, SHARED_J, [to_status("10071")])],
+            "non-atlassian author": [jira_entry(2, 5, AMAN_J, [to_status("10071")], account_type="app")],
+            "unlisted human": [jira_entry(2, 5, PO_J, [to_status("10071")])],
+            "other status": [jira_entry(2, 5, AMAN_J, [to_status("10073")])],
+            "edited after approval": approved_log() + [jira_entry(3, 7, PO_J, [edit("summary")])],
+            "attachment after approval": approved_log() + [jira_entry(3, 7, PO_J, [edit("Attachment")])],
+            "no changelog": None,
+        }
+        for name, log in cases.items():
+            self.assertFalse(self._sdlc01(log).ok, name)
+
+    def test_reporter_or_creator_cannot_approve(self):
+        self.assertFalse(self._sdlc01(approved_log(), reporter=AMAN_J).ok)
+        self.assertFalse(self._sdlc01(approved_log(), creator=AMAN_J).ok)
+
+    def test_reapproval_after_edit_passes(self):
+        log = approved_log() + [jira_entry(3, 7, PO_J, [edit()]),
+                                jira_entry(4, 8, AMAN_J, [to_status("10071", frm="10070")])]
+        self.assertTrue(self._sdlc01(log).ok)
+
+    def test_non_content_edit_does_not_reopen(self):
+        log = approved_log() + [jira_entry(3, 7, PO_J, [edit("labels")])]
+        self.assertTrue(self._sdlc01(log).ok)
+
+    def test_unpinned_status_fails_closed(self):
+        w = World()
+        d = json.loads(w.pol.raw)
+        d["jira"]["approvalStatuses"]["requirementApproval"] = None
+        w.pol = Policy(json.dumps(d).encode())
+        ev, _ = w.evaluate(10)
+        self.assertTrue(any(f.startswith("SDLC-01.req") for f in failed(ev)))
+
+    def _plan_world(self, **story):
+        w = World()
+        plan = copy.deepcopy(w.atts[2].predicate)
+        plan["stories"][0].update(story)
+        w.atts[2] = Att("techlead-plan", [("jira", "FRQ-5"), ("jira", "FRQ-6")], plan, 30)
+        ev, _ = w.evaluate(10)
+        return ev
+
+    def test_shared_identity_creator(self):
+        ev = self._plan_world(creator=SHARED_J, actingRole="techlead", actingRoleComment=True)
+        self.assertTrue(ev.ok, failed(ev))
+        self.assertEqual(len(ev.facts["jiraSharedIdentity"]), 1)
+        for bad in ({"actingRole": "pm", "actingRoleComment": True},
+                    {"actingRole": "techlead", "actingRoleComment": False},
+                    {"actingRole": "techlead"}):
+            ev = self._plan_world(creator=SHARED_J, **bad)
+            self.assertTrue(any(f.startswith("SDLC-03.plan") for f in failed(ev)), bad)
+            self.assertNotIn("jiraSharedIdentity", ev.facts)
+
+    def test_other_creator_fails(self):
+        ev = self._plan_world(creator=AMAN_J)
+        self.assertTrue(any(f.startswith("SDLC-03.plan") for f in failed(ev)))
+
+    def test_story_type_from_plan(self):
+        for bad in (None, "feature", "Dev"):
+            ev = self._plan_world(type=bad)
+            self.assertTrue(any(f.startswith("SDLC-03.plan") for f in failed(ev)), bad)
+        ev = self._plan_world(type="qa")
+        self.assertTrue(ev.ok, failed(ev))
+        self.assertEqual(ev.facts["storyTypes"], {"FRQ-6": "qa"})
+
+
+class TestFixturesExcluded(unittest.TestCase):
+    """A signed `fixture: true` attestation is never evidence; it is set aside for reporting."""
+
+    def _att(self, i, **pred):
+        from soxlib.verify import Attestation
+        st = {"subject": [{"name": "sox:pr:0"}], "predicate": dict({"outcome": "pass"}, **pred)}
+        return Attestation("review-verdict", st, f"sha256:{i:064x}", {}, T0 + i, {})
+
+    def test_evidence_drops_fixtures(self):
+        from soxlib.evidence import Evidence
+        real, fx = self._att(1), self._att(2, fixture=True)
+
+        class V:
+            policy = None
+
+            def fetch(self, api, kind, ident, predicate=None):
+                return [real, fx], []
+        ev = Evidence(V(), None)
+        self.assertEqual([a.digest for a in ev.get("pr", "0")], [real.digest])
+        self.assertEqual([f["digest"] for f in ev.fixture_list()], [fx.digest])
+        self.assertEqual(ev.fixture_list()[0]["lookup"], "pr:0")
+
+    def test_fixture_false_is_evidence(self):
+        from soxlib.evidence import Evidence
+        a = self._att(1, fixture=False)
+
+        class V:
+            policy = None
+
+            def fetch(self, api, kind, ident, predicate=None):
+                return [a], []
+        self.assertEqual(len(Evidence(V(), None).get("pr", "0")), 1)
+
+
+class TestPolicyJira(unittest.TestCase):
+    def _load(self, mutate):
+        with open(os.path.join(SOX, "trust-policy.yaml")) as fh:
+            d = json.load(fh)
+        mutate(d["jira"])
+        return Policy(json.dumps(d).encode())
+
+    def test_repo_policy_loads(self):
+        p = self._load(lambda j: None)
+        self.assertIn(p.jira["sharedAutomationAccount"], p.jira["neverApprovers"])
+
+    def test_rejects_bad_jira_blocks(self):
+        from soxlib.policy import PolicyError
+        bad = [lambda j: j.update(neverApprovers=[]),
+               lambda j: j["humanApprovers"]["requirementApproval"].append(SHARED_J),
+               lambda j: j["humanApprovers"].update(domainApproval=AMAN_J),
+               lambda j: j["approvalStatuses"].update(requirementApproval="Approved")]
+        for m in bad:
+            with self.assertRaises(PolicyError):
+                self._load(m)
 
 class TestScopeMapFile(unittest.TestCase):
     def test_repo_services_yaml_loads_and_digest_is_git_blob(self):

@@ -85,6 +85,7 @@ class Policy:
                 raise PolicyError(f"predicate type {ptype} listed twice")
             self.predicate_types[ptype] = name
         self._validate_humans()
+        self._validate_jira()
 
     def _validate_humans(self):
         humans = self.data.get("humans") or {}
@@ -98,6 +99,26 @@ class Policy:
             hit = sorted(never & set(logins))
             if hit:
                 raise PolicyError(f"{where} contains neverApprovers login(s) {hit}")
+
+    def _validate_jira(self):
+        j = self.data.get("jira") or {}
+        never = set(j.get("neverApprovers") or [])
+        shared = j.get("sharedAutomationAccount")
+        if shared and shared not in never:
+            raise PolicyError("jira.sharedAutomationAccount must be in jira.neverApprovers")
+        for kind, accounts in (j.get("humanApprovers") or {}).items():
+            if kind.startswith("$"):
+                continue
+            if not isinstance(accounts, list):
+                raise PolicyError(f"jira.humanApprovers.{kind} must be a list of accountIds")
+            bad = sorted(set(accounts) & (never | {shared}))
+            if bad:
+                raise PolicyError(f"jira.humanApprovers.{kind} contains automation or "
+                                  f"never-approver accounts {bad}")
+        for kind, status in (j.get("approvalStatuses") or {}).items():
+            if not kind.startswith("$") and status is not None \
+                    and not re.fullmatch(r"[0-9]{1,12}", str(status)):
+                raise PolicyError(f"jira.approvalStatuses.{kind} must be a numeric status id or null")
 
     # convenience accessors
     @property
@@ -137,6 +158,10 @@ class Policy:
 
     def human_id(self, login):
         return ((self.data.get("humans") or {}).get("ids") or {}).get(login)
+
+    @property
+    def jira(self):
+        return self.data.get("jira") or {}
 
     @property
     def control_paths(self):
