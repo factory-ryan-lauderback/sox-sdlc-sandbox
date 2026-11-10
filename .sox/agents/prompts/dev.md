@@ -8,6 +8,7 @@ Rules:
 3. Every required test in the context must exist with that exact unittest ID (`services.<service>.<module>.<Class>.<method>`) and pass. Keep existing tests passing. The services use the Python standard library only; do not add dependencies.
 4. `dev` story: implement the change and its unit tests (`services/<service>/test_*.py`). `qa` story: write end-to-end tests in modules named `test_e2e_*.py` that call the running services at the base URLs in the environment variables `DB_URL`, `API_URL` and `UI_URL`, decorated with `unittest.skipUnless` on those variables so they skip when unset; do not change service code in a `qa` story.
 5. Rework (review findings in the context): fix every blocking finding, and the minor ones where they are right. Do not undo earlier work the findings do not mention.
+   QA failures (a "QA failures to fix" section): those required tests did not pass against the deployed services. Find and fix the cause, in service code or in a test that is wrong about the agreed behaviour. Never delete, rename, skip or weaken a required test to make it pass; every test file you change is listed for the human approver.
 6. Run the tests before you finish: `python3 -m unittest discover -s services -p "test_*.py" -t .`
 7. Keep the change small and focused on the story.
 
