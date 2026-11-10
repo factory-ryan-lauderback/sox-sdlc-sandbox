@@ -421,20 +421,44 @@ class Bundler(unittest.TestCase):
         self.assertTrue(out["problems"])
 
     def test_snapshot_names_candidates_only(self):
+        snap = {"schema": "sox-jira-snapshot/v1", "complete": True,
+                "versions": [{"id": "1", "name": "Auto Pay", "released": False, "archived": False},
+                             {"id": "2", "name": "Old", "released": True, "archived": False},
+                             {"id": "3", "name": "Gone", "released": False, "archived": True}],
+                "issues": [{"key": "FRQ-2", "type": {"name": "Story"}, "fixVersions": [{"id": "4", "name": "Late Pay", "released": False}]},
+                           {"key": "FRQ-1", "type": {"name": "Epic"}, "fixVersions": [{"id": "5", "name": "Epic Only", "released": False}]},
+                           {"key": "FRQ-4", "type": {"name": "Story"}, "fixVersions": [{"id": "6", "name": "!!!", "released": False}, {"id": "7"}]}]}
         with tempfile.TemporaryDirectory() as d:
-            p = pathlib.Path(d, "jira.json")
-            p.write_text(json.dumps({"schema": "sox-jira-fake/v1", "issues": {
-                "FRQ-2": {"type": "Story", "fixVersions": ["Auto Pay"]},
-                "FRQ-1": {"type": "Epic", "fixVersions": ["Epic Only"]},
-                "FRQ-4": {"type": "Story", "fixVersions": ["!!!", 5]}}}))
-            self.assertEqual(bundler.snapshot_releases(str(p)), ({"auto-pay": "Auto Pay"}, None))
+            p = pathlib.Path(d, "snapshot.json")
+            p.write_bytes(json.dumps(snap).encode())
+            dig = "sha256:" + common.sha256_hex(p.read_bytes())
+            self.assertEqual(bundler.snapshot_releases(str(p), dig), ({"auto-pay": "Auto Pay", "late-pay": "Late Pay"}, None))
+            with self.assertRaises(bundler.SnapshotMismatch):
+                bundler.snapshot_releases(str(p), "sha256:" + "0" * 64)
+            p.write_text(json.dumps(dict(snap, complete=False)))
+            self.assertEqual(bundler.snapshot_releases(str(p))[0], {})
             p.write_text("not json")
             self.assertEqual(bundler.snapshot_releases(str(p))[0], {})
+            self.assertEqual(bundler.main(["--dry-run", "--out", str(p) + ".o", "--jira-ops-out", str(p) + ".j",
+                                           "--jira-snapshot", str(p)]), 2)
         self.assertEqual(bundler.snapshot_releases(None), ({}, "no Jira snapshot"))
         gh = FakeGH(dict(self.routes(), **{f"/repos/{common.REPO}/git/ref/heads/main": {"object": {"sha": M1}}}))
         out = bundler.sweep(gh, gh, fetch=lambda s, p: [], policy={"apps": {}, "requiredChecks": {}})
         self.assertEqual([r["release"] for r in out["releases"]], ["auto-pay"])
         self.assertEqual(gh.writes, [])
+
+    def test_snapshot_from_pipeline_producer(self):
+        sys.path.insert(0, str(ROOT / ".sox" / "agents"))
+        import jira_adapter
+        import jira_snapshot
+        with tempfile.TemporaryDirectory() as d:
+            j = jira_adapter.FileJira(os.path.join(d, "jira.json"))
+            epic = j.create("Epic", "E", "", "svc-techlead-agent")
+            story = j.create("Story", "S", "", "svc-techlead-agent", parent=epic)
+            j.set_fix_version(story, "Auto Pay 2026.11", "svc-release-bundler")
+            path = os.path.join(d, "snapshot.json")
+            dig = jira_snapshot.write(jira_snapshot.build(j, "releases"), path)
+            self.assertEqual(bundler.snapshot_releases(path, dig), ({"auto-pay-2026-11": "Auto Pay 2026.11"}, None))
 
     def test_null_app_ids_fail_closed(self):
         gh = FakeGH(self.routes(open_story=["FRQ-2"]))
