@@ -1,0 +1,551 @@
+{
+  "$comment": "SOX trust policy (evidence spec section 5). JSON syntax on purpose: it is valid YAML, and verifiers need no YAML parser. Verifiers read this file from refs/heads/main only. Control path (CODEOWNERS: Control Owner).",
+  "version": 1,
+  "repo": "factory-ryan-lauderback/sox-sdlc-sandbox",
+  "repositoryId": 1453102476,
+  "repositoryUri": "https://github.com/factory-ryan-lauderback/sox-sdlc-sandbox",
+  "owner": "factory-ryan-lauderback",
+  "ownerId": 344896283,
+  "oidcIssuer": "https://token.actions.githubusercontent.com",
+  "sourceRef": "refs/heads/main",
+  "runnerEnvironment": "github-hosted",
+  "denySelfHostedRunners": true,
+  "maxClockSkewSeconds": 300,
+  "neverAllowedTriggers": [
+    "deployment",
+    "deployment_status",
+    "fork",
+    "issue_comment",
+    "issues",
+    "merge_group",
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "pull_request_target",
+    "push",
+    "workflow_call"
+  ],
+  "predicates": {
+    "requirement-approval": {
+      "step": "SDLC-01",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-jira-attestor.yml",
+          "allowedTriggers": [
+            "repository_dispatch",
+            "workflow_dispatch",
+            "schedule"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "pm-decomposition": {
+      "step": "SDLC-02",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-jira-attestor.yml",
+          "allowedTriggers": [
+            "repository_dispatch",
+            "workflow_dispatch",
+            "schedule"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "techlead-plan": {
+      "step": "SDLC-03",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-jira-attestor.yml",
+          "allowedTriggers": [
+            "repository_dispatch",
+            "workflow_dispatch",
+            "schedule"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "approach-approval": {
+      "step": "SDLC-03b",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-jira-attestor.yml",
+          "allowedTriggers": [
+            "repository_dispatch",
+            "workflow_dispatch",
+            "schedule"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "release-manifest": {
+      "step": "SDLC-04",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "$comment": "signer workflow pending confirmation (sox-jira-attestor.yml vs sox-release-bundler.yml)",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-jira-attestor.yml",
+          "allowedTriggers": [
+            "repository_dispatch",
+            "workflow_dispatch",
+            "schedule"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "dev-change": {
+      "step": "SDLC-05",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-gate.yml",
+          "allowedTriggers": [
+            "workflow_dispatch",
+            "schedule",
+            "check_run"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "review-verdict": {
+      "step": "SDLC-06",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "actorApp": "review",
+      "checkName": "sox/review-agent",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-review-agent.yml",
+          "allowedTriggers": [
+            "workflow_dispatch",
+            "schedule"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "env-deploy": {
+      "step": "SDLC-07",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-env-deploy.yml",
+          "allowedTriggers": [
+            "check_run",
+            "workflow_dispatch",
+            "schedule"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "build-provenance": {
+      "step": "SDLC-07",
+      "predicateType": "https://slsa.dev/provenance/v1",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-env-deploy.yml",
+          "allowedTriggers": [
+            "check_run",
+            "workflow_dispatch",
+            "schedule"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "qa-result": {
+      "step": "SDLC-08",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "actorApp": "qa",
+      "checkName": "sox/qa-agent",
+      "$comment": "workflow_run: GitHub runs the default-branch definition; cert ref and trigger to be confirmed on the first real bundle",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-qa-agent.yml",
+          "allowedTriggers": [
+            "workflow_run",
+            "workflow_dispatch",
+            "schedule"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "loop-escalation": {
+      "step": "LOOP",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-gate.yml",
+          "allowedTriggers": [
+            "workflow_dispatch",
+            "schedule",
+            "check_run"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "human-changes-requested": {
+      "step": "LOOP-H",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-gate.yml",
+          "allowedTriggers": [
+            "workflow_dispatch",
+            "schedule",
+            "check_run"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "human-approval": {
+      "step": "SDLC-09",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-gate.yml",
+          "allowedTriggers": [
+            "workflow_dispatch",
+            "schedule",
+            "check_run"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "gate-decision": {
+      "step": "CC-02",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-gate.yml",
+          "allowedTriggers": [
+            "workflow_dispatch",
+            "schedule",
+            "check_run"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "merge-record": {
+      "step": "SDLC-10",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-gate.yml",
+          "allowedTriggers": [
+            "workflow_dispatch",
+            "schedule",
+            "check_run"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "release-approval": {
+      "step": "SDLC-10",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-gate.yml",
+          "allowedTriggers": [
+            "workflow_dispatch",
+            "schedule",
+            "check_run"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "train-plan": {
+      "step": "SDLC-11",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-deploy-train.yml",
+          "allowedTriggers": [
+            "schedule",
+            "workflow_dispatch"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "deploy-result": {
+      "step": "SDLC-11",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-deploy-train.yml",
+          "allowedTriggers": [
+            "schedule",
+            "workflow_dispatch"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        },
+        {
+          "workflow": ".github/workflows/sox-deploy-emergency.yml",
+          "allowedTriggers": [
+            "workflow_dispatch"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "emergency-change": {
+      "step": "CC-04",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-jira-attestor.yml",
+          "allowedTriggers": [
+            "repository_dispatch",
+            "workflow_dispatch",
+            "schedule"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "emergency-retro": {
+      "step": "CC-04",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-gate.yml",
+          "allowedTriggers": [
+            "workflow_dispatch",
+            "schedule",
+            "check_run"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "config-snapshot": {
+      "step": "CC-07",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-reconcile.yml",
+          "allowedTriggers": [
+            "schedule",
+            "workflow_dispatch"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    },
+    "reconciliation-report": {
+      "step": "CC-06",
+      "repository": "factory-ryan-lauderback/sox-sdlc-sandbox",
+      "repositoryId": 1453102476,
+      "sourceRef": "refs/heads/main",
+      "signers": [
+        {
+          "workflow": ".github/workflows/sox-reconcile.yml",
+          "allowedTriggers": [
+            "schedule",
+            "workflow_dispatch"
+          ],
+          "dispatchInputs": "F6: workflow_dispatch accepts only a PR number or Jira key as a lookup hint; the signer re-derives head SHA, base ref, verdicts and conclusions from the GitHub/Jira APIs, so a dispatcher cannot choose the outcome"
+        }
+      ]
+    }
+  },
+  "apps": {
+    "$comment": "App IDs filled in when the Platform builder creates the Apps. A null id fails every check that needs it (fail closed).",
+    "dev": {
+      "slug": "acme-dev-agent",
+      "id": null,
+      "botLogin": "acme-dev-agent[bot]"
+    },
+    "qa": {
+      "slug": "acme-qa-agent",
+      "id": null,
+      "botLogin": "acme-qa-agent[bot]"
+    },
+    "review": {
+      "slug": "acme-review-agent",
+      "id": null,
+      "botLogin": "acme-review-agent[bot]"
+    },
+    "techlead": {
+      "slug": "acme-techlead-agent",
+      "id": null,
+      "botLogin": "acme-techlead-agent[bot]"
+    },
+    "bundler": {
+      "slug": "acme-release-bundler",
+      "id": null,
+      "botLogin": "acme-release-bundler[bot]"
+    },
+    "gate": {
+      "slug": "acme-sox-gate",
+      "id": null,
+      "botLogin": "acme-sox-gate[bot]"
+    },
+    "reconciler": {
+      "slug": "acme-sox-reconciler",
+      "id": null,
+      "botLogin": "acme-sox-reconciler[bot]"
+    },
+    "evidenceWriter": {
+      "slug": "acme-sox-evidence-writer",
+      "id": null,
+      "botLogin": "acme-sox-evidence-writer[bot]"
+    }
+  },
+  "requiredChecks": {
+    "sox/review-agent": "review",
+    "sox/qa-agent": "qa",
+    "sox/evidence-gate": "gate"
+  },
+  "pushers": {
+    "story": [
+      "dev",
+      "qa"
+    ],
+    "qa-fix": [
+      "qa"
+    ],
+    "release": [
+      "bundler"
+    ],
+    "hotfix": [
+      "dev",
+      "qa"
+    ]
+  },
+  "humans": {
+    "$comment": "Logins are pinned to numeric user IDs; a renamed or recreated account does not match.",
+    "ids": {
+      "factory-aman": 320644755,
+      "factory-riya-bhivare": 351550958,
+      "factory-ryan-lauderback": 344896283
+    },
+    "releaseApprovers": [
+      "factory-aman"
+    ],
+    "controlOwners": [
+      "factory-aman"
+    ],
+    "sodShortcut": "sandbox-only: Release Approver and Control Owner are the same person (matrix CC-08)",
+    "developers": [
+      "factory-riya-bhivare"
+    ],
+    "ecab": [
+      "factory-aman"
+    ],
+    "techLeads": [
+      "factory-aman"
+    ],
+    "neverApprovers": [
+      "factory-ryan-lauderback"
+    ],
+    "platformAdmins": [
+      "factory-ryan-lauderback"
+    ]
+  },
+  "controlPaths": [
+    ".github/",
+    ".sox/",
+    ".factory/",
+    "tools/",
+    "CODEOWNERS"
+  ],
+  "jira": {
+    "site": "https://factory-dev-testing.atlassian.net",
+    "project": "FRQ",
+    "agentAccounts": {
+      "pm": "svc-pm-agent",
+      "techlead": "svc-techlead-agent",
+      "bundler": "svc-release-bundler",
+      "dev": "svc-dev-agent",
+      "review": "svc-review-agent",
+      "qa": "svc-qa-agent",
+      "gate": "svc-sox-gate",
+      "reconciler": "svc-sox-reconciler"
+    },
+    "groups": {
+      "productOwners": "frq-product-owners",
+      "releaseApprovers": "frq-release-approvers",
+      "techLeads": "frq-tech-leads",
+      "ecab": "frq-ecab"
+    }
+  },
+  "loops": {
+    "maxReviewRounds": 10,
+    "maxQaRounds": 10
+  },
+  "goLive": {
+    "$comment": "Set at the coordinated go-live. First-parent commits on main up to and including this SHA are labelled bootstrap by the reconciler.",
+    "mainSha": null,
+    "at": null
+  },
+  "evidenceStore": {
+    "repo": "factory-ryan-lauderback/sox-sdlc-evidence",
+    "repositoryId": 1453113434,
+    "branch": "main",
+    "reportsPrefix": "reports/",
+    "bundlesPrefix": "bundles/"
+  },
+  "$commentTriggers": "pull_request_target is never allowed: its job ref is the PR base branch, so a signer holding a main-only environment key cannot run on it, and a pull_request_target cert would name a non-main ref for story PRs. Secret-less relays (sox-gate-relay.yml, sox-review-relay.yml) turn PR events into workflow_dispatch on main."
+}
