@@ -5,6 +5,9 @@ name: sox-release-bundler
 # draft release PR in sync, and merge the approved release PR into main with a merge commit.
 # Writes use the Release Bundler App (contents and pull requests only), whose key lives in the
 # main-only `release-bundler` environment. No dispatch inputs.
+# Jira: the sweep never calls Jira. It reads a Jira snapshot as data (candidate release names
+# only; a verified release-manifest decides) and emits an operation list that the `jira` job
+# applies through sox-jira-write.yml as role bundler (svc-release-bundler).
 on:
   schedule:
     - cron: "*/10 * * * *"
@@ -28,6 +31,8 @@ jobs:
       pull-requests: read
       checks: read
       attestations: read
+    outputs:
+      ops: ${{ steps.sweep.outputs.ops }}
     steps:
       - name: Refuse non-main refs
         env:
@@ -41,18 +46,34 @@ jobs:
         with:
           app-id: ${{ vars.BUNDLER_APP_ID }}
           private-key: ${{ secrets.BUNDLER_APP_PRIVATE_KEY }}
+      - name: Jira snapshot (data only)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BACKEND: ${{ vars.SOX_JIRA_BACKEND || 'file' }}
+        run: |
+          # Fake backend: the store on sox-jira-fake, written only by the jira-attestor App.
+          # Without a snapshot the sweep still serves releases whose branches exist.
+          if [ "$BACKEND" = file ]; then
+            curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/contents/jira.json?ref=sox-jira-fake" \
+              -o "$RUNNER_TEMP/jira-snapshot.json" || echo "::warning::no Jira snapshot; existing release branches only"
+          else
+            echo "::warning::no Jira snapshot source for backend $BACKEND; existing release branches only"
+          fi
       - name: Sweep
+        id: sweep
         env:
           GITHUB_TOKEN: ${{ github.token }}
           SOX_GITHUB_TOKEN: ${{ github.token }}
           SOX_BUNDLER_TOKEN: ${{ steps.app.outputs.token }}
-          SOX_JIRA_BACKEND: ${{ vars.SOX_JIRA_BACKEND || 'file' }}
-          SOX_JIRA_STORE_BRANCH: sox-jira-fake
-          SOX_JIRA_FILE: ${{ runner.temp }}/jira-fake/jira.json
         run: |
           set -euo pipefail
-          python3 -m tools.sox_release.bundler --out bundler-run.json --jira-ops-out bundler-jira-ops.json
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+          snap=()
+          [ -s "$RUNNER_TEMP/jira-snapshot.json" ] && snap=(--jira-snapshot "$RUNNER_TEMP/jira-snapshot.json")
+          python3 -m tools.sox_release.bundler --out bundler-run.json --jira-ops-out bundler-jira-ops.json "${snap[@]}"
+          echo "ops=$(python3 -c 'import json; print(len(json.load(open("bundler-jira-ops.json"))))')" >> "$GITHUB_OUTPUT"
+      - if: steps.sweep.outputs.ops != '0'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: jira-ops-bundler
           path: bundler-jira-ops.json
@@ -60,3 +81,13 @@ jobs:
         with:
           name: bundler-run
           path: bundler-run.json
+
+  jira:
+    needs: sweep
+    if: ${{ !cancelled() && needs.sweep.outputs.ops != '' && needs.sweep.outputs.ops != '0' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/sox-jira-write.yml
+    with:
+      role: bundler
+      artifact-pattern: jira-ops-bundler

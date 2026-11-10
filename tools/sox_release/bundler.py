@@ -1,8 +1,9 @@
 """SDLC-04 Release Bundler and SDLC-10 Shipping Dock.
 
-One idempotent sweep per run, all state re-read from GitHub, Jira and the verifier:
-  1. Releases come from Jira fix versions (and existing release/* branches). A release is acted
-     on only when the verifier returns a release-manifest for `release:<slug>`.
+One idempotent sweep per run, all state re-read from GitHub and the verifier:
+  1. Candidate releases come from Jira fix versions in a Jira read snapshot (data only) and from
+     existing release/* branches. A release is acted on only when the verifier returns a
+     release-manifest for `release:<slug>`.
   2. Ensure branch release/<slug> exists (created from main).
   3. Sync: when main has moved, merge main into release/<slug> with the Merges API. A conflict is
      never resolved here; it is reported and the release waits.
@@ -15,6 +16,8 @@ One idempotent sweep per run, all state re-read from GitHub, Jira and the verifi
      required checks passed on that head (sox/evidence-gate covers the human approval). It then
      waits for the deploy train.
 Reads use the job's GITHUB_TOKEN; writes use the Release Bundler App token (SOX_BUNDLER_TOKEN).
+Jira is never called from here: Jira updates are written as an operation list that
+sox-jira-write.yml applies as svc-release-bundler.
 """
 import argparse
 import json
@@ -55,18 +58,22 @@ def checks_passed(gh, sha, pinned):
     return problems
 
 
-def jira_releases():
-    """{slug: version name} from Jira stories' fix versions. Empty when Jira is unreachable."""
-    agents = ROOT / ".sox" / "agents"
-    if not (agents / "jira_cli.py").exists():
-        return {}, "Jira adapter not on main"
-    sys.path.insert(0, str(agents))
+def snapshot_releases(path):
+    """{slug: version name} from a Jira read snapshot, used only to discover candidate releases.
+
+    The bundler never reads Jira itself. A snapshot only names candidates: nothing is acted on
+    without a verified release-manifest, which the jira-attestor signs from its own Jira read.
+    Accepts the fake store (sox-jira-fake/v1, issues keyed by Jira key) or a list of issues.
+    """
+    if not path:
+        return {}, "no Jira snapshot"
     try:
-        import jira_cli
-        jira = jira_cli.load()
-        names = {v for s in jira.search(type="Story") for v in (s.get("fixVersions") or [])}
-    except Exception as e:  # Jira down: act only on releases that already have branches
-        return {}, f"Jira unavailable: {e}"
+        data = json.loads(pathlib.Path(path).read_text())
+        issues = list(data.get("issues", {}).values()) if isinstance(data, dict) else data
+        names = {v for s in issues if isinstance(s, dict) and s.get("type") == "Story"
+                 for v in (s.get("fixVersions") or []) if isinstance(v, str)}
+    except (OSError, ValueError, AttributeError) as e:  # act only on releases that already have branches
+        return {}, f"Jira snapshot unreadable: {e}"
     out = {}
     for n in sorted(names):
         try:
@@ -207,10 +214,10 @@ def sweep_release(reader, writer, slug, man, pinned, main_sha, dry_run=False):
     return {"release": slug, "log": log, "problems": problems, "jiraOps": jira_ops}
 
 
-def sweep(reader, writer, fetch=evidence.fetch, dry_run=False, policy=None):
+def sweep(reader, writer, fetch=evidence.fetch, dry_run=False, policy=None, jira_snapshot=None):
     policy = policy or trust_policy()
     pinned = pinned_checks(policy)
-    from_jira, jira_err = jira_releases()
+    from_jira, jira_err = snapshot_releases(jira_snapshot)
     slugs = sorted(set(from_jira) | set(release_branches(reader)))
     main_sha = reader.get("/repos/{repo}/git/ref/heads/main")["object"]["sha"]
     out = {"mainSha": main_sha, "jira": jira_err or "ok", "releases": [], "problems": []}
@@ -232,13 +239,14 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--out", required=True)
     ap.add_argument("--jira-ops-out", required=True)
+    ap.add_argument("--jira-snapshot", help="Jira read snapshot (data only, candidate release names)")
     args = ap.parse_args(argv)
     reader = GitHub(token=os.environ.get("GITHUB_TOKEN"))
     writer = GitHub(token=os.environ.get("SOX_BUNDLER_TOKEN") or ("dry-run" if args.dry_run else None))
     if not args.dry_run and not os.environ.get("SOX_BUNDLER_TOKEN"):
         print("refused: SOX_BUNDLER_TOKEN (Release Bundler App token) is required for writes", file=sys.stderr)
         return 2
-    out = sweep(reader, writer, dry_run=args.dry_run)
+    out = sweep(reader, writer, dry_run=args.dry_run, jira_snapshot=args.jira_snapshot)
     out["rejectedEvidence"] = evidence.REJECTED[:50]
     write_json(args.out, out)
     ops = [op for r in out["releases"] for op in r["jiraOps"]]

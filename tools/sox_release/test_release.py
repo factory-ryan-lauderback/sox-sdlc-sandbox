@@ -353,6 +353,22 @@ class Bundler(unittest.TestCase):
         self.assertFalse([w for w in gh.writes if w[0] == "PUT"])
         self.assertTrue(out["problems"])
 
+    def test_snapshot_names_candidates_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d, "jira.json")
+            p.write_text(json.dumps({"schema": "sox-jira-fake/v1", "issues": {
+                "FRQ-2": {"type": "Story", "fixVersions": ["Auto Pay"]},
+                "FRQ-1": {"type": "Epic", "fixVersions": ["Epic Only"]},
+                "FRQ-4": {"type": "Story", "fixVersions": ["!!!", 5]}}}))
+            self.assertEqual(bundler.snapshot_releases(str(p)), ({"auto-pay": "Auto Pay"}, None))
+            p.write_text("not json")
+            self.assertEqual(bundler.snapshot_releases(str(p))[0], {})
+        self.assertEqual(bundler.snapshot_releases(None), ({}, "no Jira snapshot"))
+        gh = FakeGH(dict(self.routes(), **{f"/repos/{common.REPO}/git/ref/heads/main": {"object": {"sha": M1}}}))
+        out = bundler.sweep(gh, gh, fetch=lambda s, p: [], policy={"apps": {}, "requiredChecks": {}})
+        self.assertEqual([r["release"] for r in out["releases"]], ["auto-pay"])
+        self.assertEqual(gh.writes, [])
+
     def test_null_app_ids_fail_closed(self):
         gh = FakeGH(self.routes(open_story=["FRQ-2"]))
         bundler.sweep_release(gh, gh, "auto-pay", self.man, {"sox/evidence-gate": None}, M1)
