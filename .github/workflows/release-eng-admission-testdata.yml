@@ -1,0 +1,148 @@
+name: release-eng-admission-testdata
+# TEST DATA ONLY. Runs on branch release-eng/admission-testdata, never on main. Mints images whose
+# attestations are signed by THIS branch workflow, with predicate fields that look exactly like a
+# real release approval, so sox-admission-demo.yml on main can show that cluster admission rejects
+# them on signer identity. Also checks that Kyverno enforces keyless additionalExtensions.
+# Nothing minted here may ever be trusted: the trust policy and Kyverno pin main-only signers.
+on:
+  push:
+    branches: [release-eng/admission-testdata]
+permissions: {}
+env:
+  REG: ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push test images
+        id: build
+        run: |
+          set -euo pipefail
+          for v in branch-minted unsigned; do
+            docker build -q --label "sox.testdata=$v" -t "$REG/admission-testdata:$v" services/db > /dev/null
+            docker push -q "$REG/admission-testdata:$v" > /dev/null
+            d=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$REG/admission-testdata:$v" | grep "^$REG/admission-testdata@" | head -1 | cut -d@ -f2)
+            echo "${v//-/_}=$d" >> "$GITHUB_OUTPUT"
+          done
+      - name: Branch-signed build provenance (pushed to the registry)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REG }}/admission-testdata
+          subject-digest: ${{ steps.build.outputs.branch_minted }}
+          push-to-registry: true
+      - name: Forged release-approval predicate (right fields, wrong signer)
+        env:
+          DIGEST: ${{ steps.build.outputs.branch_minted }}
+          MAIN_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          jq -n --arg d "$DIGEST" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+            schema:"sox/common/v1", repo:"factory-ryan-lauderback/sox-sdlc-sandbox", step:"SDLC-10",
+            environment:"production", service:"db", imageDigest:$d,
+            mergeCommitSha:"0000000000000000000000000000000000000000", releaseHeadSha:"0000000000000000000000000000000000000000",
+            prNumber:0, release:"admission-testdata",
+            mergeRecord:"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            humanApproval:"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            observedAt:$now, testdata:"branch-minted, must be rejected"}' > ra.json
+      - name: Branch-signed release-approval (pushed to the registry)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.REG }}/admission-testdata
+          subject-digest: ${{ steps.build.outputs.branch_minted }}
+          predicate-type: https://acme-lending.example/sox/release-approval/v1
+          predicate-path: ra.json
+          push-to-registry: true
+      - name: Record digests
+        env:
+          BM: ${{ steps.build.outputs.branch_minted }}
+          UN: ${{ steps.build.outputs.unsigned }}
+        run: |
+          jq -n --arg bm "$BM" --arg un "$UN" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{image:"ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox/admission-testdata", branchMinted:$bm, unsigned:$un, mintedBy:$run}' | tee cases.json
+          { echo '```json'; cat cases.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          version: v0.33.0
+          cluster_name: extcheck
+      - name: Kyverno and pull secrets
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          helm repo add kyverno https://kyverno.github.io/kyverno/ >/dev/null
+          helm install kyverno kyverno/kyverno -n kyverno --create-namespace --version 3.9.2 \
+            --set admissionController.replicas=1 --set backgroundController.enabled=false \
+            --set cleanupController.enabled=false --set reportsController.enabled=false --wait --timeout 6m >/dev/null
+          for ns in kyverno svc-good svc-bad; do
+            kubectl get ns "$ns" >/dev/null 2>&1 || kubectl create ns "$ns"
+            kubectl -n "$ns" create secret docker-registry ghcr-pull --docker-server=ghcr.io \
+              --docker-username=x --docker-password="$TOKEN" >/dev/null
+          done
+      - name: Policies differing only in githubWorkflowTrigger
+        run: |
+          set -euo pipefail
+          for pair in "good:push" "bad:workflow_dispatch"; do
+            ns=${pair%%:*}; trig=${pair#*:}
+            cat <<YAML | kubectl apply -f -
+          apiVersion: kyverno.io/v1
+          kind: ClusterPolicy
+          metadata: {name: ext-$ns}
+          spec:
+            background: false
+            webhookConfiguration: {failurePolicy: Fail, timeoutSeconds: 30}
+            rules:
+              - name: ext
+                match: {any: [{resources: {kinds: [Pod], namespaces: ["svc-$ns"]}}]}
+                verifyImages:
+                  - imageReferences: ["ghcr.io/factory-ryan-lauderback/sox-sdlc-sandbox/*"]
+                    type: SigstoreBundle
+                    failureAction: Enforce
+                    mutateDigest: false
+                    verifyDigest: true
+                    required: true
+                    imageRegistryCredentials: {secrets: [ghcr-pull]}
+                    attestations:
+                      - type: https://acme-lending.example/sox/release-approval/v1
+                        attestors:
+                          - entries:
+                              - keyless:
+                                  issuer: https://token.actions.githubusercontent.com
+                                  subject: https://github.com/factory-ryan-lauderback/sox-sdlc-sandbox/.github/workflows/release-eng-admission-testdata.yml@refs/heads/release-eng/admission-testdata
+                                  additionalExtensions:
+                                    githubWorkflowRepository: factory-ryan-lauderback/sox-sdlc-sandbox
+                                    githubWorkflowTrigger: $trig
+                                  rekor: {url: https://rekor.sigstore.dev}
+          YAML
+          done
+          kubectl wait --for=condition=Ready clusterpolicy/ext-good clusterpolicy/ext-bad --timeout=180s
+      - name: Extension enforcement check
+        env:
+          BM: ${{ steps.build.outputs.branch_minted }}
+        run: |
+          set -uo pipefail
+          pod() { cat <<JSON
+          {"apiVersion":"v1","kind":"Pod","metadata":{"name":"t","namespace":"$1"},"spec":{"imagePullSecrets":[{"name":"ghcr-pull"}],
+           "containers":[{"name":"t","image":"$REG/admission-testdata@$BM"}]}}
+          JSON
+          }
+          good=0; pod svc-good | kubectl create -f - > good.txt 2>&1 || good=$?
+          bad=0; pod svc-bad | kubectl create -f - > bad.txt 2>&1 || bad=$?
+          echo "matching trigger (push): rc=$good $(cat good.txt)"
+          echo "wrong trigger (workflow_dispatch): rc=$bad $(cat bad.txt)"
+          { echo "matching trigger rc=$good"; echo "wrong trigger rc=$bad"; } >> "$GITHUB_STEP_SUMMARY"
+          [ "$good" = 0 ] && [ "$bad" != 0 ] || { echo "additionalExtensions NOT enforced as expected"; exit 1; }
+          echo "additionalExtensions enforced: githubWorkflowTrigger mismatch is denied"
