@@ -59,7 +59,12 @@ def make_ctx(policy, api, mirror_path=None):
     v = Verifier(policy)
     ev = Evidence(v, api)
     path = mirror_path or os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "sox-mirror.git")
-    return G.Context(policy, api, ev, LazyMirror(policy.repo, path), load_services(policy))
+    ctx = G.Context(policy, api, ev, LazyMirror(policy.repo, path), load_services(policy))
+    if os.environ.get("SOX_ACTIONS_TOKEN"):
+        # Workflow runs and jobs (F17) are read with the job's own token (actions: read), so the
+        # Gate App needs no Actions permission.
+        ctx.actions_api = GitHub(token=os.environ["SOX_ACTIONS_TOKEN"])
+    return ctx
 
 
 def pr_number(text):
@@ -162,6 +167,7 @@ def cmd_run(a, api=None, policy=None):
         write_state(a.out, state)
         try:
             ctx = make_ctx(policy, api, a.mirror)
+            ctx.check_run_id = check["id"]
             ev = G.evaluate(ctx, n)
             emissions = R.plan_open(ev, ctx)
             for e in emissions:
