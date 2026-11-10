@@ -19,7 +19,8 @@
     "code": [
       ".sox/gate.py",
       ".sox/soxlib/gate.py",
-      ".sox/soxlib/records.py"
+      ".sox/soxlib/records.py",
+      ".sox/soxlib/scope.py"
     ],
     "relay_triggers": [
       "pull_request_target (opened, synchronize, reopened, edited, ready_for_review, closed)",
@@ -44,7 +45,9 @@
     "rules": {
       "any_fail_wins": "any verified failing review-verdict or qa-result for a head blocks that head (BP-41)",
       "rounds": "LOOP-R/LOOP-Q count distinct heads (F11)",
-      "loop_h": "per release: CHANGES_REQUESTED (incl. dismissed) on any PR from the same head branch into main, plus attested human-changes-requested for release:<slug>; cleared only by a new techlead-plan per epic with an unused digest attested after the request, and a new head (BP-39)"
+      "loop_h": "per release: CHANGES_REQUESTED (incl. dismissed) on any PR from the same head branch into main, plus attested human-changes-requested for release:<slug>; cleared only by a new techlead-plan per epic with an unused digest attested after the request, and a new head (BP-39)",
+      "scope": "every PR: each changed path maps through .sox/services.yaml on main (service manifest paths, the shared section, control paths -> pseudo-service controls). Failures: SDLC-04.unmapped-path, SDLC-04.out-of-scope (touched service, incl. controls, not in the latest verified release-manifest), SDLC-04.manifest-stale (servicesMapDigest is not the git blob of .sox/services.yaml on main), SDLC-04.story-not-in-manifest, SDLC-04.story-in-two-releases (BP-38a-f)",
+      "approval_packet": "human-approval.packet binds releaseManifest (digest of the latest verified release-manifest), stories[], declaredServices[], planDigests; an approval given on an earlier packet for the same head fails with SDLC-09.approval-stale until the new packet is presented and approved (BP-38e)"
     }
   },
   "verifier": {
@@ -66,7 +69,8 @@
       "good": ".sox/testdata/good-review-verdict.bundle.json",
       "branch_minted": ".sox/testdata/branch-minted-review-verdict.bundle.json"
     },
-    "attestation_digest": "sha256 of the in-toto statement bytes (base64-decoded DSSE payload)"
+    "attestation_digest": "sha256 of the in-toto statement bytes (base64-decoded DSSE payload)",
+    "loader_rules": "the whole policy is rejected if a signer file name contains relay/observer/probe or is not an allowlisted sox-*.yml signer, any predicate allows pull_request/pull_request_target/push, a sox-gate.yml predicate allows anything but workflow_dispatch, a sourceRef is not refs/heads/main, or a human role list contains a neverApprovers login"
   },
   "reconciliation": {
     "latest": "https://github.com/factory-ryan-lauderback/sox-sdlc-evidence/blob/main/reports/latest.json",

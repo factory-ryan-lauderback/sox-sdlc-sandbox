@@ -24,7 +24,6 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 from soxlib import gate as G  # noqa: E402
 from soxlib import records as R  # noqa: E402
@@ -32,6 +31,7 @@ from soxlib.evidence import Evidence  # noqa: E402
 from soxlib.ghapi import GitHub  # noqa: E402
 from soxlib.gitrepo import Mirror  # noqa: E402
 from soxlib.policy import Policy  # noqa: E402
+from soxlib.scope import ScopeMap  # noqa: E402
 from soxlib.verify import Verifier, parse_time  # noqa: E402
 
 POLICY = os.path.join(HERE, "trust-policy.yaml")
@@ -51,16 +51,15 @@ class LazyMirror:
         return getattr(self._m, name)
 
 
-def load_services(root=ROOT):
-    from deploy_order import load_services as ls
-    return ls(__import__("pathlib").Path(root))
+def load_services(policy, root=ROOT):
+    return ScopeMap.load(root, policy)
 
 
 def make_ctx(policy, api, mirror_path=None):
     v = Verifier(policy)
     ev = Evidence(v, api)
     path = mirror_path or os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "sox-mirror.git")
-    return G.Context(policy, api, ev, LazyMirror(policy.repo, path), load_services())
+    return G.Context(policy, api, ev, LazyMirror(policy.repo, path), load_services(policy))
 
 
 def pr_number(text):

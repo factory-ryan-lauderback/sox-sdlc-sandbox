@@ -24,6 +24,9 @@ class Policy:
         "sox-jira-attestor", "sox-gate", "sox-review-agent", "sox-qa-agent", "sox-env-deploy",
         "sox-deploy-train", "sox-deploy-emergency", "sox-reconcile", "sox-reg-tests"))
     FORBIDDEN_WORKFLOW_WORDS = ("probe", "relay", "observer")
+    GATE_WORKFLOW = ".github/workflows/sox-gate.yml"
+    # Lists under humans that name non-approvers by design; every other list is a role list.
+    NON_ROLE_LISTS = frozenset({"neverApprovers", "platformAdmins"})
 
     def __init__(self, raw_bytes, source="<memory>"):
         self.raw = raw_bytes
@@ -74,10 +77,27 @@ class Policy:
                 bad = (trig & never) | (trig - SAFE_TRIGGERS)
                 if bad:
                     raise PolicyError(f"predicate {name}: triggers {sorted(bad)} are never allowed")
+                if wf == self.GATE_WORKFLOW and trig != {"workflow_dispatch"}:
+                    raise PolicyError(f"predicate {name}: {wf} may only sign on workflow_dispatch "
+                                      f"(one PR per run), not {sorted(trig)}")
             ptype = spec.get("predicateType") or f"{PREFIX}{name}/v1"
             if ptype in self.predicate_types:
                 raise PolicyError(f"predicate type {ptype} listed twice")
             self.predicate_types[ptype] = name
+        self._validate_humans()
+
+    def _validate_humans(self):
+        humans = self.data.get("humans") or {}
+        never = set(humans.get("neverApprovers") or [])
+        lists = {f"humans.{k}": v for k, v in humans.items()
+                 if isinstance(v, list) and k not in self.NON_ROLE_LISTS}
+        reg = (self.data.get("regulated") or {}).get("domainApprovers") or {}
+        lists.update({f"regulated.domainApprovers.{k}": v for k, v in reg.items()
+                      if isinstance(v, list)})
+        for where, logins in sorted(lists.items()):
+            hit = sorted(never & set(logins))
+            if hit:
+                raise PolicyError(f"{where} contains neverApprovers login(s) {hit}")
 
     # convenience accessors
     @property

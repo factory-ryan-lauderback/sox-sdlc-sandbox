@@ -15,6 +15,7 @@ sys.path.insert(0, SOX)
 
 from soxlib import gate as G, jcs, records as R, subject as subj  # noqa: E402
 from soxlib.policy import Policy  # noqa: E402
+from soxlib.scope import ScopeMap  # noqa: E402
 
 REPO = "factory-ryan-lauderback/sox-sdlc-sandbox"
 T0 = 1_800_000_000
@@ -150,6 +151,8 @@ class World:
         self.release_files = [{"filename": "services/api/app.py"}]
         self.story_pusher = DEV
         self.other_release_prs = []
+        self.other_releases = []
+        self.shared = []
         self.release_merged = False
         tl, pm = "svc-techlead-agent", "svc-pm-agent"
         plan = {"epicKey": "FRQ-5", "planDigest": "sha256:plan1",
@@ -163,14 +166,18 @@ class World:
                 {"requirementKey": "FRQ-1", "requirementContentDigest": "sha256:req",
                  "epics": [{"key": "FRQ-5", "creator": pm}]}, 20),
             Att("techlead-plan", [("jira", "FRQ-5"), ("jira", "FRQ-6")], plan, 30),
-            Att("release-manifest", [("release", "autopay"), ("jira", "FRQ-6")],
-                {"stories": ["FRQ-6"], "declaredServices": ["api"]}, 40),
+            self.manifest(["api"], 40),
             self.verdict(H10, 10, "release/autopay", "pass", 200),
             Att("gate-decision", [("pr", "10"), ("commit", H10)],
                 {"headSha": H10, "conclusion": "success", "prNumber": 10}, 250),
             Att("dev-change", [("pr", "10"), ("commit", H10)], {"headSha": H10, "prNumber": 10}, 250),
         ]
         self.add_release_evidence(R1)
+
+    def manifest(self, declared, at, stories=("FRQ-6",), slug="autopay", map_digest="map1"):
+        return Att("release-manifest", [("release", slug)] + [("jira", s) for s in stories],
+                   {"stories": list(stories), "declaredServices": list(declared),
+                    "servicesMapDigest": map_digest}, at)
 
     def verdict(self, head, pr, base, verdict, at, story="FRQ-6"):
         return Att("review-verdict", [("commit", head), ("pr", str(pr)), ("jira", story)],
@@ -233,6 +240,8 @@ class World:
             f"{r}/branches/main": {"commit": {"sha": M0}},
             f"{r}/commits/{S1}/pulls": [self.pr10()],
             f"{r}/pulls": lambda q: [self.pr20()] + self.other_release_prs,
+            f"{r}/branches": [{"name": "main"}, {"name": "release/autopay"}]
+            + [{"name": f"release/{s}"} for s in self.other_releases],
         }
         for sha, prs in heads.items():
             routes[f"{r}/commits/{sha}/pulls"] = prs
@@ -247,7 +256,8 @@ class World:
         mirror = FakeMirror([(S1, [B0])], trees={MERGE: "tree-R", self.release_head: "tree-R"},
                             parents={MERGE: [M0, self.release_head]})
         services = {"api": {"paths": ["services/api/**"]}, "db": {"paths": ["services/db/**"]}}
-        return G.Context(self.pol, self.api(), FakeEvidence(self.atts), mirror, services)
+        scope = ScopeMap(services, self.shared, self.pol, digest="map1")
+        return G.Context(self.pol, self.api(), FakeEvidence(self.atts), mirror, scope)
 
     _release = False
 
@@ -400,6 +410,7 @@ class TestReleasePR(unittest.TestCase):
     def test_control_path_needs_control_owner_and_marks_shortcut(self):
         w = World()
         w.release_files = [{"filename": "services/api/app.py"}, {"filename": ".sox/trust-policy.yaml"}]
+        w.atts.append(w.manifest(["api", "controls"], 45))
         w.present_packet(600)
         w.review(AMAN, "APPROVED", 700)
         ev, ctx = w.evaluate(20)
@@ -481,7 +492,8 @@ class TestMergedRelease(unittest.TestCase):
         w.release_merged = True
         ev, ctx = w.evaluate(20)
         ha = Att("human-approval", [("commit", R1), ("pr", "20")],
-                 {"prNumber": 20, "commitId": R1, "baseRef": "refs/heads/main"}, 710)
+                 {"prNumber": 20, "commitId": R1, "baseRef": "refs/heads/main",
+                  "packetDigest": ev.facts["packetDigest"]}, 710)
         w.atts.append(ha)
         return w, ha
 
@@ -519,6 +531,134 @@ class TestMergedRelease(unittest.TestCase):
         ras, why = R.release_approvals(ev, ctx, "sha256:mr", {"treeMatch": True})
         self.assertTrue(any("human-approval" in x for x in why))
 
+
+class TestScope(unittest.TestCase):
+    """BP-38: every changed path maps to a declared service through services.yaml on main."""
+
+    def test_unmapped_path_fails_until_shared_maps_it(self):
+        w = World()
+        w.release_files = [{"filename": "services/api/app.py"}, {"filename": "README.md"}]
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-04.unmapped-path", failed(ev))
+        w.shared = [{"path": "README.md", "services": ["api"]}]
+        ev, _ = w.evaluate(20)
+        self.assertNotIn("SDLC-04.unmapped-path", failed(ev))
+        self.assertNotIn("SDLC-04.out-of-scope", failed(ev))
+
+    def test_shared_path_maps_to_every_user(self):
+        w = World()
+        w.shared = [{"paths": ["libs/common/**"], "services": ["api", "db"]}]
+        w.release_files = [{"filename": "libs/common/money.py"}]
+        ev, _ = w.evaluate(20)
+        self.assertEqual(ev.facts["servicesTouched"], ["api", "db"])
+        self.assertIn("SDLC-04.out-of-scope", failed(ev))
+
+    def test_control_path_needs_controls_declared(self):
+        w = World()
+        w.release_files = [{"filename": "services/api/app.py"}, {"filename": "tools/deploy_order.py"}]
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-04.out-of-scope", failed(ev))
+        self.assertIn("controls", ev.facts["servicesTouched"])
+
+    def test_manifest_stale(self):
+        w = World()
+        w.atts.append(w.manifest(["api"], 45, map_digest="old-map"))
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-04.manifest-stale", failed(ev))
+        ev, _ = w.evaluate(10)
+        self.assertIn("SDLC-04.manifest-stale", failed(ev))
+
+    def test_story_not_in_manifest(self):
+        w = World()
+        w.atts.append(w.manifest(["api"], 45, stories=("FRQ-9",)))
+        ev, _ = w.evaluate(10)
+        self.assertIn("SDLC-04.story-not-in-manifest", failed(ev))
+
+    def test_story_in_two_releases(self):
+        w = World()
+        w.other_releases = ["other"]
+        w.atts.append(w.manifest(["api"], 45, slug="other"))
+        ev, _ = w.evaluate(10)
+        self.assertIn("SDLC-04.story-in-two-releases", failed(ev))
+        w2 = World()
+        w2.other_releases = ["other"]
+        w2.atts.append(w2.manifest(["api"], 45, stories=("FRQ-77",), slug="other"))
+        ev, _ = w2.evaluate(10)
+        self.assertNotIn("SDLC-04.story-in-two-releases", failed(ev))
+
+
+class TestApprovalStale(unittest.TestCase):
+    """BP-38e: the packet binds the manifest; a newer manifest or plan voids the approval."""
+
+    def test_packet_binds_manifest(self):
+        w = World()
+        ev, _ = w.evaluate(20)
+        p = ev.facts["packet"]
+        man = next(a for a in w.atts if a.name == "release-manifest")
+        self.assertEqual(p["releaseManifest"], man.digest)
+        self.assertEqual(p["declaredServices"], ["api"])
+        self.assertEqual(p["stories"], ["FRQ-6"])
+
+    def _approved(self):
+        w = World()
+        w.present_packet(600)
+        w.review(AMAN, "APPROVED", 700)
+        ev, _ = w.evaluate(20)
+        self.assertTrue(ev.ok, failed(ev))
+        return w
+
+    def test_newer_manifest_makes_approval_stale(self):
+        w = self._approved()
+        w.atts.append(w.manifest(["api", "db"], 750))
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-09.approval-stale", failed(ev))
+        self.assertIn("SDLC-09.approval", failed(ev))
+        why = ev.facts["approvalCandidates"]["factory-aman"]
+        self.assertTrue(any("releaseManifest" in x and "declaredServices" in x for x in why), why)
+        # a new presentation and a new approval clear it
+        w.present_packet(800)
+        w.review(AMAN, "APPROVED", 900)
+        ev, _ = w.evaluate(20)
+        self.assertTrue(ev.ok, failed(ev))
+
+    def test_newer_plan_makes_approval_stale(self):
+        w = self._approved()
+        plan = copy.deepcopy(w.atts[2].predicate)
+        plan["planDigest"] = "sha256:plan2"
+        w.atts.append(Att("techlead-plan", [("jira", "FRQ-5"), ("jira", "FRQ-6")], plan, 750))
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-09.approval-stale", failed(ev))
+        why = ev.facts["approvalCandidates"]["factory-aman"]
+        self.assertTrue(any("planDigests" in x for x in why), why)
+
+    def test_signed_approval_for_old_packet_not_used_for_release_approval(self):
+        w = self._approved()
+        ev, _ = w.evaluate(20)
+        w.atts.append(Att("human-approval", [("commit", R1), ("pr", "20")],
+                          {"prNumber": 20, "commitId": R1, "baseRef": "refs/heads/main",
+                           "packetDigest": "sha256:old", "reviewer": AMAN}, 710))
+        w.atts.append(w.manifest(["api", "db"], 750))
+        ev, _ = w.evaluate(20)
+        self.assertIn("SDLC-09.approval-stale", failed(ev))
+
+class TestScopeMapFile(unittest.TestCase):
+    def test_repo_services_yaml_loads_and_digest_is_git_blob(self):
+        import subprocess
+        from soxlib.scope import ScopeError, parse_yaml
+        root = os.path.dirname(SOX)
+        m = ScopeMap.load(root, policy())
+        blob = subprocess.run(["git", "hash-object", os.path.join(SOX, "services.yaml")],
+                              capture_output=True, text=True).stdout.strip()
+        if blob:
+            self.assertEqual(m.digest, blob)
+        self.assertEqual(m.map("services/api/app.py"), {"api"})
+        self.assertEqual(m.map(".github/workflows/sox-gate.yml"), {"controls"})
+        self.assertEqual(m.map("CODEOWNERS"), {"controls"})
+        with self.assertRaises(ScopeError):
+            parse_yaml("services:\n  - name: a\n      bad: indent\n")
+        with self.assertRaises(ScopeError):
+            ScopeMap({"api": {"paths": ["services/api/**"]}},
+                     [{"path": "x", "services": ["nope"]}])
 
 class TestCli(unittest.TestCase):
     def setUp(self):

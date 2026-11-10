@@ -11,6 +11,7 @@ import time
 import urllib.parse
 
 from . import jcs
+from .scope import ScopeMap, norm_digest
 from .verify import parse_time
 
 STORY_RE = re.compile(r"^(story|qa-fix)/(FRQ-[0-9]{1,9})-[A-Za-z0-9._-]+$")
@@ -80,10 +81,11 @@ class Context:
     def __init__(self, policy, api, evidence, mirror=None, services=None, now=None):
         self.policy, self.api, self.ev, self.mirror = policy, api, evidence, mirror
         self.repo = policy.repo
-        self.services = services or {}
+        self.scope = services if isinstance(services, ScopeMap) else ScopeMap(services or {}, policy=policy)
         self.now = now or time.time()
         self._prs = {}
         self._story_results = {}
+        self._release_slugs = None
         self.participants = set()
 
     def prdata(self, n):
@@ -91,19 +93,28 @@ class Context:
             self._prs[n] = PRData(self, n)
         return self._prs[n]
 
-    def services_touched(self, paths):
-        touched, unmapped = set(), []
-        for p in paths:
-            hit = False
-            for name, spec in self.services.items():
-                for pat in spec.get("paths", []):
-                    pre = pat[:-2] if pat.endswith("/**") else pat
-                    if p == pre or p.startswith(pre.rstrip("/") + "/"):
-                        touched.add(name)
-                        hit = True
-            if not hit:
-                unmapped.append(p)
-        return sorted(touched), unmapped
+    def scope_at(self, as_of):
+        """Services map to judge a change with. The reconciler overrides this to use the map on
+        main at the time of the merge."""
+        return self.scope
+
+    def services_touched(self, paths, as_of=None):
+        return self.scope_at(as_of).touched(paths)
+
+    def release_slugs(self):
+        """Every release the repository has: release/* branches and release/* PRs into main."""
+        if self._release_slugs is None:
+            slugs = set()
+            for b in self.api.paginate(f"/repos/{self.repo}/branches"):
+                m = RELEASE_RE.match(b.get("name") or "")
+                if m:
+                    slugs.add(m.group(1))
+            for p in self.api.paginate(f"/repos/{self.repo}/pulls?state=all&base=main"):
+                m = RELEASE_RE.match((p.get("head") or {}).get("ref") or "")
+                if m:
+                    slugs.add(m.group(1))
+            self._release_slugs = sorted(slugs)
+        return self._release_slugs
 
     def check_runs(self, sha):
         data = self.api.get(f"/repos/{self.repo}/commits/{sha}/check-runs?per_page=100&filter=all")
@@ -273,14 +284,60 @@ class Evaluation:
                      aa.predicate.get("approver") in pol.humans("techLeads"),
                      "risk-high epic needs approach-approval of the current plan digest",
                      [aa.digest] if aa else [])
-        if slug:
-            man = self.get("release", slug, "release-manifest")
-            self.use(f"release-manifest:{slug}", man)
-            self.req(f"SDLC-04.manifest{t}", "SDLC-04",
-                     man is not None and story in (man.predicate.get("stories") or []),
-                     f"release {slug} manifest lists {story}" if man else
-                     f"missing: release-manifest for {slug}", [man.digest] if man else [])
         return plan
+
+    # ---------- SDLC-04 scope (every PR) ----------
+    def check_scope(self, slug, stories):
+        """unmapped-path, out-of-scope, manifest-stale, story-not-in-manifest,
+        story-in-two-releases (BP-38a-f). Hotfixes (slug None) get the mapping check only."""
+        pd, ctx = self.pd, self.ctx
+        scope = ctx.scope_at(self.as_of)
+        touched, unmapped = scope.touched(pd.paths)
+        self.facts["servicesTouched"] = touched
+        self.req("SDLC-04.unmapped-path", "SDLC-04", not unmapped,
+                 f"paths that map to no service in .sox/services.yaml on main: {unmapped[:20]}"
+                 + (f" (+{len(unmapped) - 20} more)" if len(unmapped) > 20 else "")
+                 if unmapped else f"every changed path maps to a service: {touched}")
+        if slug is None:
+            return None
+        man = self.get("release", slug, "release-manifest")
+        self.use(f"release-manifest:{slug}", man)
+        if man is None:
+            self.req("SDLC-04.manifest", "SDLC-04", False, f"missing: release-manifest for {slug}")
+            return None
+        p = man.predicate
+        declared = sorted(set(p.get("declaredServices") or []))
+        listed = sorted(set(p.get("stories") or []))
+        self.facts["manifest"] = {"digest": man.digest, "stories": listed,
+                                  "declaredServices": declared}
+        out = sorted(set(touched) - set(declared))
+        self.req("SDLC-04.out-of-scope", "SDLC-04", not out,
+                 f"services touched but not declared by release {slug}: {out}" if out else
+                 f"services {touched} within declared {declared}", [man.digest])
+        have, want = norm_digest(p.get("servicesMapDigest")), norm_digest(scope.digest)
+        self.req("SDLC-04.manifest-stale", "SDLC-04", have is not None and have == want,
+                 f"manifest servicesMapDigest {have} vs .sox/services.yaml on main {want}",
+                 [man.digest])
+        missing = sorted(set(stories) - set(listed))
+        self.req("SDLC-04.story-not-in-manifest", "SDLC-04", not missing,
+                 f"stories not in the {slug} manifest: {missing}" if missing else
+                 f"stories {sorted(set(stories))} listed in the {slug} manifest", [man.digest])
+        mine = set(stories) | set(listed)
+        dup, seen = [], []
+        for other in ctx.release_slugs():
+            if other == slug:
+                continue
+            om = self.get("release", other, "release-manifest")
+            if om is None:
+                continue
+            both = sorted(mine & set(om.predicate.get("stories") or []))
+            if both:
+                dup.append(f"{other}: {both}")
+                seen.append(om.digest)
+        self.req("SDLC-04.story-in-two-releases", "SDLC-04", not dup,
+                 f"story keys also in another release's latest manifest: {dup}" if dup else
+                 "no story key is in another release's latest manifest", seen)
+        return man
 
     def review_verdict(self, pd, tag=""):
         pol = self.policy
@@ -348,12 +405,7 @@ class Evaluation:
         self.facts.update({"story": story, "release": slug, "stories": [story]})
         self.check_pushers(pd, kind)
         plan = self.story_chain(story, slug, self.facts.get("firstPushAt"))
-        touched, unmapped = self.ctx.services_touched(pd.paths)
-        self.facts["servicesTouched"] = touched
-        man = self.get("release", slug, "release-manifest")
-        declared = set((man.predicate.get("declaredServices") if man else None) or [])
-        self.req("SDLC-04.scope", "SDLC-04", man is not None and set(touched) <= declared,
-                 f"services touched {touched}, declared {sorted(declared)}")
+        self.check_scope(slug, [story])
         if plan is not None:
             dep = next((s for s in plan.predicate.get("stories", []) if s.get("key") == story), {})
             missing = []
@@ -396,19 +448,7 @@ class Evaluation:
             self.check_pushers(pd, "release")
             self.release_commits(slug)
         self.refresh_plans()
-        stories = self.facts["stories"]
-        man = self.get("release", slug, "release-manifest") if slug else None
-        if slug:
-            self.use(f"release-manifest:{slug}", man)
-            listed = set((man.predicate.get("stories") if man else None) or [])
-            extra = sorted(set(stories) - listed)
-            touched, _ = ctx.services_touched(pd.paths)
-            declared = set((man.predicate.get("declaredServices") if man else None) or [])
-            self.facts["servicesTouched"] = touched
-            self.req("SDLC-04.release-scope", "SDLC-04",
-                     man is not None and not extra and set(touched) <= declared,
-                     f"stories {stories} (not in manifest: {extra}); services {touched} vs "
-                     f"declared {sorted(declared)}", [man.digest] if man else [])
+        self.check_scope(slug, [] if emergency else self.facts["stories"])
         self.review_verdict(pd)
         self.required_check(pd.head, "sox/review-agent", "review")
         self.required_check(pd.head, "sox/qa-agent", "qa")
@@ -626,8 +666,11 @@ class Evaluation:
         qa_att = None
         if qa:
             qa_att = next((a for a in self.all("commit", self.pd.head, "qa-result") if a.digest == qa), None)
+        man = f.get("manifest") or {}
         return {"prNumber": self.pd.number, "headSha": self.pd.head, "baseRef": "refs/heads/main",
                 "planDigests": {k: v["planDigest"] for k, v in sorted(f["epics"].items())},
+                "releaseManifest": man.get("digest"),
+                "declaredServices": man.get("declaredServices", []),
                 "reviewVerdict": up.get(f"review-verdict:{self.pd.number}"),
                 "envDeploy": up.get("env-deploy"), "qaResult": qa,
                 "reportDigest": qa_att.predicate.get("reportDigest") if qa_att else None,
@@ -649,9 +692,15 @@ class Evaluation:
             self.req("SDLC-09.packet", "SDLC-09", False,
                      "approval packet not ready: earlier requirements fail")
             return
-        shown = self.ctx.ev.get("pr", pd.number, "gate-decision", before=self.as_of)
-        shown = [a for a in shown if a.predicate.get("packetDigest") == pdig
-                 and a.predicate.get("headSha") == pd.head]
+        decisions = [a for a in self.ctx.ev.get("pr", pd.number, "gate-decision", before=self.as_of)
+                     if a.predicate.get("headSha") == pd.head and a.predicate.get("packetDigest")]
+        shown = [a for a in decisions if a.predicate.get("packetDigest") == pdig]
+        older = [a for a in decisions if a.predicate.get("packetDigest") != pdig]
+
+        def packet_changes(old):
+            old = old or {}
+            keys = sorted(k for k in set(old) | set(packet) if old.get(k) != packet.get(k))
+            return keys or ["(packet body not recorded)"]
         presented_at = shown[0].integrated_time if shown else None
         self.facts["packetPresentedAt"] = iso(presented_at) if presented_at else None
         latest = {}
@@ -686,7 +735,13 @@ class Evaluation:
             if login in participants:
                 why.append("participated in the change")
             if presented_at is None or sub is None or sub <= presented_at:
-                why.append("submitted before the approval packet for this SHA was presented")
+                prior = [a for a in older if sub is not None and a.integrated_time < sub]
+                if prior:
+                    why.append("approval-stale: approved packet " + str(prior[-1].predicate.get("packetDigest"))
+                               + "; the current packet differs in "
+                               + str(packet_changes(prior[-1].predicate.get("packet"))))
+                else:
+                    why.append("submitted before the approval packet for this SHA was presented")
             if any(t >= sub for t in base_changes if sub):
                 why.append("base changed after the review")
             if self.as_of is not None and sub and sub > self.as_of:
@@ -696,6 +751,16 @@ class Evaluation:
         results = {l: qualifies(r, approvers) for l, r in latest.items()}
         good = [latest[l] for l, why in results.items() if not why]
         self.facts["approvalCandidates"] = {l: (why or ["ok"]) for l, why in results.items()}
+        stale = sorted(l for l, why in results.items() if any(w.startswith("approval-stale") for w in why))
+        signed_stale = [a for a in self.ctx.ev.get("commit", pd.head, "human-approval", before=self.as_of)
+                        if a.predicate.get("prNumber") == pd.number
+                        and a.predicate.get("packetDigest") not in (None, pdig)]
+        if not good and (stale or signed_stale):
+            # BP-38e: a newer release-manifest or techlead-plan than the approver saw.
+            self.req("SDLC-09.approval-stale", "SDLC-09", False,
+                     f"approval by {stale or [(a.predicate.get('reviewer') or {}).get('login') for a in signed_stale]} "
+                     f"covers an earlier packet; current packet {pdig} must be approved anew",
+                     [a.digest for a in signed_stale])
         self.req("SDLC-09.approval", "SDLC-09", bool(good) and not blocking and pd.base_ref == "main",
                  (f"approved by {[r['user']['login'] for r in good]} on {pd.head[:12]}" if good else
                   "no qualifying approval: " + (str(self.facts["approvalCandidates"]) if latest else
