@@ -1,0 +1,99 @@
+name: sox-env-up
+description: >
+  Create a kind cluster with Kyverno admission control and (optionally) deploy an environment spec
+  with `tilt ci`, then read the running digests back from the Kubernetes API. Used by
+  sox-env-deploy.yml, by the QA agent to re-create the identical environment inside its own job,
+  and by the deploy train for the simulated production cluster.
+inputs:
+  spec:
+    description: Path to env-spec.json (envId, images[{service, digest}]).
+    required: true
+  policy:
+    description: nonprod or prod (selects deploy/kyverno/<policy>-policy.yaml).
+    default: nonprod
+  deploy:
+    description: "tilt: deploy the spec with tilt ci and verify digests. none: cluster and policy only."
+    default: tilt
+  registry-token:
+    description: Token with packages:read for ghcr.io (github.token). Empty when packages are public.
+    default: ""
+  controls-root:
+    description: Checkout of main that holds Tiltfile, deploy/, and tools/ (never the PR checkout).
+    default: "."
+outputs:
+  db-url:
+    value: http://127.0.0.1:18001
+  api-url:
+    value: http://127.0.0.1:18002
+  ui-url:
+    value: http://127.0.0.1:18003
+  readback:
+    description: Path to readback.json ({running, problems}).
+    value: ${{ steps.verify.outputs.readback }}
+runs:
+  using: composite
+  steps:
+    - name: Install kind and tilt (pinned by checksum)
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/sox-bin"
+        cd "$RUNNER_TEMP/sox-bin"
+        curl -fsSL -o kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+        echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind" | sha256sum -c -
+        curl -fsSL -o tilt.tgz https://github.com/tilt-dev/tilt/releases/download/v0.37.8/tilt.0.37.8.linux.x86_64.tar.gz
+        echo "e39513f958705d30524d55f68b1d46fbef2b46a0da568efd00e6383dee6be44f  tilt.tgz" | sha256sum -c -
+        tar xzf tilt.tgz tilt
+        chmod +x kind tilt
+        echo "$RUNNER_TEMP/sox-bin" >> "$GITHUB_PATH"
+    - name: Create cluster and install Kyverno
+      shell: bash
+      working-directory: ${{ inputs.controls-root }}
+      env:
+        SPEC: ${{ inputs.spec }}
+        POLICY: ${{ inputs.policy }}
+        REGISTRY_TOKEN: ${{ inputs.registry-token }}
+      run: |
+        set -euo pipefail
+        case "$POLICY" in nonprod|prod) ;; *) echo "unknown policy $POLICY"; exit 1;; esac
+        NS=$(jq -r .envId "$SPEC")
+        [[ "$NS" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || { echo "bad envId"; exit 1; }
+        kind create cluster --name sox --config deploy/kind/cluster.yaml --wait 120s
+        helm repo add kyverno https://kyverno.github.io/kyverno/ >/dev/null
+        helm install kyverno kyverno/kyverno -n kyverno --create-namespace --version 3.9.2 \
+          --set admissionController.replicas=1 --set backgroundController.enabled=false \
+          --set cleanupController.enabled=false --set reportsController.enabled=false \
+          --wait --timeout 6m >/dev/null
+        kubectl create namespace "$NS"
+        kubectl label namespace "$NS" pod-security.kubernetes.io/enforce=restricted \
+          pod-security.kubernetes.io/enforce-version=latest
+        if [ -n "$REGISTRY_TOKEN" ]; then
+          for ns in kyverno "$NS"; do
+            kubectl -n "$ns" create secret docker-registry ghcr-pull --docker-server=ghcr.io \
+              --docker-username=sox-env --docker-password="$REGISTRY_TOKEN" >/dev/null
+          done
+        fi
+        kubectl apply -f "deploy/kyverno/${POLICY}-policy.yaml"
+        for p in $(kubectl get clusterpolicy -o name); do kubectl wait --for=condition=Ready "$p" --timeout=180s; done
+    - name: Deploy with tilt ci
+      if: inputs.deploy == 'tilt'
+      shell: bash
+      working-directory: ${{ inputs.controls-root }}
+      env:
+        SOX_ENV_SPEC: ${{ inputs.spec }}
+      run: |
+        set -euo pipefail
+        SOX_ENV_SPEC=$(realpath "$SOX_ENV_SPEC") timeout 600 tilt ci --file Tiltfile --timeout 8m
+    - name: Read back running digests
+      id: verify
+      if: inputs.deploy == 'tilt'
+      shell: bash
+      working-directory: ${{ inputs.controls-root }}
+      env:
+        SPEC: ${{ inputs.spec }}
+      run: |
+        set -euo pipefail
+        out="$RUNNER_TEMP/readback.json"
+        python3 -m tools.sox_release.kube verify --spec "$(realpath "$SPEC")" > "$out"
+        cat "$out"
+        echo "readback=$out" >> "$GITHUB_OUTPUT"

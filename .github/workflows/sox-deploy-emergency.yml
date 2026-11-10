@@ -1,0 +1,75 @@
+name: sox-deploy-emergency
+# CC-04 emergency deploy of one merged hotfix/FRQ-n-* PR, through `production-emergency`.
+# The only input is the PR number, used as a lookup key. The plan requires, for the hotfix merge
+# and every other unreleased merge before it, verified merge-record and human-approval, and for
+# the hotfix a verified emergency-change (ECAB approval) for its Jira key (trust policy:
+# requiresVerified emergency-change). Only the services the hotfix touches are deployed. Signs
+# deploy-result per service; the plan itself is recorded inside each deploy-result.
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Merged hotfix PR number (lookup key only)
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: sox-production
+  cancel-in-progress: false
+
+jobs:
+  emergency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: production-emergency
+    permissions:
+      contents: read
+      pull-requests: read
+      packages: read
+      deployments: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Refuse non-main refs
+        env:
+          REF: ${{ github.ref }}
+        run: '[ "$REF" = "refs/heads/main" ] || { echo "sox-deploy-emergency runs only from refs/heads/main, not $REF"; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Plan (after the environment approval)
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOX_GITHUB_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          [[ "$PR" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "pr must be a PR number"; exit 1; }
+          python3 -m tools.sox_release.train --mode emergency --emergency-pr "$PR" --cutoff "$GITHUB_SHA" --out plan.json --subjects-out plan-subjects.txt
+          jq '{trainId, outcome, cutoffSha, order, releases: [.releases[] | {prNumber, slug, kind, emergencyChange, ecabApprover}], problems}' plan.json
+          outcome=$(jq -r .outcome plan.json)
+          [ "$outcome" = planned ] || { echo "emergency deploy refused or nothing to deploy ($outcome)"; exit 1; }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: emergency-plan
+          path: plan.json
+      - id: prod
+        uses: ./.github/actions/sox-prod-deploy
+        with:
+          plan: plan.json
+          environment: production-emergency
+          workflow: .github/workflows/sox-deploy-emergency.yml
+          github-token: ${{ github.token }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: deploy-results
+          path: deploy-results.json
+          if-no-files-found: ignore
+      - name: Fail when any service failed
+        env:
+          OUTCOME: ${{ steps.prod.outputs.outcome }}
+        run: '[ "$OUTCOME" = success ] || { echo "emergency deploy failed; deploy-results attested"; exit 1; }'

@@ -1,0 +1,10 @@
+# Single-node kind cluster for ephemeral, QA, and simulated production environments.
+# NodePorts 30001-30003 (db, api, ui) are reachable on 127.0.0.1:18001-18003 of the runner.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - {containerPort: 30001, hostPort: 18001, listenAddress: "127.0.0.1"}
+      - {containerPort: 30002, hostPort: 18002, listenAddress: "127.0.0.1"}
+      - {containerPort: 30003, hostPort: 18003, listenAddress: "127.0.0.1"}
