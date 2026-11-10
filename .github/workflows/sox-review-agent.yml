@@ -1,0 +1,45 @@
+name: sox-review-agent
+# THROWAWAY FORGERY (red team BP-31 testdata). Lives only on a non-main branch. It reuses the real
+# signer's file name so that only the certificate's ref (and trigger) distinguish it from the
+# genuine review-verdict signer on refs/heads/main.
+on:
+  push:
+    branches: [redteam-testdata/branch-mint]
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build forged review-verdict statement
+        env:
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          REF: ${{ github.ref }}
+        run: |
+          SUBJ_SHA=4de627863b24da9d1588afb81d1275ab5fe72d27
+          key() { printf 'sox-subject/v1\n%s\n%s\n%s' "$REPO" "$1" "$2" | sha256sum | cut -d' ' -f1; }
+          {
+            echo "$(key commit "$SUBJ_SHA")  sox:commit:$SUBJ_SHA"
+            echo "$(key pr 0)  sox:pr:0"
+          } > subjects.txt
+          jq -n --arg repo "$REPO" --arg sha "$SUBJ_SHA" --arg run "$RUN_ID" --arg ref "$REF" '{
+            schema: "sox/common/v1", repo: $repo, prNumber: 0, headSha: $sha, baseSha: $sha,
+            baseRef: "refs/heads/main", jiraKeys: ["FRQ-0"], release: "testdata", step: "SDLC-06",
+            actor: {type: "github_app", login: "acme-review-agent[bot]", source: "FORGED on a non-main branch"},
+            inputs: [], inputsDigest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            outcome: "pass", round: 1, observedAt: (now|todate),
+            attestor: {workflow: ".github/workflows/sox-review-agent.yml", ref: "refs/heads/main", runId: ($run|tonumber), runAttempt: 1, actualRef: $ref},
+            upstream: [], verdict: "pass", findingsDigest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            diffDigest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            checkRunId: 0, reviewerAppId: 0, authorAppId: 0,
+            agentClaims: {summary: "BP-31 testdata: branch-minted forgery. Must FAIL verification."}
+          }' > predicate.json
+      - id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: subjects.txt
+          predicate-type: https://acme-lending.example/sox/review-verdict/v1
+          predicate-path: predicate.json
