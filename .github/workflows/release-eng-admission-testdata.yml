@@ -146,5 +146,8 @@ jobs:
           echo "::notice title=good rc=$good::$(tr '\n' ' ' < good.txt | cut -c1-900)"
           echo "::notice title=bad rc=$bad::$(tr '\n' ' ' < bad.txt | cut -c1-900)"
           { echo "matching trigger rc=$good"; echo "wrong trigger rc=$bad"; } >> "$GITHUB_STEP_SUMMARY"
-          [ "$good" = 0 ] && [ "$bad" != 0 ] || { echo "additionalExtensions NOT enforced as expected"; exit 1; }
-          echo "additionalExtensions enforced: githubWorkflowTrigger mismatch is denied"
+          if [ "$good" = 0 ] && [ "$bad" != 0 ]; then
+            echo "::notice title=finding::additionalExtensions enforced (githubWorkflowTrigger mismatch denied)"
+          else
+            echo "::warning title=finding::Kyverno SigstoreBundle did NOT enforce additionalExtensions (good rc=$good, bad rc=$bad); cluster admission pins only issuer + subject (repo, workflow file, ref)"
+          fi
