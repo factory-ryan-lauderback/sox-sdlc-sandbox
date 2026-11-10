@@ -259,6 +259,58 @@ class TestRealCrypto(unittest.TestCase):
         self.assertEqual(att.identity["sourceRepositoryRef"], "refs/heads/main")
 
 
+class TestImageSubjects(unittest.TestCase):
+    """release-approval and build-provenance are looked up by image digest (image:sha256:<hex>).
+    The signature check still runs on the sox subject; the image digest must be in the signed
+    statement."""
+    IMG = "sha256:" + "ab" * 32
+
+    def _bundle(self):
+        b = copy.deepcopy(load(PROBE))
+        st = json.loads(base64.b64decode(b["dsseEnvelope"]["payload"]))
+        st["subject"].append({"name": "ghcr.io/factory-ryan-lauderback/api@" + self.IMG,
+                              "digest": {"sha256": self.IMG.split(":")[1]}})
+        st["predicate"] = {"repo": "factory-ryan-lauderback/sox-sdlc-sandbox",
+                           "observedAt": "2026-11-10T19:37:30Z"}
+        b["dsseEnvelope"]["payload"] = base64.b64encode(json.dumps(st).encode()).decode()
+        return b, st
+
+    def test_parse_ref(self):
+        self.assertEqual(subj.parse_ref("image:" + self.IMG), ("image", self.IMG))
+        for bad in ("image:ab" * 1, "image:sha256:XYZ", "image:sha512:" + "a" * 64):
+            with self.assertRaises(ValueError):
+                subj.parse_ref(bad)
+
+    def test_fetch_by_image_digest(self):
+        b, st = self._bundle()
+        v = Verifier(probe_policy())
+        v.gh_run = FakeGh(st, certificate_identity(leaf_certificate(b)))
+
+        class Api:
+            paths = []
+
+            def paginate_attestations(self, path):
+                self.paths.append(path)
+                return [{"bundle": b}]
+        api = Api()
+        ok, bad = v.fetch(api, "image", self.IMG)
+        self.assertEqual((len(ok), len(bad)), (1, 0), [r.reason for r in bad])
+        self.assertIn("/attestations/" + self.IMG + "?", api.paths[0])
+        other = "sha256:" + "cd" * 32
+        ok, bad = v.fetch(api, "image", other)
+        self.assertEqual(ok, [])
+        self.assertEqual(bad[0].category, "binding-mismatch")
+
+    def test_sox_subject_named_like_image_does_not_match(self):
+        """A sox:<kind> subject never satisfies an image lookup, even with the same digest."""
+        b, st = self._bundle()
+        key = st["subject"][0]["digest"]["sha256"]
+        v = Verifier(probe_policy())
+        v.gh_run = FakeGh(st, certificate_identity(leaf_certificate(b)))
+        att = v.verify(b)
+        self.assertFalse(att.has_subject("image", "sha256:" + key))
+        self.assertTrue(att.has_subject("image", self.IMG))
+
 class TestBundleForms(unittest.TestCase):
     def test_api_record_wrapper(self):
         rec = {"repository_id": "1453102476", "bundle": load(PROBE)}

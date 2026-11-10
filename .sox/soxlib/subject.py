@@ -3,6 +3,8 @@ import hashlib
 import re
 
 KINDS = ("commit", "pr", "jira", "release", "train", "report")
+# Real artifacts (container images) are subjects under their own digest, not a derived key.
+IMAGE_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ID_RULES = {
     "commit": re.compile(r"^[0-9a-f]{40}$"),
     "pr": re.compile(r"^[0-9]{1,9}$"),
@@ -37,9 +39,20 @@ def parse_name(name):
 
 
 def parse_ref(text):
-    """'commit:<sha>' (CLI form) -> ('commit', '<sha>')."""
+    """'commit:<sha>' (CLI form) -> ('commit', '<sha>'); 'image:sha256:<hex>' for image digests."""
     kind, _, ident = text.partition(":")
+    if kind == "image":
+        if not IMAGE_RE.match(ident):
+            raise ValueError(f"expected image:sha256:<64 hex>, got {text!r}")
+        return kind, ident
     if kind not in KINDS or not ident:
         raise ValueError(f"expected <kind>:<id>, got {text!r}")
     preimage("x/y", kind, ident)
     return kind, ident
+
+
+def lookup_digest(repo, kind, ident):
+    """Hex digest to query the attestations API with: the derived key, or the image digest."""
+    if kind == "image":
+        return ident.split(":", 1)[1]
+    return key(repo, kind, ident)

@@ -92,6 +92,11 @@ class Attestation:
         return out
 
     def has_subject(self, kind, ident):
+        if kind == "image":
+            want = str(ident).split(":", 1)[-1]
+            return any(subj.parse_name(s.get("name")) is None
+                       and (s.get("digest") or {}).get("sha256") == want
+                       for s in self.statement.get("subject", []))
         return (kind, str(ident)) in self.subjects
 
     @property
@@ -384,7 +389,7 @@ class Verifier:
 
         Only verified ones may be used for decisions or loop counts. Rejected ones are reported.
         """
-        key = subj.key(self.policy.repo, kind, ident)
+        key = subj.lookup_digest(self.policy.repo, kind, ident)
         path = f"/repos/{self.policy.repo}/attestations/sha256:{key}?per_page=100"
         if predicate:
             path += "&predicate_type=" + self.policy.predicate_type(predicate)
