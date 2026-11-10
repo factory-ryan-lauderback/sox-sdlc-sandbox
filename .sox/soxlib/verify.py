@@ -418,7 +418,13 @@ class Verifier:
 
     def count_rounds(self, api, story_key, predicate="review-verdict",
                      outcome="changes_requested", since=None):
+        """Rounds = distinct head SHAs with a verified `outcome` verdict. Re-dispatching the signer
+        on the same head adds attestations but not rounds (F11)."""
         verified, rejected = self.fetch(api, "jira", story_key, predicate)
-        n = [a for a in verified if a.predicate.get("outcome") == outcome
-             and (since is None or a.integrated_time > since)]
-        return len(n), n, rejected
+        heads, items = set(), []
+        for a in verified:
+            if a.predicate.get("outcome") != outcome or (since is not None and a.integrated_time <= since):
+                continue
+            items.append(a)
+            heads.add(a.predicate.get("headSha") or a.digest)
+        return len(heads), items, rejected

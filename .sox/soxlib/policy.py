@@ -18,7 +18,12 @@ class PolicyError(ValueError):
 
 
 class Policy:
-    FORBIDDEN_WORKFLOW_WORDS = ("probe",)
+    # Only these files may ever sign evidence. Relays and the observer are dispatch-only by design
+    # and must never become signers, even through a policy edit (F12, BP-53b).
+    SIGNER_WORKFLOWS = frozenset(f".github/workflows/{n}.yml" for n in (
+        "sox-jira-attestor", "sox-gate", "sox-review-agent", "sox-qa-agent", "sox-env-deploy",
+        "sox-deploy-train", "sox-deploy-emergency", "sox-reconcile", "sox-reg-tests"))
+    FORBIDDEN_WORKFLOW_WORDS = ("probe", "relay", "observer")
 
     def __init__(self, raw_bytes, source="<memory>"):
         self.raw = raw_bytes
@@ -59,9 +64,10 @@ class Policy:
                 raise PolicyError(f"predicate {name}: no signers")
             for s in signers:
                 wf = s.get("workflow", "")
-                if not WORKFLOW_RE.match(wf) or any(w in wf for w in self.FORBIDDEN_WORKFLOW_WORDS):
-                    raise PolicyError(f"predicate {name}: signer workflow {wf!r} is not a pinned "
-                                      "sox-*.yml workflow")
+                if (not WORKFLOW_RE.match(wf) or wf not in self.SIGNER_WORKFLOWS
+                        or any(w in wf for w in self.FORBIDDEN_WORKFLOW_WORDS)):
+                    raise PolicyError(f"predicate {name}: signer workflow {wf!r} is not one of the "
+                                      "allowed signer workflows")
                 trig = set(s.get("allowedTriggers") or [])
                 if not trig:
                     raise PolicyError(f"predicate {name}: no allowedTriggers")

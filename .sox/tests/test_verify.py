@@ -13,7 +13,7 @@ sys.path.insert(0, SOX)
 
 from soxlib import der, subject as subj  # noqa: E402
 from soxlib.policy import Policy, PolicyError  # noqa: E402
-from soxlib.verify import (Rejection, Verifier, certificate_identity, check_identity,  # noqa: E402
+from soxlib.verify import (Attestation, Rejection, Verifier, certificate_identity, check_identity,  # noqa: E402
                            leaf_certificate, normalize_bundle, gh_verify_args)
 
 POLICY = os.path.join(SOX, "trust-policy.yaml")
@@ -39,6 +39,7 @@ def probe_policy():
 
     class TestPolicy(Policy):
         FORBIDDEN_WORKFLOW_WORDS = ()
+        SIGNER_WORKFLOWS = Policy.SIGNER_WORKFLOWS | {".github/workflows/sox-platform-probe.yml"}
     return TestPolicy(json.dumps(d).encode())
 
 
@@ -93,6 +94,15 @@ class TestPolicyLoading(unittest.TestCase):
                    ".github/workflows/../workflows/sox-gate.yml"):
             raw = self._mutated(lambda d: d["predicates"]["human-approval"]["signers"][0]
                                 .__setitem__("workflow", wf))
+            with self.assertRaises(PolicyError, msg=wf):
+                Policy(raw)
+
+    def test_rejects_relay_and_observer_signers(self):
+        """BP-53b: relays and the observer are dispatch-only and can never be signers."""
+        for wf in (".github/workflows/sox-observer-relay.yml", ".github/workflows/sox-gate-relay.yml",
+                   ".github/workflows/sox-review-relay.yml", ".github/workflows/sox-gates-ci.yml"):
+            raw = self._mutated(lambda d: d["predicates"]["review-verdict"]["signers"].append(
+                {"workflow": wf, "allowedTriggers": ["workflow_dispatch"]}))
             with self.assertRaises(PolicyError, msg=wf):
                 Policy(raw)
 
@@ -310,6 +320,32 @@ class TestImageSubjects(unittest.TestCase):
         att = v.verify(b)
         self.assertFalse(att.has_subject("image", "sha256:" + key))
         self.assertTrue(att.has_subject("image", self.IMG))
+
+class TestRoundCounting(unittest.TestCase):
+    """F11/BP-41b: a round is a distinct head with a verified changes_requested verdict."""
+
+    def _count(self, items, **kw):
+        v = Verifier.load(POLICY)
+        v.fetch = lambda api, kind, ident, predicate=None: (items, [])
+        return v.count_rounds(None, "FRQ-1", **kw)[0]
+
+    @staticmethod
+    def _att(i, head, outcome="changes_requested"):
+        st = {"subject": [{"name": f"sox:commit:{head}"}, {"name": "sox:jira:FRQ-1"}],
+              "predicate": {"outcome": outcome, "headSha": head}}
+        return Attestation("review-verdict", st, f"sha256:{i:064x}", {}, 1_800_000_000 + i, {})
+
+    def test_redispatch_on_one_head_is_one_round(self):
+        self.assertEqual(self._count([self._att(i, "a" * 40) for i in range(3)]), 1)
+
+    def test_distinct_heads_count(self):
+        self.assertEqual(self._count([self._att(i, c * 40) for i, c in enumerate("bcd")]), 3)
+
+    def test_passes_and_since_excluded(self):
+        items = [self._att(0, "a" * 40), self._att(1, "b" * 40, "pass"), self._att(5, "c" * 40)]
+        self.assertEqual(self._count(items), 2)
+        self.assertEqual(self._count(items, since=1_800_000_002), 1)
+
 
 class TestBundleForms(unittest.TestCase):
     def test_api_record_wrapper(self):
