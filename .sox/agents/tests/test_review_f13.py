@@ -180,15 +180,15 @@ PASS = RecordTest.PASS
 
 
 class FinishTest(unittest.TestCase):
-    def _finish(self, plan, env, status="in_progress"):
+    def _finish(self, plan, env, status="in_progress", cid=9):
         out = tempfile.mkdtemp()
         if plan is not None:
             json.dump(plan, open(f"{out}/plan.json", "w"))
         gh = mock.Mock()
-        gh.get.return_value = {"id": 9, "head_sha": HEAD, "status": status}
+        gh.get.return_value = {"id": cid, "head_sha": HEAD, "status": status}
         with mock.patch.object(review_agent, "GitHub", return_value=gh), \
              mock.patch.object(review_agent.checks, "complete") as complete, \
-             mock.patch.dict(os.environ, {"APP_TOKEN": "t", "CHECK_RUN_ID": "9", **env}):
+             mock.patch.dict(os.environ, {"APP_TOKEN": "t", "CHECK_RUN_ID": str(cid), **env}):
             review_agent.finish(mock.Mock(out=out))
         return complete, gh
 
@@ -201,6 +201,11 @@ class FinishTest(unittest.TestCase):
             c, gh = self._finish({"attest": False, "pr": 7, "conclusion": "success", "title": "t", "summary": ""}, env)
             self.assertEqual((c.call_args.args[3], c.call_args.kwargs["run_id"]), ("failure", 9))
             gh.request.assert_not_called()
+
+    def test_real_size_check_run_id(self):
+        c, _ = self._finish({"attest": True, "pr": 7, "conclusion": "success", "title": "t", "summary": "s"},
+                            {"ATTEST_OUTCOME": "success", "ATTESTATION_URL": "https://x"}, cid=134129588395)
+        self.assertEqual((c.call_args.args[3], c.call_args.kwargs["run_id"]), ("success", 134129588395))
 
     def test_failed_attest_completes_failure(self):
         c, gh = self._finish({"attest": True, "pr": 7, "conclusion": "success", "title": "t", "summary": ""},

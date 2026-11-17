@@ -282,16 +282,16 @@ class RunTestsTest(unittest.TestCase):
 
 
 def do_record(statuses=None, result="success", existing=None, status="in_progress", head_moved=False,
-              fetch=None, results_b64=None, prior=(), pr=PR):
+              fetch=None, results_b64=None, prior=(), pr=PR, cid=9):
     ctx, digest = ctxdir(pr, fetch)
     statuses = statuses if statuses is not None else {t: "passed" for t in REQ}
     f = tempfile.mktemp()
     json.dump([{"id": k, "status": v} for k, v in statuses.items()], open(f, "w"))
     b64 = sealed_results(f) if results_b64 is None else results_b64
     pr = {**pr, "head": {**pr["head"], "sha": "c" * 40}} if head_moved else pr
-    gh = fake_gh({"id": 9, "app": {"id": APP}, "head_sha": HEAD, "name": qa_agent.CHECK_NAME, "status": status}, pr=pr)
+    gh = fake_gh({"id": cid, "app": {"id": APP}, "head_sha": HEAD, "name": qa_agent.CHECK_NAME, "status": status}, pr=pr)
     out = tempfile.mkdtemp()
-    env = {"CONTEXT_DIGEST": digest, "CHECK_RUN_ID": "9", "TEST_RESULT": result, "RESULTS_SEALED": b64,
+    env = {"CONTEXT_DIGEST": digest, "CHECK_RUN_ID": str(cid), "TEST_RESULT": result, "RESULTS_SEALED": b64,
            "SEAL_SECRET": SECRET, "GITHUB_SHA": "d" * 40}
     with patched(gh, fetch=fetch, existing=existing, prior=prior, env=env):
         qa_agent.record(mock.Mock(ctx=ctx, out=out))
@@ -399,6 +399,10 @@ class RecordTest(unittest.TestCase):
         self.assertIn("sox:jira:FRQ-2", subjects)
         self.assertNotIn("sox:jira:FRQ-3", subjects)
 
+    def test_real_size_check_run_id(self):
+        plan, pred, _, _ = do_record(cid=134129588395)
+        self.assertEqual((plan["attest"], plan["checkRunId"], pred["checkRunId"]), (True, 134129588395, 134129588395))
+
     def test_tenth_failing_round_escalates(self):
         plan, pred, _, ops = do_record({REQ[0]: "failed", REQ[1]: "passed"}, prior=[str(i) * 40 for i in range(9)])
         self.assertEqual(pred["round"], 10)
@@ -406,21 +410,28 @@ class RecordTest(unittest.TestCase):
 
 
 class FinishTest(unittest.TestCase):
-    def _finish(self, plan, env, status="in_progress"):
+    def _finish(self, plan, env, status="in_progress", cid=9):
         out = tempfile.mkdtemp()
         if plan is not None:
             json.dump(plan, open(f"{out}/plan.json", "w"))
         gh = mock.Mock()
-        gh.get.return_value = {"id": 9, "head_sha": HEAD, "status": status}
+        gh.get.return_value = {"id": cid, "head_sha": HEAD, "status": status}
         with mock.patch.object(qa_agent, "GitHub", return_value=gh), \
              mock.patch.object(qa_agent.checks, "complete") as complete, \
-             mock.patch.dict(os.environ, {"APP_TOKEN": "t", "CHECK_RUN_ID": "9", **env}):
+             mock.patch.dict(os.environ, {"APP_TOKEN": "t", "CHECK_RUN_ID": str(cid), **env}):
             qa_agent.finish(mock.Mock(out=out))
         return complete
 
     def test_no_plan_completes_failure(self):
         c = self._finish(None, {})
         self.assertEqual((c.call_args.args[3], c.call_args.kwargs["run_id"]), ("failure", 9))
+
+    def test_real_size_check_run_id(self):
+        c = self._finish({"attest": True, "conclusion": "success", "title": "t", "summary": "s"},
+                         {"ATTEST_OUTCOME": "success", "ATTESTATION_URL": "https://x"}, cid=134129588395)
+        self.assertEqual((c.call_args.args[3], c.call_args.kwargs["run_id"]), ("success", 134129588395))
+        with self.assertRaises(SystemExit):
+            self._finish(None, {}, cid=10 ** 19)
 
     def test_attest_failure_completes_failure(self):
         c = self._finish({"attest": True, "conclusion": "success", "title": "t", "summary": ""},

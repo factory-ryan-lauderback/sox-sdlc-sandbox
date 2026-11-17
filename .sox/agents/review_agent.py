@@ -25,7 +25,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (REPO, GitHub, digest_of, dump_json, is_control_path, load_json, now_utc,  # noqa: E402
+from common import (CHECK_RUN_ID_DIGITS, REPO, GitHub, digest_of, dump_json, is_control_path, load_json, now_utc,  # noqa: E402
                     positive_int, pr_binding, set_output, sha256_hex, subject_lines)
 import checks  # noqa: E402
 import rounds  # noqa: E402
@@ -382,7 +382,7 @@ def finish(args):
     """Complete the run opened by `open`. Success only if the verdict is pass AND its attestation exists.
     Runs even when earlier jobs failed or were cancelled; without a plan the run completes as failure."""
     gh = GitHub(os.environ["APP_TOKEN"])
-    cid = positive_int(os.environ["CHECK_RUN_ID"], "check run id")
+    cid = positive_int(os.environ["CHECK_RUN_ID"], "check run id", CHECK_RUN_ID_DIGITS)
     plan = load_json(f"{args.out}/plan.json", default={}) or {}
     if plan.get("closed"):
         print("check run already completed")

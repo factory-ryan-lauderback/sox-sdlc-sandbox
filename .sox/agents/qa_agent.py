@@ -38,7 +38,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (REPO, GitHub, digest_of, dump_json, load_json, now_utc, positive_int,  # noqa: E402
+from common import (CHECK_RUN_ID_DIGITS, REPO, GitHub, digest_of, dump_json, load_json, now_utc, positive_int,  # noqa: E402
                     set_output, sha256_hex, subject_lines)
 import checks  # noqa: E402
 import rounds  # noqa: E402
@@ -342,7 +342,7 @@ def record(args):
     ctx = _ctx(args.ctx)
     os.makedirs(args.out, exist_ok=True)
     dump_json(f"{args.out}/jira-ops.json", [])
-    n, head, slug, cid = ctx["pr"], ctx["headSha"], ctx["release"], positive_int(os.environ["CHECK_RUN_ID"], "check run")
+    n, head, slug, cid = ctx["pr"], ctx["headSha"], ctx["release"], positive_int(os.environ["CHECK_RUN_ID"], "check run", CHECK_RUN_ID_DIGITS)
     plan = {"pr": n, "headSha": head, "checkRunId": cid, "conclusion": "failure", "attest": False}
 
     def finish_plan(title, summary, details=""):
@@ -443,7 +443,7 @@ def record(args):
 
 def finish(args):
     gh = GitHub(os.environ["APP_TOKEN"])
-    cid = positive_int(os.environ["CHECK_RUN_ID"], "check run id")
+    cid = positive_int(os.environ["CHECK_RUN_ID"], "check run id", CHECK_RUN_ID_DIGITS)
     plan = load_json(f"{args.out}/plan.json", default={}) or {}
     if plan.get("closed"):
         return print("check run already completed")

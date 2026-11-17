@@ -605,6 +605,13 @@
       "approvedBy": "factory-ryan-lauderback",
       "approvedAt": "2026-11-17",
       "reason": "PM/TL context hidden-files fix; no control-change path yet"
+    },
+    {
+      "pr": 60,
+      "label": "bypass-exception-2",
+      "approvedBy": "factory-ryan-lauderback",
+      "approvedAt": "2026-11-17",
+      "reason": "check-run ids exceed 9 digits"
     }
   ],
   "loops": {
