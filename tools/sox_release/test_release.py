@@ -2,6 +2,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -572,6 +573,21 @@ class Bundler(unittest.TestCase):
         self.assertEqual([o["key"] for o in out["jiraOps"]], ["FRQ-2", "FRQ-3"])
         gh, _ = self.run_(merged=["FRQ-2", "FRQ-3"], release_pr=rel, checks_ok=False)
         self.assertEqual(gh.writes, [])
+
+
+class WorkflowConcurrency(unittest.TestCase):
+    """F21: a run on any ref but main must not join a shared concurrency group, or it can displace
+    or cancel a pending main run before its ref guard refuses it."""
+
+    def test_shared_groups_are_main_only(self):
+        for name, group in (("sox-deploy-train.yml", "sox-production"), ("sox-deploy-emergency.yml", "sox-production"),
+                            ("sox-release-bundler.yml", "sox-release-bundler")):
+            text = (ROOT / ".github" / "workflows" / name).read_text()
+            m = re.search(r"^concurrency:\n  group: (.+)\n  cancel-in-progress: false\n", text, re.M)
+            self.assertIsNotNone(m, name)
+            self.assertEqual(m.group(1), "${{ github.ref == 'refs/heads/main' && '%s' || format('%s-refused-{0}', github.run_id) }}"
+                             % (group, group), name)
+            self.assertEqual(text.count("concurrency:"), 1, name)
 
 
 if __name__ == "__main__":

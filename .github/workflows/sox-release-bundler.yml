@@ -20,8 +20,10 @@ on:
 
 permissions: {}
 
+# Only runs on main join the shared group. A run on any other ref gets a group of its own, so it
+# cannot displace or cancel a pending main run before its ref guard refuses it.
 concurrency:
-  group: sox-release-bundler
+  group: ${{ github.ref == 'refs/heads/main' && 'sox-release-bundler' || format('sox-release-bundler-refused-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
