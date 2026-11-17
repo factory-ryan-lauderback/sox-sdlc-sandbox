@@ -1,0 +1,5 @@
+{
+  "$comment": "Unpaired success check runs from the Gate, Review and QA Apps that a named setup or red-team run explains (evidence spec 7.6 rule 3). Pre-go-live only: after goLive.at every unpaired success is a check-without-evidence exception whatever is listed here. Each entry names the check run (checkRunId) or the workflow run it claims (runId), the reason, and a link to the log.",
+  "checkRuns": [],
+  "runs": []
+}

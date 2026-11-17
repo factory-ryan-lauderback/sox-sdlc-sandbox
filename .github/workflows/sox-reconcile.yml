@@ -1,0 +1,95 @@
+name: sox-reconcile
+# Reconciliation (evidence spec section 7), demo grade: P1 every commit on main, P2 merged PRs,
+# P5 App key pins against the latest app-inventory artifact, P8 pairing of every Gate, Review
+# and QA check run since the Apps were created. The report is signed here as
+# reconciliation-report (subject sox:report:<time>) and appended to the hash-chained index in
+# factory-ryan-lauderback/sox-sdlc-evidence (reports/) by the Evidence Writer.
+# The reconciler holds only its own read-only token; it never receives another role's key.
+# Fixed: no dispatch inputs. The daily schedule is enabled at go-live.
+on:
+  workflow_dispatch: {}
+  # schedule:
+  #   - cron: "30 3 * * *"
+
+permissions: {}
+
+concurrency:
+  group: sox-reconcile
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: reconciler
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.RECONCILER_APP_ID }}
+          private-key: ${{ secrets.RECONCILER_APP_PRIVATE_KEY }}
+          permission-actions: read
+          permission-attestations: read
+          permission-checks: read
+          permission-contents: read
+          permission-pull-requests: read
+      - id: run
+        env:
+          SOX_GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          SOX_ACTIONS_TOKEN: ${{ github.token }}
+        run: python3 .sox/reconcile.py run --out "$RUNNER_TEMP/rec"
+      - id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/rec/report.subjects
+          predicate-type: https://acme-lending.example/sox/reconciliation-report/v1
+          predicate-path: ${{ runner.temp }}/rec/report.json
+      - env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE" "$RUNNER_TEMP/rec/report.bundle.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reconciliation
+          path: ${{ runner.temp }}/rec/
+          retention-days: 90
+
+  publish:
+    needs: reconcile
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: evidence-writer
+    permissions:
+      contents: read
+    steps:
+      - name: Refuse to run outside main
+        run: test "$GITHUB_REF" = "refs/heads/main"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reconciliation
+          path: ${{ runner.temp }}/rec
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.EVIDENCE_WRITER_APP_ID }}
+          private-key: ${{ secrets.EVIDENCE_WRITER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: sox-sdlc-evidence
+          permission-contents: write
+      - env:
+          SOX_EVIDENCE_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 .sox/reconcile.py publish --dir "$RUNNER_TEMP/rec"
