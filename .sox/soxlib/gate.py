@@ -108,10 +108,6 @@ class Context:
         self._story_results = {}
         self._release_slugs = None
         self.participants = set()
-        # Set by evaluate(): the as-of time of the top-level PR, which decides whether the
-        # chain is judged under the post-go-live rules (a story merged before go-live still
-        # carries pre-rotation App actions into a release merged after it).
-        self.top_as_of = None
         # The gate's own in-progress check run in this workflow run; gate-decision pairs with it.
         self.check_run_id = None
         self._wf_runs = {}
@@ -325,7 +321,6 @@ class Evaluation:
             self.facts["firstPushAt"] = min((parse_time(a["timestamp"]) for a in pushes), default=None)
         self.req(f"SDLC-05.pushers#{pd.number}", "SDLC-05", bool(pushes) and not bad,
                  f"pushers to {pd.head_ref}: {actors or 'none recorded'}; allowed {sorted(allowed)}")
-        self.pre_rotation_pushes(pd)
         return actors
 
     def check_agent_approvals(self):
@@ -495,28 +490,7 @@ class Evaluation:
                  [a.digest for a in ([latest] if latest else []) + fails])
         return latest
 
-    @property
-    def carry_over(self):
-        """Post-go-live rules apply: goLive.at is set and the top-level PR is open or merged at or
-        after go-live (evidence spec 7.6)."""
-        at = self.policy.go_live_at
-        if at is None:
-            return False
-        top = getattr(self.ctx, "top_as_of", self.as_of)
-        return top is None or top >= at
-
-    def _split_rotation(self, runs, role):
-        """(pre, post): runs started before the role's App key rotation are set aside (7.6): they
-        neither pass nor bind the head; only a new evaluation after rotation does."""
-        rot = self.policy.rotation_at(role) if self.carry_over else None
-        # started_at is writable by whoever holds the App key, so a run can only be pre-rotation
-        # if its head existed before the rotation; otherwise a backdated run would be set aside.
-        if rot is None or self.head_pushed_at(self.pd) >= rot:
-            return [], list(runs)
-        pre = [c for c in runs if (pairing.started(c) or 0) < rot]
-        return pre, [c for c in runs if c not in pre]
-
-    def _pair_all(self, sha, name, role, runs, pre):
+    def _pair_all(self, sha, name, role, runs):
         """facts.checks[name] entries; returns {check id: attestation or None} for completed success."""
         pred = pairing.PREDICATE_FOR_CHECK[name]
         cands = self.all("commit", sha, pred)
@@ -527,12 +501,8 @@ class Evaluation:
             if c.get("status") == "completed" and c.get("conclusion") == "success":
                 att, why = pairing.pair(c, sha, cands, self.policy.repo)
                 out[c.get("id")] = att
-            e = dict(pairing.record(c, self.policy.app_id(role), att), headSha=sha,
-                     preRotation=c in pre, startedAt=c.get("started_at"), detail=why)
-            entries.append(e)
-            if c in pre and att is None and c.get("conclusion") == "success":
-                # Exposure finding (7.6 item 4), never an in-scope exception.
-                self.facts.setdefault("preRotationUnpaired", []).append(e)
+            entries.append(dict(pairing.record(c, self.policy.app_id(role), att), headSha=sha,
+                                startedAt=c.get("started_at"), detail=why))
         self.facts.setdefault("checks", {}).setdefault(name, []).extend(entries)
         return out
 
@@ -551,7 +521,7 @@ class Evaluation:
             mine = [c for c in mine if not c.get("started_at")
                     or parse_time(c["started_at"]) <= self.as_of]
         mine.sort(key=lambda c: (c.get("started_at") or "", c.get("id") or 0))
-        pre, post = self._split_rotation(mine, role)
+        post = mine
 
         def state(c):
             done = c.get("completed_at")
@@ -567,13 +537,8 @@ class Evaluation:
                  (f"{len(post)} {name} run(s) from {slug} on {sha[:12]}"
                   + (f"; not success (every run on the head binds it): {bad}" if bad else
                      ", all completed success" if post else ": missing"))
-                 + (f"; {len(pre)} run(s) before the App key rotation set aside" if pre else "")
                  + (f"; same-named checks from other sources ignored: {others}" if others else ""))
-        if pre and not post:
-            self.req(f"CC-02.app-key-pre-rotation:{name}", "CC-02", False,
-                     f"app-key-pre-rotation: every {name} run on {sha[:12]} predates the {slug} key "
-                     "rotation; a new run after rotation is required")
-        paired = self._pair_all(sha, name, role, mine, pre)
+        paired = self._pair_all(sha, name, role, mine)
         unpaired = [cid for c in post for cid in [c.get("id")] if cid in paired and paired[cid] is None]
         if any(cid in paired for cid in (c.get("id") for c in post)):
             self.req(f"CC-02.check-without-evidence:{name}", "CC-02", not unpaired,
@@ -597,9 +562,9 @@ class Evaluation:
         if self.as_of is not None:
             runs = [c for c in runs if parse_time(c["completed_at"]) <= self.as_of]
         runs.sort(key=lambda c: (c.get("completed_at") or "", c.get("id") or 0))
-        pre, post = self._split_rotation(runs, role)
+        post = runs
         self.facts["gateCheckRuns"] = len(runs)
-        paired = self._pair_all(pd.head, name, role, runs, pre)
+        paired = self._pair_all(pd.head, name, role, runs)
         unpaired = [c.get("id") for c in post if c.get("id") in paired and paired[c.get("id")] is None]
         self.req(f"CC-02.check-without-evidence:{name}", "CC-02", not unpaired,
                  (f"check-without-evidence: {name} success run(s) {unpaired} on {pd.head[:12]} have no "
@@ -611,12 +576,7 @@ class Evaluation:
             self.req(f"CC-02.check:{name}", "CC-02", ok,
                      f"last {name} run before the merge: "
                      + (f"{last.get('id')} {last.get('conclusion')}, "
-                        f"{'paired' if ok else 'not a paired success'}" if last else "none")
-                     + (f"; {len(pre)} run(s) before the App key rotation set aside" if pre else ""))
-            if pre and not post:
-                self.req(f"CC-02.app-key-pre-rotation:{name}", "CC-02", False,
-                         f"app-key-pre-rotation: every {name} run before the merge predates the "
-                         "gate App key rotation")
+                        f"{'paired' if ok else 'not a paired success'}" if last else "none"))
 
     def judging_runs(self, pd, role, rid, control):
         """F17: every run of the role's judging workflow whose judging step started on this head
@@ -642,11 +602,12 @@ class Evaluation:
                 if m:
                     mine = int(m.group(1)) == pd.number
                 elif job.get("name") == cfg["job"]:
+                    # Titles are free text (a commit subject can say "pr 12"), so a title alone
+                    # never clears a run that left a check on this head.
                     t = re.search(r"\bpr[=#: ]?([0-9]+)\b", run.get("display_title") or "", re.I)
-                    if t:
-                        mine = int(t.group(1)) == pd.number
-                    else:
-                        mine = str(run["id"]) in on_head
+                    mine = bool(t) and int(t.group(1)) == pd.number
+                    if str(run["id"]) in on_head:
+                        mine = True
                         by_head.add(str(run["id"]))
                 else:
                     continue
@@ -680,28 +641,6 @@ class Evaluation:
             return min(ts)
         return parse_time(pd.pr.get("created_at")) if pd.pr.get("created_at") else 0
 
-    def pre_rotation_pushes(self, pd):
-        """7.6 item 3: a commit first pushed under an App identity before that App's key rotation
-        cannot be relied on after go-live; only a new head of commits pushed after rotation clears it."""
-        if not self.carry_over:
-            return
-        order = [c["sha"] for c in pd.commits]
-        idx = {s: i for i, s in enumerate(order)}
-        first = {}
-        for a in sorted(pd.pushes(), key=lambda a: a.get("timestamp") or ""):
-            if a.get("after") in idx:
-                for s in order[:idx[a["after"]] + 1]:
-                    first.setdefault(s, (parse_time(a.get("timestamp")), (a.get("actor") or {}).get("login")))
-        bad = []
-        for s, (t, login) in first.items():
-            role = self.policy.role_of_login(login)
-            rot = self.policy.rotation_at(role) if role else None
-            if rot is not None and (t is None or t < rot):
-                bad.append(f"{s[:12]} by {login}")
-        self.req(f"SDLC-05.app-key-pre-rotation#{pd.number}", "SDLC-05", not bad,
-                 (f"app-key-pre-rotation: commits first pushed by an App before its key rotation: {bad}; "
-                  "push a rebuilt head after rotation") if bad else
-                 "no commit was first pushed by an App before its key rotation")
     def loop_review(self, story):
         pol = self.policy
         mx = pol.loops.get("maxReviewRounds", 10)
@@ -1118,5 +1057,4 @@ class Evaluation:
 
 def evaluate(ctx, number, as_of=None):
     pd = ctx.prdata(number)
-    ctx.top_as_of = as_of
     return Evaluation(ctx, pd, as_of=as_of).run()

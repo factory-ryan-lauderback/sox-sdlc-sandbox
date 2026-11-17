@@ -61,12 +61,18 @@ def approved_log():
     return [jira_entry(1, 2, PO_J, [edit()]), jira_entry(2, 5, AMAN_J, [to_status("10071")])]
 
 
+def pin_ids(d):
+    """Test App ids in apps and in the goLive key pins, which must agree."""
+    for role, i in IDS.items():
+        d["apps"][role]["id"] = i
+        d["goLive"]["appKeys"][role]["appId"] = i
+    return d
+
+
 def policy():
     with open(os.path.join(SOX, "trust-policy.yaml")) as fh:
         d = json.load(fh)
-    for role, i in IDS.items():
-        d["apps"][role]["id"] = i
-    return Policy(json.dumps(d).encode())
+    return Policy(json.dumps(pin_ids(d)).encode())
 
 
 def t(x):
@@ -386,9 +392,7 @@ class TestStoryPR(unittest.TestCase):
 
     def test_missing_app_ids_fail_closed(self):
         w = World()
-        d = json.loads(w.pol.raw)
-        d["apps"]["review"]["id"] = None
-        w.pol = Policy(json.dumps(d).encode())
+        w.pol.data["apps"]["review"]["id"] = None
         ev, _ = w.evaluate(10)
         self.assertIn("CC-02.check:sox/review-agent", failed(ev))
         self.assertIn("SDLC-06.review#10", failed(ev))
@@ -929,19 +933,12 @@ class TestPolicyJira(unittest.TestCase):
             with self.assertRaises(PolicyError):
                 self._load(m)
 
-def golive_policy(at=1000, rotations=None, **mut):
-    """Trust policy with every App id pinned and a goLive block; rotations: {role: offset}."""
+def golive_policy(at=1000, rotated=False, **mut):
+    """Trust policy with test App ids and a goLive block set at T0 + at."""
     with open(os.path.join(SOX, "trust-policy.yaml")) as fh:
-        d = json.load(fh)
-    for role, i in IDS.items():
-        d["apps"][role]["id"] = i
-    keys = {}
-    for role, a in d["apps"].items():
-        if role.startswith("$"):
-            continue
-        keys[a["slug"]] = {"appId": a["id"], "keyFingerprint": "SHA256:" + "A" * 43,
-                           "rotationCompletedAt": t((rotations or {}).get(role, 0))}
-    d["goLive"].update({"at": t(at), "mainSha": M0, "rulesetVersion": 3, "appKeys": keys})
+        d = pin_ids(json.load(fh))
+    d["goLive"].update({"at": t(at), "mainSha": M0, "rulesetVersion": 3})
+    d["goLive"]["appKeyExposure"]["rotated"] = rotated
     for path, value in mut.items():
         node = d
         parts = path.split("__")
@@ -1134,7 +1131,8 @@ class TestUnattestedJudgingRuns(unittest.TestCase):
             self.assertNotIn("SDLC-06.unattested-judging-run#20", failed(ev), job["name"])
 
     def test_qa_run_without_step(self):
-        w = self._world([self._job("qa (20)", 455, step=None)], wf="sox-qa-agent.yml")
+        w = self._world([self._job("test (20)", 455, step="Run the plan-required tests")],
+                        wf="sox-qa-agent.yml")
         ev, _ = w.evaluate(20)
         self.assertIn("SDLC-08.unattested-judging-run#20", failed(ev))
         w.atts.append(Att("qa-result", [("commit", R1), ("pr", "20")],
@@ -1200,106 +1198,65 @@ class TestUnattestedJudgingRuns(unittest.TestCase):
             Context(policy(), NoRepo(), FakeEvidence([])).workflow_runs(".github/workflows/x.yml", T0)
 
 
-class TestGoLiveRotation(unittest.TestCase):
-    """Spec 7.6: rotation is a go-live precondition; a PR merged after go-live must not rely on a
-    pre-rotation App check or push."""
+class TestGoLiveKeys(unittest.TestCase):
+    """Spec 7.6 (v2.7): the App keys were not rotated (accepted F16 exposure). goLive pins each
+    App's key; every merge-record carries app-key-exposed-not-rotated; pairing stays enforced."""
+
+    def test_repo_policy_pins_all_nine_apps(self):
+        p = Policy.load(os.path.join(SOX, "trust-policy.yaml"))
+        roles = sorted(r for r in p.data["apps"] if not r.startswith("$"))
+        self.assertEqual(len(roles), 9)
+        for r in roles:
+            self.assertEqual(p.app_key(r)["appId"], p.app_id(r))
+            self.assertTrue(p.app_key(r)["keyFingerprint"].startswith("SHA256:"))
+        self.assertEqual(p.key_labels, ["app-key-exposed-not-rotated"])
+        self.assertIsNone(p.go_live_at)
 
     def test_loader(self):
         from soxlib.policy import PolicyError
-        p = golive_policy(rotations={"review": 470})
-        self.assertEqual(p.rotation_at("review"), T0 + 470)
+        p = golive_policy()
         self.assertEqual(p.go_live_at, T0 + 1000)
-        self.assertIsNone(policy().go_live_at)
-        with self.assertRaises(PolicyError):
-            golive_policy(at=400, rotations={"review": 470})
+        self.assertEqual(golive_policy(rotated=True).key_labels, [])
         for bad in ({"goLive__mainSha": None}, {"goLive__rulesetVersion": "3"},
-                    {"goLive__at": "not a time"}):
+                    {"goLive__at": "not a time"}, {"goLive__appKeyExposure__label": "other"},
+                    {"goLive__appKeyExposure__rotated": "no"}, {"goLive__appKeyExposure__decision": ""},
+                    {"goLive__appKeyExposure": None}):
             with self.assertRaises(PolicyError, msg=str(bad)):
                 golive_policy(**bad)
-        d = json.loads(golive_policy().raw)
-        del d["goLive"]["appKeys"]["acme-sox-gate"]
-        with self.assertRaises(PolicyError):
-            Policy(json.dumps(d).encode())
-        d = json.loads(golive_policy().raw)
-        d["goLive"]["appKeys"]["acme-sox-gate"]["appId"] = 1
-        with self.assertRaises(PolicyError):
-            Policy(json.dumps(d).encode())
-        d = json.loads(golive_policy().raw)
-        d["goLive"]["appKeys"]["acme-sox-gate"]["keyFingerprint"] = "-----BEGIN RSA PRIVATE KEY-----"
-        with self.assertRaises(PolicyError):
-            Policy(json.dumps(d).encode())
+        base = json.loads(policy().raw)
+        for mutate in (lambda d: d["goLive"]["appKeys"].pop("jiraAttestor"),
+                       lambda d: d["goLive"]["appKeys"]["gate"].update(appId=1),
+                       lambda d: d["goLive"]["appKeys"]["gate"].update(keyFingerprint="-----BEGIN RSA PRIVATE KEY-----"),
+                       lambda d: d["goLive"]["appKeys"].update(stranger={"appId": 1, "keyFingerprint": "SHA256:" + "A" * 43}),
+                       lambda d: d["goLive"].pop("appKeys")):
+            d = json.loads(json.dumps(base))
+            mutate(d)
+            with self.assertRaises(PolicyError):
+                Policy(json.dumps(d).encode())
 
-    def _world(self, **rot):
+    def test_exposed_keys_do_not_fail_the_gate(self):
         w = World()
-        w.pol = golive_policy(rotations=rot)
-        return w
-
-    def test_after_rotation_passes(self):
-        ev, _ = self._world(review=200, qa=200, bundler=300).evaluate(20)
+        w.pol = golive_policy(at=100)
+        ev, _ = w.evaluate(20)
         self.assertEqual(failed(ev), ["SDLC-09.approval"])
+        self.assertFalse([r.id for r in ev.reqs if "rotation" in r.id])
 
-    def test_pre_rotation_check_fails_then_clears_on_new_run(self):
-        w = self._world(review=470)
-        ev, _ = w.evaluate(20)
-        self.assertIn("CC-02.app-key-pre-rotation:sox/review-agent", failed(ev))
-        self.assertIn("CC-02.check:sox/review-agent", failed(ev))
-        self.assertEqual([e["checkRunId"] for e in ev.facts["checks"]["sox/review-agent"]
-                          if e["preRotation"]], [460])
-        runs = [check("sox/review-agent", "review", 460), check("sox/qa-agent", "qa", 510),
-                check("sox/review-agent", "review", 520)]
-        w.extra_routes = {f"/repos/{REPO}/commits/{R1}/check-runs": {"check_runs": runs}}
-        w.atts.append(paired_att("sox/review-agent", R1, 20, 520))
-        ev, _ = w.evaluate(20)
-        self.assertNotIn("CC-02.app-key-pre-rotation:sox/review-agent", failed(ev))
-        self.assertNotIn("CC-02.check:sox/review-agent", failed(ev))
-
-    def test_pre_rotation_unpaired_success_is_an_exposure_finding(self):
-        w = self._world(review=470)
+    def test_pairing_still_enforced_with_exposed_keys(self):
+        w = World()
+        w.pol = golive_policy(at=100)
         runs = [check("sox/review-agent", "review", 455), check("sox/review-agent", "review", 460),
-                check("sox/qa-agent", "qa", 510), check("sox/review-agent", "review", 520)]
-        w.extra_routes = {f"/repos/{REPO}/commits/{R1}/check-runs": {"check_runs": runs}}
-        w.atts.append(paired_att("sox/review-agent", R1, 20, 520))
-        ev, _ = w.evaluate(20)
-        self.assertNotIn("CC-02.check-without-evidence:sox/review-agent", failed(ev))
-        self.assertEqual([e["checkRunId"] for e in ev.facts["preRotationUnpaired"]], [455])
-
-    def test_backdated_run_on_post_rotation_head_is_not_set_aside(self):
-        w = self._world(review=300, qa=300, bundler=300)
-        w.release_push_at = 320
-        runs = [check("sox/review-agent", "review", 250), check("sox/review-agent", "review", 460),
                 check("sox/qa-agent", "qa", 510)]
         w.extra_routes = {f"/repos/{REPO}/commits/{R1}/check-runs": {"check_runs": runs}}
         ev, _ = w.evaluate(20)
         self.assertIn("CC-02.check-without-evidence:sox/review-agent", failed(ev))
-        self.assertNotIn("preRotationUnpaired", ev.facts)
 
-    def test_pre_rotation_push_fails_until_new_head(self):
-        w = self._world(bundler=320)
-        ev, _ = w.evaluate(20)
-        self.assertIn("SDLC-05.app-key-pre-rotation#20", failed(ev))
-        w.release_head = R2
-        w.release_push_at = 330
-        w.add_release_evidence(R2, 800)
-        ev, _ = w.evaluate(20)
-        self.assertNotIn("SDLC-05.app-key-pre-rotation#20", failed(ev))
-
-    def test_story_push_carries_into_release(self):
-        w = self._world(dev=150)
-        ev, _ = w.evaluate(20)
-        self.assertIn("SDLC-05.story-pr#10", failed(ev))
-        sp = ev.facts["storyPrs"][0]
-        self.assertIn("SDLC-05.app-key-pre-rotation#10", sp["failed"])
-
-    def test_merged_before_go_live_is_bootstrap(self):
-        w = World()
-        w.present_packet(600)
-        w.review(AMAN, "APPROVED", 700)
-        w.add_gate_success(R1, 880)
-        w.release_merged = True
-        w.pol = golive_policy(at=1000, rotations={"review": 470, "bundler": 320})
-        ev, _ = w.evaluate(20, as_of=T0 + 900)
-        self.assertFalse([f for f in failed(ev) if "app-key-pre-rotation" in f])
-
+    def test_merge_record_carries_label(self):
+        ev, ctx = TestMergeRecordChecks()._merged()
+        mr = R.plan_merged(ev, ctx)[0][0].predicate
+        self.assertEqual(mr["labels"], ["app-key-exposed-not-rotated"])
+        self.assertEqual(mr["outcome"], "recorded")
+        ctx.policy.data["goLive"]["appKeyExposure"]["rotated"] = True
+        self.assertEqual(R.plan_merged(ev, ctx)[0][0].predicate["labels"], [])
 class TestScopeMapFile(unittest.TestCase):
     def test_repo_services_yaml_loads_and_digest_is_git_blob(self):
         import subprocess

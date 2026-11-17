@@ -416,46 +416,51 @@
     }
   },
   "apps": {
-    "$comment": "App IDs filled in when the Platform builder creates the Apps. A null id fails every check that needs it (fail closed).",
+    "$comment": "App IDs from the Platform builder (sandbox-status.md, app-inventory run 44015048531). A null id fails every check that needs it (fail closed).",
     "dev": {
       "slug": "acme-dev-agent",
-      "id": null,
+      "id": 5702161,
       "botLogin": "acme-dev-agent[bot]"
     },
     "qa": {
       "slug": "acme-qa-agent",
-      "id": null,
+      "id": 5702164,
       "botLogin": "acme-qa-agent[bot]"
     },
     "review": {
       "slug": "acme-review-agent",
-      "id": null,
+      "id": 5702162,
       "botLogin": "acme-review-agent[bot]"
     },
     "techlead": {
       "slug": "acme-techlead-agent",
-      "id": null,
+      "id": 5702158,
       "botLogin": "acme-techlead-agent[bot]"
     },
     "bundler": {
       "slug": "acme-release-bundler",
-      "id": null,
+      "id": 5702160,
       "botLogin": "acme-release-bundler[bot]"
     },
     "gate": {
       "slug": "acme-sox-gate",
-      "id": null,
+      "id": 5702165,
       "botLogin": "acme-sox-gate[bot]"
     },
     "reconciler": {
       "slug": "acme-sox-reconciler",
-      "id": null,
+      "id": 5702166,
       "botLogin": "acme-sox-reconciler[bot]"
     },
     "evidenceWriter": {
       "slug": "acme-sox-evidence-writer",
-      "id": null,
+      "id": 5702823,
       "botLogin": "acme-sox-evidence-writer[bot]"
+    },
+    "jiraAttestor": {
+      "slug": "acme-jira-attestor",
+      "id": 5702824,
+      "botLogin": "acme-jira-attestor[bot]"
     }
   },
   "requiredChecks": {
@@ -473,8 +478,8 @@
     },
     "qa": {
       "workflow": ".github/workflows/sox-qa-agent.yml",
-      "job": "qa",
-      "step": null,
+      "job": "test",
+      "step": "Run the plan-required tests",
       "predicate": "qa-result"
     }
   },
@@ -589,11 +594,54 @@
     "maxQaRounds": 10
   },
   "goLive": {
-    "$comment": "Set at the coordinated go-live, after every App key is rotated (evidence spec 7.6). First-parent commits on main up to and including mainSha are labelled bootstrap by the reconciler. While at is null the policy is in bootstrap and app-key-pre-rotation is not evaluated. Once at is set the loader requires mainSha, rulesetVersion and one appKeys entry per App slug in apps {appId (= apps.<role>.id), keyFingerprint SHA256:..., rotationCompletedAt <= at}; IDs and fingerprints only, never key material.",
+    "$comment": "Evidence spec 7.6 (v2.7). at, mainSha and rulesetVersion are set at the coordinated go-live; first-parent commits on main up to and including mainSha are labelled bootstrap by the reconciler. appKeys pins each App's in-scope key by its role in apps (appId and public-key fingerprint only, never key material); the loader refuses a policy that lacks an entry for any App. appKeyExposure records the accepted F16 exposure: while rotated is false every in-scope merge-record (labels[]) and reconciliation item carries the label. It relaxes no check: paired evidence (spec 2.5) and reconciler P8 over every check run since the Apps were created are the compensating controls. Reconciler P5 raises app-key-changed if an environment secret's key no longer matches its pin.",
     "mainSha": null,
     "at": null,
     "rulesetVersion": null,
-    "appKeys": {}
+    "appKeyExposure": {
+      "window": "key creation .. 2026-11-10T20:52:00Z",
+      "rotated": false,
+      "decision": "human, 2026-11-17",
+      "label": "app-key-exposed-not-rotated"
+    },
+    "appKeys": {
+      "techlead": {
+        "appId": 5702158,
+        "keyFingerprint": "SHA256:K+Wn1dUaMB96SN2xS/eIs9wCv5twKF6xtv2aO3qg+Tg="
+      },
+      "bundler": {
+        "appId": 5702160,
+        "keyFingerprint": "SHA256:QBzi3j+2S7NLqyjmC0XjqSzj4PSZpPQanoZEgYs9K/w="
+      },
+      "dev": {
+        "appId": 5702161,
+        "keyFingerprint": "SHA256:qzK4+DD0QqyQR9aj1Ws8ZQfSvhV3DZymyVFwZbFtpnk="
+      },
+      "review": {
+        "appId": 5702162,
+        "keyFingerprint": "SHA256:G6VL8y2Gp+/CXwNhL6318S+VH2OCeoM1nX6mD0gnHRY="
+      },
+      "qa": {
+        "appId": 5702164,
+        "keyFingerprint": "SHA256:mfCasoTIMuj38RRRgPRPNvLiiLHunIXFt51E5Zt5qP4="
+      },
+      "gate": {
+        "appId": 5702165,
+        "keyFingerprint": "SHA256:EPnB07C6MEwN55cP3JI4bz7wkcDPlA8Lu6jzl2fQXds="
+      },
+      "reconciler": {
+        "appId": 5702166,
+        "keyFingerprint": "SHA256:xO9mFuZc9UqGXiCmRD/0fxvbuBa8kszCeqYq7tFQOJY="
+      },
+      "evidenceWriter": {
+        "appId": 5702823,
+        "keyFingerprint": "SHA256:NXHfOL7KylmvyvyECRRe4nXNTcT5i+NqbLFkhk5EOGA="
+      },
+      "jiraAttestor": {
+        "appId": 5702824,
+        "keyFingerprint": "SHA256:ZIUvzehdfDu+/OY0Q2ZQoW71wCX6nmQw0G2tixAHOQU="
+      }
+    }
   },
   "evidenceStore": {
     "repo": "factory-ryan-lauderback/sox-sdlc-evidence",

@@ -232,21 +232,19 @@ def plan_open(ev, ctx):
 def merge_checks(ev):
     """merge-record.checks[] (spec 2.5): for sox/evidence-gate the last run completed before the
     merge (the one the ruleset relied on); for agent checks every run on the merged head, since
-    each binds it. Runs set aside as pre-rotation are listed separately."""
-    out, pre = [], []
+    each binds it."""
+    out = []
     keep = ("name", "checkRunId", "appId", "conclusion", "externalId", "pairedAttestation", "paired")
-    for name in sorted(ev.policy.data.get("requiredChecks") or {}):
+    for name in sorted(n for n in ev.policy.data.get("requiredChecks") or {} if not n.startswith("$")):
         entries = [e for e in (ev.facts.get("checks") or {}).get(name, [])
                    if e.get("headSha") == ev.pd.head]
-        pre += [{k: e[k] for k in keep} for e in entries if e.get("preRotation")]
-        post = [e for e in entries if not e.get("preRotation")]
         if name == "sox/evidence-gate":
-            post = post[-1:]
-        out += [{k: e[k] for k in keep} for e in post]
-    names = set(ev.policy.data.get("requiredChecks") or {})
+            entries = entries[-1:]
+        out += [{k: e[k] for k in keep} for e in entries]
+    names = {n for n in ev.policy.data.get("requiredChecks") or {} if not n.startswith("$")}
     paired = (bool(out) and all(e["paired"] for e in out)
               and names <= {e["name"] for e in out})
-    return out, pre, paired
+    return out, paired
 
 def merge_record(ev, mirror):
     pd = ev.pd
@@ -256,14 +254,16 @@ def merge_record(ev, mirror):
     parents = mirror.parents(merge)
     tree, htree = mirror.tree(merge), mirror.tree(pd.head)
     match = tree == htree and len(parents) == 2 and parents[1] == pd.head
-    checks, pre_checks, paired = merge_checks(ev)
+    checks, paired = merge_checks(ev)
     p = common(ev, "SDLC-10", "recorded" if match and ev.ok and paired else "fail",
                upstream=ev.facts["upstream"].values())
     p.update({"mergeCommitSha": merge, "parents": parents, "treeSha": tree,
               "approvedHeadSha": pd.head, "approvedHeadTreeSha": htree, "treeMatch": match,
               "mergedBy": (pd.pr.get("merged_by") or {}).get("login"),
               "mergedAt": pd.pr.get("merged_at"),
-              "checks": checks, "checksPaired": paired, "preRotationChecks": pre_checks,
+              "checks": checks, "checksPaired": paired,
+              # Known exceptions (spec 7.6); they relax no check above.
+              "labels": list(ev.policy.key_labels),
               "gateAsOfMerge": {"result": "pass" if ev.ok else "fail",
                                 "failed": [r.id for r in ev.reqs if not r.ok],
                                 "requirementsDigest": requirement_key(ev)}})

@@ -11,6 +11,7 @@ WORKFLOW_RE = re.compile(r"^\.github/workflows/sox-[a-z0-9-]+\.ya?ml$")
 # unavailable for story PRs, and the certificate would carry a non-main ref.
 SAFE_TRIGGERS = {"workflow_dispatch", "schedule", "repository_dispatch", "check_run",
                  "workflow_run"}
+EXPOSED_NOT_ROTATED = "app-key-exposed-not-rotated"
 
 
 class PolicyError(ValueError):
@@ -134,43 +135,43 @@ class Policy:
                 raise PolicyError(f"jira.approvalStatuses.{kind} must be a numeric status id or null")
 
     def _validate_go_live(self):
-        """Rotation is a go-live precondition (F16): once goLive.at is set, every App in `apps` needs
-        an appKeys entry (by slug) whose rotationCompletedAt is not after goLive.at."""
+        """goLive (evidence spec 7.6, F16). appKeys pins each App's in-scope key by its role in
+        `apps` (appId, public-key fingerprint; never key material) and must cover every App.
+        appKeyExposure records the accepted, unremediated exposure: while rotated is false every
+        in-scope merge-record and reconciliation item carries its label. It relaxes no check."""
         g = self.data.get("goLive") or {}
-        self._rotation = {}
         self._go_live_at = None
-        if g.get("at") is None:
-            return
-        at = _epoch(g.get("at"), "goLive.at")
-        if not re.fullmatch(r"[0-9a-f]{40}", str(g.get("mainSha") or "")):
-            raise PolicyError("goLive.mainSha must be a 40-hex commit SHA once goLive.at is set")
-        if not isinstance(g.get("rulesetVersion"), int) or isinstance(g.get("rulesetVersion"), bool):
-            raise PolicyError("goLive.rulesetVersion must be an integer once goLive.at is set")
+        if g.get("at") is not None:
+            at = _epoch(g.get("at"), "goLive.at")
+            if not re.fullmatch(r"[0-9a-f]{40}", str(g.get("mainSha") or "")):
+                raise PolicyError("goLive.mainSha must be a 40-hex commit SHA once goLive.at is set")
+            if not isinstance(g.get("rulesetVersion"), int) or isinstance(g.get("rulesetVersion"), bool):
+                raise PolicyError("goLive.rulesetVersion must be an integer once goLive.at is set")
+            self._go_live_at = at
         keys = g.get("appKeys")
         if not isinstance(keys, dict):
-            raise PolicyError("goLive.appKeys must map every App slug to its rotation entry")
+            raise PolicyError("goLive.appKeys must map every App in apps to its pinned key")
         apps = {r: a for r, a in (self.data.get("apps") or {}).items()
                 if not r.startswith("$") and isinstance(a, dict)}
-        slugs = {a.get("slug"): r for r, a in apps.items()}
-        extra = sorted(k for k in keys if not k.startswith("$") and k not in slugs)
+        extra = sorted(k for k in keys if not k.startswith("$") and k not in apps)
         if extra:
             raise PolicyError(f"goLive.appKeys names Apps not in apps: {extra}")
-        for slug, role in sorted(slugs.items()):
-            e = keys.get(slug)
+        for role in sorted(apps):
+            e = keys.get(role)
             if not isinstance(e, dict):
-                raise PolicyError(f"goLive.appKeys.{slug} missing: every App needs a rotation entry")
+                raise PolicyError(f"goLive.appKeys.{role} missing: every App needs a pinned key")
             if e.get("appId") is None or e.get("appId") != apps[role].get("id"):
-                raise PolicyError(f"goLive.appKeys.{slug}.appId {e.get('appId')!r} does not match "
+                raise PolicyError(f"goLive.appKeys.{role}.appId {e.get('appId')!r} does not match "
                                   f"apps.{role}.id {apps[role].get('id')!r}")
-            if not re.fullmatch(r"SHA256:[A-Za-z0-9+/=]{20,}", str(e.get("keyFingerprint") or "")):
-                raise PolicyError(f"goLive.appKeys.{slug}.keyFingerprint must be SHA256:<base64>")
-            rot = _epoch(e.get("rotationCompletedAt"), f"goLive.appKeys.{slug}.rotationCompletedAt")
-            if rot > at:
-                raise PolicyError(f"goLive.appKeys.{slug}.rotationCompletedAt is after goLive.at: "
-                                  "rotation must complete before go-live")
-            self._rotation[role] = rot
-        self._go_live_at = at
-
+            if not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}=?", str(e.get("keyFingerprint") or "")):
+                raise PolicyError(f"goLive.appKeys.{role}.keyFingerprint must be SHA256:<base64 of 32 bytes>")
+        x = g.get("appKeyExposure")
+        if not isinstance(x, dict) or not isinstance(x.get("rotated"), bool):
+            raise PolicyError("goLive.appKeyExposure.rotated must be true or false")
+        if not x["rotated"] and x.get("label") != EXPOSED_NOT_ROTATED:
+            raise PolicyError(f"goLive.appKeyExposure.label must be {EXPOSED_NOT_ROTATED!r} while rotated is false")
+        if not x["rotated"] and not x.get("decision"):
+            raise PolicyError("goLive.appKeyExposure.decision must record who accepted the exposure and when")
     def _validate_judging(self):
         for role, j in (self.data.get("judgingWorkflows") or {}).items():
             if role.startswith("$"):
@@ -246,9 +247,15 @@ class Policy:
         """Epoch of goLive.at, or None before go-live (bootstrap)."""
         return self._go_live_at
 
-    def rotation_at(self, role):
-        """Epoch of the role's App key rotation (goLive.appKeys), or None before go-live."""
-        return self._rotation.get(role)
+    def app_key(self, role):
+        """The role's pinned in-scope key {appId, keyFingerprint}."""
+        return (self.data["goLive"]["appKeys"]).get(role)
+
+    @property
+    def key_labels(self):
+        """Labels every in-scope merge-record and reconciliation item carries (spec 7.6)."""
+        x = self.data["goLive"]["appKeyExposure"]
+        return [] if x["rotated"] else [x["label"]]
 
     def role_of_login(self, login):
         for role, a in (self.data.get("apps") or {}).items():
