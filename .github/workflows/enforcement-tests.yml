@@ -40,7 +40,8 @@ jobs:
         with:
           app-id: ${{ vars[format('{0}_APP_ID', matrix.prefix)] }}
           private-key: ${{ secrets[format('{0}_APP_PRIVATE_KEY', matrix.prefix)] }}
-          permission-contents: write
+          # Not narrowed with permission-* inputs: A-5 must test the App's full grant, so it
+          # fails if the App is ever granted the workflows permission.
       - name: Run ${{ matrix.role }} tests
         env:
           SOX_APP_TOKEN: ${{ steps.app.outputs.token }}
