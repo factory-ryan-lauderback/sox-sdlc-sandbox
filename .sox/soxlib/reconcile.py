@@ -257,12 +257,25 @@ class Reconciler:
         keys = self.app_keys()
         checks = self.check_runs()
         prev = self.previous
+        if prev:
+            # The chain is only as good as its links: the previous report must be a verified
+            # reconciliation-report whose predicate is the indexed digest.
+            atts = self.ev.get("report", prev["id"], "reconciliation-report")
+            if not any(jcs.digest(a.predicate) == prev["digest"] for a in atts):
+                self.exception("CC-06", f"report:{prev['id']}", "previous-report-unverified",
+                               f"no verified reconciliation-report for {prev['id']} has digest "
+                               f"{prev['digest']} ({len(atts)} verified for that subject)")
         genesis = rows[0]["committedAt"] if rows else iso(self.now)
         rid = iso(self.now)
         labels = sorted({l for r in rows for l in r["labels"]})
         known = [{"label": l, "kind": "known-exception"} for l in labels]
         return {
-            "schema": SCHEMA, "id": rid,
+            "schema": SCHEMA, "id": rid, "repo": self.repo, "step": "CC-06",
+            "actor": {"type": "github_app", "login": self.policy.bot_login("reconciler"),
+                      "appId": self.policy.app_id("reconciler")},
+            "outcome": "exceptions" if self.exceptions else "clean",
+            # The CLI sets observedAt again right before signing (verifier skew check).
+            "observedAt": iso(self.now),
             "period": {"from": prev["period_end"] if prev else genesis, "to": rid},
             "previousReport": prev["digest"] if prev else None,
             "highWater": {"mainSha": head,

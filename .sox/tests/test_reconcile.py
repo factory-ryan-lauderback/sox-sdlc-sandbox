@@ -55,7 +55,7 @@ class FakeEvidence:
         self.by_commit = by_commit or {}
 
     def get(self, kind, ident, predicate=None, before=None):
-        items = self.by_commit.get(ident, []) if kind == "commit" else []
+        items = self.by_commit.get(ident if kind == "commit" else f"{kind}:{ident}", [])
         return [a for a in items if predicate is None or a.name == predicate]
 
 
@@ -165,7 +165,7 @@ class TestPopulation(unittest.TestCase):
 
     def test_rewritten_history_is_an_exception(self):
         w = World()
-        r = w.rec(previous={"digest": "sha256:p", "period_end": "2027-01-01T00:00:00Z",
+        r = w.rec(previous={"id": "2027-01-01T00:00:00Z", "digest": "sha256:p", "period_end": "2027-01-01T00:00:00Z",
                             "highWater": {"mainSha": "f" * 40}}).report()
         self.assertIn("history-rewritten", [e["kind"] for e in r["exceptions"]])
 
@@ -233,6 +233,19 @@ class TestChain(unittest.TestCase):
         self.assertTrue(RC.check_chain([e1], dict(first, previousReport=e1["digest"],
                                                   period={"from": e1["period_end"], "to": "x"})))
         self.assertTrue(RC.check_chain([], second))
+
+    def test_previous_report_must_verify(self):
+        w = World()
+        first = w.rec().report()
+        self.assertEqual((first["repo"], first["step"]), (REPO, "CC-06"))
+        self.assertTrue(first["observedAt"])
+        e1 = RC.index_entry(first, "reports/a.json")
+        kinds = lambda r: [e["kind"] for e in r["exceptions"]]
+        self.assertEqual(kinds(w.rec(previous=e1).report()), ["previous-report-unverified"])
+        w.atts["report:" + first["id"]] = [Att("reconciliation-report", dict(first, outcome="x"), "sha256:r0")]
+        self.assertEqual(kinds(w.rec(previous=e1).report()), ["previous-report-unverified"])
+        w.atts["report:" + first["id"]].append(Att("reconciliation-report", first, "sha256:r1"))
+        self.assertEqual(kinds(w.rec(previous=e1).report()), [])
 
     def test_merkle_root(self):
         self.assertIsNone(RC.merkle_root([]))
