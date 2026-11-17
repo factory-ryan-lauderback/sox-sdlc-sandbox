@@ -415,6 +415,18 @@ class TestStoryPR(unittest.TestCase):
         self.assertEqual(ev.kind, "invalid-main")
         self.assertIn("F5.topology", failed(ev))
 
+    def test_review_author_from_attested_login(self):
+        """The Review agent cannot resolve private App ids (authorAppId null); the gate maps the
+        attested authorLogin through the trust policy, and the author must not be the reviewer."""
+        for login, ok in ((None, False), ("someone-else", False), ("review", False), ("dev", True)):
+            w = World()
+            for a in w.atts:
+                if a.name == "review-verdict":
+                    a.predicate["authorAppId"] = None
+                    a.predicate["authorLogin"] = w.pol.bot_login(login) if login in ("dev", "review") else login
+            ev, _ = w.evaluate(10)
+            self.assertEqual("SDLC-06.review#10" not in failed(ev), ok, login)
+
 
 class TestReleasePR(unittest.TestCase):
     def test_awaiting_approval_presents_packet(self):
