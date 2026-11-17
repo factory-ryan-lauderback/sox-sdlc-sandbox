@@ -245,7 +245,7 @@ class Train(unittest.TestCase):
             routes[f"/repos/{common.REPO}/pulls/{n}/files"] = [{"filename": f} for f in fl]
         return FakeGH(routes)
 
-    def fetch_factory(self, approved=True, prod_state=None, missing=(), mutate=None):
+    def fetch_factory(self, approved=True, prod_state=None, missing=(), mutate=None, checks_paired=True, labels=None):
         heads = {10: "h" * 40, 11: H}
         paired = {n: paired_checks(h, n, mutate if n == 11 else None) for n, h in heads.items()}
 
@@ -256,7 +256,8 @@ class Train(unittest.TestCase):
             if name == "merge-record" and kind == "commit":
                 n = {M2: 10, M3: 11}[ident]
                 return [att({"mergeCommitSha": ident, "prNumber": n, "treeMatch": True, "jiraKeys": [f"FRQ-{n}"],
-                             "checks": paired[n][0]})]
+                             "checks": paired[n][0], "checksPaired": checks_paired,
+                             **({"labels": labels} if labels else {})})]
             if name in ("gate-decision", "review-verdict", "qa-result"):
                 n = next((k for k, h in heads.items() if kind == "commit" and ident == h), None)
                 return paired[n][1].get(name, []) if n else []
@@ -317,6 +318,36 @@ class Train(unittest.TestCase):
         owner = dict(self.POLICY, owner="factory-aman")
         p = train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1, policy=owner)
         self.assertEqual(p["outcome"], "planned", p["problems"])
+        self.assertEqual([r.get("sodShortcuts") for r in p["releases"]], [["sod-shortcut-owner-approver"]] * 2)
+
+    def test_every_recorded_run_must_pair(self):
+        def rerun(checks, atts):
+            qa = next(c for c in checks if c["name"] == "sox/qa-agent")
+            extra = dict(qa, checkRunId=qa["checkRunId"] + 100, externalId=str(int(qa["externalId"]) + 100),
+                         pairedAttestation="sha256:" + "e" * 64)
+            checks.append(extra)
+            a = att({"checkRunId": extra["checkRunId"], "headSha": H, "outcome": "pass"}, digest=extra["pairedAttestation"])
+            a["run"] = f"https://github.com/{common.REPO}/actions/runs/{extra['externalId']}/attempts/1"
+            atts["qa-result"].append(a)
+
+        p = train.plan(self.standard_gh(), self.fetch_factory(mutate=rerun), M3, self.today, M1, policy=self.POLICY)
+        self.assertEqual(p["outcome"], "planned", p["problems"])
+
+        def rerun_unpaired(checks, atts):
+            rerun(checks, atts)
+            atts["qa-result"].pop()
+
+        p = train.plan(self.standard_gh(), self.fetch_factory(mutate=rerun_unpaired), M3, self.today, M1, policy=self.POLICY)
+        self.assertEqual(p["outcome"], "refused")
+        p = train.plan(self.standard_gh(), self.fetch_factory(checks_paired=False), M3, self.today, M1, policy=self.POLICY)
+        self.assertEqual(p["outcome"], "refused")
+        self.assertTrue(any("checksPaired" in x for x in p["problems"]), p["problems"])
+
+    def test_gate_labels_carried_into_plan(self):
+        labels = ["app-key-exposure-not-rotated", "sod-shortcut-owner-approver"]
+        p = train.plan(self.standard_gh(), self.fetch_factory(labels=labels), M3, self.today, M1, policy=self.POLICY)
+        self.assertEqual(p["outcome"], "planned", p["problems"])
+        self.assertEqual([r.get("labels") for r in p["releases"]], [labels] * 2)
         self.assertEqual([r.get("sodShortcuts") for r in p["releases"]], [["sod-shortcut-owner-approver"]] * 2)
 
     def test_refuses_unpaired_or_mismatched_check(self):
