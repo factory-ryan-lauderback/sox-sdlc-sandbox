@@ -244,6 +244,20 @@ class QaBurnedTest(unittest.TestCase):
             self.assertIsNone(scan(iss, FakeRepo([pr()], first_push=T0 - 10, runs=passed, qa_runs=q), plans, verdict=ok,
                                    now=da._time("2027-01-15T08:30:00Z"))[0])
 
+    def test_success_run_without_verified_result_gets_fresh_commit(self):
+        iss = issues(story("FRQ-15", status="In Review"))
+        plans = [plan([entry("FRQ-15")], t=T0 - 50)]
+        ok = att("review-verdict", {"outcome": "pass", "findings": []}, T0, 3)
+        passed = [{"status": "completed", "conclusion": "success", "completed_at": "2027-01-15T08:00:00Z"}]
+        repo = FakeRepo([pr()], first_push=T0 - 10, runs=passed, qa_runs=passed)
+        item, _, log = scan(iss, repo, plans, verdict=ok, now=da._time("2027-01-15T08:30:00Z"))
+        self.assertEqual(item["mode"], "rekick")
+        self.assertIn("sox/qa-agent", "\n".join(log))
+        # Within the grace period, or with the verified result present, the head is left alone.
+        self.assertIsNone(scan(iss, repo, plans, verdict=ok, now=da._time("2027-01-15T08:05:00Z"))[0])
+        self.assertIsNone(scan(iss, repo, plans, verdict=ok, qa=att("qa-result", {"outcome": "pass"}, T0, 4),
+                               now=da._time("2027-01-15T08:30:00Z"))[0])
+
 
 class PathTest(unittest.TestCase):
     def test_paths(self):

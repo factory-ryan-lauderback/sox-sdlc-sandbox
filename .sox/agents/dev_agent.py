@@ -56,6 +56,7 @@ MAX_FILES = 60
 MAX_PLAN_CHARS = 30_000
 REKICK_LIMIT = 3
 STALE_OPEN_SECONDS = 2 * 3600
+ORPHAN_GRACE_SECONDS = 10 * 60
 STORY_TYPES = ("dev", "qa")
 ESCALATED = "Blocked - Human Escalation"
 HANDS_OFF = (ESCALATED, "Re-plan", "Done", "Released")
@@ -367,10 +368,16 @@ def scan(issues, repo, hint=None, fetch=None, now=None):
         def stale(rs, st):
             return st == "open" and all(r.get("started_at") and now - _time(r["started_at"]) > STALE_OPEN_SECONDS
                                         for r in rs if r["status"] != "completed")
+        def orphaned(rs, st, result):
+            # A success run is written only after its result is attested, so one with no verified result
+            # (e.g. the attestation was rejected as malformed) is unpaired: the gate blocks the head and
+            # the agent will not open a second run on it. Only a new commit clears it.
+            return st == "passed" and result is None and all(
+                r.get("completed_at") and now - _time(r["completed_at"]) > ORPHAN_GRACE_SECONDS for r in rs)
         qa_runs = repo.qa_runs(head)
         qstate = checks.head_state(qa_runs)
-        review_burned = (state == "burned" and verdict is None) or stale(runs, state)
-        qa_burned = (qstate == "burned" and qa is None) or stale(qa_runs, qstate)
+        review_burned = (state == "burned" and verdict is None) or stale(runs, state) or orphaned(runs, state, verdict)
+        qa_burned = (qstate == "burned" and qa is None) or stale(qa_runs, qstate) or orphaned(qa_runs, qstate, qa)
         if review_burned or qa_burned:
             what = REVIEW_CHECK if review_burned else QA_CHECK
             if rekicks >= REKICK_LIMIT:
