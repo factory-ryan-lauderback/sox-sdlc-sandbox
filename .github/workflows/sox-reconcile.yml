@@ -5,11 +5,11 @@ name: sox-reconcile
 # reconciliation-report (subject sox:report:<time>) and appended to the hash-chained index in
 # factory-ryan-lauderback/sox-sdlc-evidence (reports/) by the Evidence Writer.
 # The reconciler holds only its own read-only token; it never receives another role's key.
-# Fixed: no dispatch inputs. The daily schedule is enabled at go-live.
+# Fixed: no dispatch inputs. Daily at 03:30 UTC, after the deploy train, and on demand.
 on:
   workflow_dispatch: {}
-  # schedule:
-  #   - cron: "30 3 * * *"
+  schedule:
+    - cron: "30 3 * * *"
 
 permissions: {}
 

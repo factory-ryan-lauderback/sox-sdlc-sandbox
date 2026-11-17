@@ -76,8 +76,9 @@ class Reconciler:
 
     # ---------- helpers ----------
     def in_scope(self, t):
+        """After go-live. The go-live merge itself (at == goLive.at) is the last bootstrap change."""
         gl = self.policy.go_live_at
-        return gl is not None and t is not None and t >= gl
+        return gl is not None and t is not None and t > gl
 
     def exception(self, control, item, kind, reason):
         eid = f"EXC-{iso(self.now)[:10]}-{len(self.exceptions) + 1:02d}"
@@ -100,12 +101,19 @@ class Reconciler:
             if p.get("merged_at") and p.get("merge_commit_sha"):
                 prs[p["merge_commit_sha"]] = p
         rows = []
+        go_live_sha = self.policy.go_live_sha if self.policy.go_live_at is not None else None
+        bootstrap = True
         for line in self.git("rev-list", "--first-parent", "--parents", "--reverse",
                              "--format=%cI", head).splitlines():
             if line.startswith("commit "):
                 sha, *parents = line.split()[1:]
                 continue
-            rows.append(self.main_row(sha, parents, line.strip(), prs.get(sha)))
+            rows.append(self.main_row(sha, parents, line.strip(), prs.get(sha), bootstrap))
+            if sha == go_live_sha:
+                bootstrap = False
+        if go_live_sha and bootstrap:
+            self.exception("CC-06", f"commit:{go_live_sha}", "go-live-not-on-main",
+                           f"goLive.mainSha {go_live_sha} is not on main's first-parent chain")
         on_chain = {r["sha"] for r in rows}
         merged = [p for p in prs.values()]
         off = sorted(p["number"] for p in merged if p["merge_commit_sha"] not in on_chain)
@@ -120,7 +128,7 @@ class Reconciler:
               "mergedNotOnFirstParent": off}
         return head, rows, p1, p2
 
-    def main_row(self, sha, parents, committed_at, pr):
+    def main_row(self, sha, parents, committed_at, pr, bootstrap=True):
         inner = []
         if len(parents) > 1:
             inner = [c for c in self.git("rev-list", f"{parents[0]}..{sha}").split() if c != sha]
@@ -136,8 +144,7 @@ class Reconciler:
             for label in mr.predicate.get("labels") or []:
                 if label not in row["labels"]:
                     row["labels"].append(label)
-        when = _time(pr["merged_at"]) if pr else _time(committed_at)
-        if not self.in_scope(when):
+        if bootstrap:
             row["result"] = "pass" if mr is not None else "bootstrap"
             row["exception"] = BOOTSTRAP
             if BOOTSTRAP not in row["labels"]:
@@ -283,7 +290,8 @@ class Reconciler:
                           "lastCheckRunId": checks["lastCheckRunId"]},
             "reconcilerCodeSha": self.code_sha, "policyDigest": self.policy.digest,
             "goLive": {"at": iso(self.policy.go_live_at) if self.policy.go_live_at else None,
-                       "mainSha": self.policy.go_live_sha},
+                       "mainSha": self.policy.go_live_sha,
+                       "anchorPr": self.policy.data["goLive"].get("anchorPr")},
             "populations": {"P1": p1, "P2": p2,
                             "P5": {"count": len(keys["keys"])},
                             "P8": {k: checks[k] for k in ("commitsScanned", "count", "success",

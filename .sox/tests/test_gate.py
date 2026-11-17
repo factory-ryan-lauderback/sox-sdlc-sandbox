@@ -1013,6 +1013,7 @@ def golive_policy(at=1000, rotated=False, **mut):
     """Trust policy with test App ids and a goLive block set at T0 + at."""
     with open(os.path.join(SOX, "trust-policy.yaml")) as fh:
         d = pin_ids(json.load(fh))
+    d["goLive"].pop("anchorPr", None)
     d["goLive"].update({"at": t(at), "mainSha": M0, "rulesetVersion": 3})
     d["goLive"]["appKeyExposure"]["rotated"] = rotated
     for path, value in mut.items():

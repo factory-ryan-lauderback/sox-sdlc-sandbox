@@ -99,6 +99,7 @@ def load_explained(path=EXPLAINED):
 
 
 def build(policy, api, actions_api, mirror_path, workdir, inventory_file=None, now=None):
+    policy.resolve_go_live(api.get)
     mirror = Mirror.ensure(policy.repo, mirror_path)
     ctx = G.Context(policy, api, Evidence(Verifier(policy), api), mirror,
                     ScopeMap.load(os.path.dirname(HERE), policy))
