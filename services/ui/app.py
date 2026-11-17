@@ -11,10 +11,10 @@ API_URL = os.environ.get("API_URL", "http://localhost:8002")
 def render(loans):
     rows = "".join(
         f"<tr><td>{html.escape(str(l['id']))}</td><td>{l['amount']:.2f}</td>"
-        f"<td>{l['monthly_payment']:.2f}</td></tr>"
+        f"<td>{l['monthly_payment']:.2f}</td><td>{l['payoff_amount']:.2f}</td></tr>"
         for l in loans)
     return ("<html><head><title>Acme Lending</title></head><body><h1>Acme Lending loans</h1>"
-            "<table><tr><th>ID</th><th>Amount</th><th>Monthly</th></tr>"
+            "<table><tr><th>ID</th><th>Amount</th><th>Monthly</th><th>Payoff</th></tr>"
             f"{rows}</table></body></html>")
 
 
