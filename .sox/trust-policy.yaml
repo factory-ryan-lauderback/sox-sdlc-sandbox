@@ -597,6 +597,16 @@
       "platform-admin"
     ]
   },
+  "$commentBypassExceptions": "Merges into main the owner approved to land under a recorded bypass of main-protection, without gate evidence (decision 2026-11-17). Each entry names one PR; only its merge commit, resolved from the Pulls API like goLive.anchorPr, is covered. The deploy train does not refuse because of that commit, and the reconciler reports it as a bypass-exception with the entry's label in every report. It is never evidence and relaxes no other check.",
+  "bypassExceptions": [
+    {
+      "pr": 58,
+      "label": "bypass-exception-1",
+      "approvedBy": "factory-ryan-lauderback",
+      "approvedAt": "2026-11-17",
+      "reason": "PM/TL context hidden-files fix; no control-change path yet"
+    }
+  ],
   "loops": {
     "maxReviewRounds": 10,
     "maxQaRounds": 10
