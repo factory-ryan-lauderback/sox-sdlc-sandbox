@@ -41,6 +41,7 @@ jobs:
     uses: ./.github/workflows/sox-jira-read.yml
     secrets:
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      SOX_JIRA_EMAIL: ${{ secrets.SOX_JIRA_EMAIL }}
     with:
       preset: sweep
       artifact-name: jira-snapshot-dev
@@ -261,6 +262,7 @@ jobs:
     uses: ./.github/workflows/sox-jira-write.yml
     secrets:
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      SOX_JIRA_EMAIL: ${{ secrets.SOX_JIRA_EMAIL }}
     with:
       role: dev
       artifact-pattern: jira-ops-dev-*
@@ -273,6 +275,7 @@ jobs:
     uses: ./.github/workflows/sox-jira-write.yml
     secrets:
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      SOX_JIRA_EMAIL: ${{ secrets.SOX_JIRA_EMAIL }}
     with:
       role: qa
       artifact-pattern: jira-ops-qa-*

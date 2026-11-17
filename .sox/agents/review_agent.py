@@ -6,15 +6,19 @@ anything other than an attested pass (cancel, timeout, model error, invalid verd
 leaves that run failed or unfinished, and the gate blocks the head. Recovery is a new commit.
 
 The verdict never appears in logs or in repo-readable artifacts before it is attested: `parse` hands
-it to `record` as a job output only, and the check run text and PR comment are written by `finish`
-after the attestation exists.
+it to `record` as a job output sealed to a per-run key that only env agent-review can derive
+(seal.py, red team F18), and the check run text and PR comment are written by `finish` after the
+attestation exists.
+
+Pairing (F16/F17): a check run succeeds only on an attestation from the run named in its external_id.
+For a head that already has a verified verdict, `open` completes that verdict's own stale run and
+posts nothing new; `record` and `finish` never complete a run as success without this run's attestation.
 
 The LLM job (`parse`) holds FACTORY_API_KEY and a read-only GITHUB_TOKEN, never an App key. `open`
 and `record` hold the Review App token and re-derive everything they sign from the GitHub API.
 No job checks out or executes PR code: the diff is fetched as data.
 """
 import argparse
-import base64
 import json
 import os
 import re
@@ -25,6 +29,9 @@ from common import (REPO, GitHub, digest_of, dump_json, is_control_path, load_js
                     positive_int, pr_binding, set_output, sha256_hex, subject_lines)
 import checks  # noqa: E402
 import rounds  # noqa: E402
+import seal  # noqa: E402
+
+SEAL_PURPOSE = "review-verdict"
 
 CHECK_NAME = "sox/review-agent"
 WORKFLOW = "sox-review-agent.yml"
@@ -160,15 +167,15 @@ def open_(args):
         conclusion = "success" if p.get("outcome") == "pass" else "failure"
         cid = p.get("checkRunId")
         mine = [r for r in runs if r["id"] == cid]
-        title = f"Review: {p.get('outcome')} (round {p.get('round')}, existing verified verdict)"
-        summary = ("A verified review-verdict already exists for this head SHA and base. It is re-posted, not re-run; "
-                   "a failing verdict for a head can never be replaced by a later pass.")
-        text = f"Attestation {existing.digest}, run {existing.identity.get('runInvocationURI')}"
+        # Only the verdict's own run is paired with its attestation; a new run posted here would carry
+        # this run's ID and no attestation, and would block the head under run-ID pairing.
         if mine and mine[0]["status"] != "completed":
+            title = f"Review: {p.get('outcome')} (round {p.get('round')}, existing verified verdict)"
+            summary = ("A verified review-verdict exists for this head SHA and base; its own check run is completed "
+                       "here, not re-run. A failing verdict for a head can never be replaced by a later pass.")
+            text = f"Attestation {existing.digest}, run {existing.identity.get('runInvocationURI')}"
             checks.complete(app, CHECK_NAME, head, conclusion, title, summary, text, run_id=cid)
             return done("completed the stale run of an attested verdict")
-        if not any(r["status"] == "completed" and r.get("conclusion") == conclusion for r in runs):
-            post(conclusion, title, summary, text)
         return done("verdict already attested for this head")
     state = checks.head_state(runs)
     if state != "none":
@@ -237,8 +244,9 @@ def no_verdict(reason):
 
 
 def parse(args):
-    """droid's JSON output -> job output `verdict` (base64 JSON). Nothing about the verdict is printed.
-    Anything malformed becomes changes_requested, never a free retry."""
+    """droid's JSON output -> job output `verdict`, sealed to the open job's SEAL_PUB. Nothing about the
+    verdict is printed. Anything malformed becomes changes_requested, never a free retry. Without a
+    sealing key there is no output, and record counts that as no verdict."""
     agent = {}
     try:
         raw = load_json(f"{args.dir}/droid.json")
@@ -249,8 +257,7 @@ def parse(args):
         verdict = no_verdict(f"{type(e).__name__}")
     verdict["agent"] = agent
     verdict["contextDigest"] = os.environ.get("CONTEXT_DIGEST")
-    enc = base64.b64encode(json.dumps(verdict, sort_keys=True).encode()).decode()
-    set_output("verdict", enc)
+    set_output("verdict", seal.seal(os.environ.get("SEAL_PUB"), json.dumps(verdict, sort_keys=True).encode()))
     print("verdict handed to the record job (not shown until attested)")
 
 
@@ -263,7 +270,7 @@ def _decode_verdict(mode, ctx_digest):
     if os.environ.get("REVIEW_RESULT") != "success":
         return no_verdict(f"LLM job {os.environ.get('REVIEW_RESULT') or 'missing'}")
     try:
-        v = json.loads(base64.b64decode(os.environ.get("VERDICT_B64") or "", validate=True))
+        v = json.loads(seal.unseal(os.environ.get("SEAL_SECRET"), SEAL_PURPOSE, os.environ.get("VERDICT_SEALED") or ""))
     except Exception:
         return no_verdict("verdict output missing or not decodable")
     if not isinstance(v, dict) or v.get("verdict") not in ("pass", "changes_requested"):
@@ -304,11 +311,12 @@ def record(args):
 
     existing = rounds.verdict_for_head(head, ctx["baseRef"])
     if existing:
-        # A re-run of this workflow: the head already has its verdict. Never sign a second one.
+        # Another run attested this head after open: never sign a second verdict. This run's check
+        # run has no attestation of its own, so it cannot be completed as success.
         p = existing.predicate
-        plan["conclusion"] = "success" if p.get("outcome") == "pass" else "failure"
-        return finish(f"Review: {p.get('outcome')} (existing verified verdict)",
-                      "A verified review-verdict already exists for this head; it is not re-judged.",
+        return finish(f"Review: {p.get('outcome')} (verdict attested by another run)",
+                      "A verified review-verdict for this head was attested by another run while this one was judging. "
+                      "This run signs nothing, so its check run is not evidence and blocks the head.",
                       f"Attestation {existing.digest}")
 
     pr = gh.pr(number)
@@ -389,7 +397,9 @@ def finish(args):
                 "summary": "The review run failed or was cancelled after this head was opened for judging. "
                            "This head is blocked; push a new commit to get a fresh review.", "details": ""}
     conclusion, details = plan["conclusion"], plan.get("details", "")
-    if plan.get("attest"):
+    if not plan.get("attest"):
+        conclusion = "failure"  # success needs this run's attestation (run-ID pairing)
+    else:
         if os.environ.get("ATTEST_OUTCOME") != "success" or not os.environ.get("ATTESTATION_URL"):
             conclusion, plan["title"] = "failure", "Attestation failed"
             plan["summary"] = "The review-verdict attestation was not created, so the verdict is not evidence."

@@ -7,7 +7,9 @@ name: sox-review-agent
 #
 # Signing order (gate F13/F16, red team F17): `open` creates the in_progress sox/review-agent check
 # run (external_id = this run's ID) BEFORE the model runs. The verdict travels to `record` only as a
-# job output, is attested with that checkRunId, and only then does `finish` complete the check with
+# job output sealed to a per-run public key from `open` (F18: step env is printed in the public log,
+# so the plaintext must never reach one; only env agent-review can derive the private key), is attested
+# with that checkRunId, and only then does `finish` complete the check with
 # the verdict's conclusion and publish the reasoning. Anything else (cancel, timeout, model error,
 # invalid verdict, attest failure) leaves the run failed or unfinished, which blocks the head.
 # Recovery for a blocked head is a new commit, which then needs its own review, QA and approval.
@@ -79,6 +81,7 @@ jobs:
     uses: ./.github/workflows/sox-jira-read.yml
     secrets:
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      SOX_JIRA_EMAIL: ${{ secrets.SOX_JIRA_EMAIL }}
     with:
       preset: ${{ needs.resolve.outputs.preset }}
       keys: ${{ needs.resolve.outputs.keys }}
@@ -105,6 +108,7 @@ jobs:
       mode: ${{ steps.open.outputs.mode }}
       check_run_id: ${{ steps.open.outputs.check_run_id }}
       context_digest: ${{ steps.open.outputs.context_digest }}
+      seal_pub: ${{ steps.seal.outputs.seal_pub }}
     steps:
       - name: Refuse to run outside main
         run: test "$GITHUB_REF" = "refs/heads/main"
@@ -122,6 +126,12 @@ jobs:
         with:
           app-id: ${{ vars.REVIEW_APP_ID }}
           private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+      # Public key for sealing the verdict; the private key is re-derived only in `record`. Before
+      # `open`, so a failure here cannot leave an opened check run behind.
+      - id: seal
+        env:
+          SEAL_SECRET: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+        run: python3 .sox/agents/seal.py pubkey --purpose review-verdict
       - id: open
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -149,7 +159,7 @@ jobs:
           retention-days: 30
 
   # LLM job: FACTORY_API_KEY and a read-only GITHUB_TOKEN only. No App key, no id-token. The verdict
-  # leaves this job only as a job output; nothing about it is printed or uploaded.
+  # leaves this job only as a sealed job output; nothing about it is printed or uploaded.
   review:
     needs: open
     if: needs.open.outputs.mode == 'llm'
@@ -191,6 +201,7 @@ jobs:
         name: Parse verdict
         env:
           CONTEXT_DIGEST: ${{ needs.open.outputs.context_digest }}
+          SEAL_PUB: ${{ needs.open.outputs.seal_pub }}
         run: python3 .sox/agents/review_agent.py parse --dir "$RUNNER_TEMP/review"
 
   # Key-holding: Review App token, id-token, attestations. Checks out main only; reads the PR via API.
@@ -232,7 +243,8 @@ jobs:
           REVIEWER_APP_SLUG: ${{ steps.app.outputs.app-slug }}
           OPEN_CONTEXT_DIGEST: ${{ needs.open.outputs.context_digest }}
           REVIEW_RESULT: ${{ needs.review.result }}
-          VERDICT_B64: ${{ needs.review.outputs.verdict }}
+          VERDICT_SEALED: ${{ needs.review.outputs.verdict }}
+          SEAL_SECRET: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
           SOX_REVIEW_MODEL: ${{ vars.SOX_REVIEW_MODEL }}
         run: python3 .sox/agents/review_agent.py record --ctx "$RUNNER_TEMP/review" --out "$RUNNER_TEMP/out"
       - id: attest1
@@ -276,6 +288,7 @@ jobs:
     uses: ./.github/workflows/sox-jira-write.yml
     secrets:
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      SOX_JIRA_EMAIL: ${{ secrets.SOX_JIRA_EMAIL }}
     with:
       role: review
       artifact-pattern: jira-ops-review-*

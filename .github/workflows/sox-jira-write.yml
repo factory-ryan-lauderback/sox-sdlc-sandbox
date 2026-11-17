@@ -24,6 +24,8 @@ on:
       # values used are still the ones in env jira-attestor (main only).
       JIRA_API_TOKEN:
         required: false
+      SOX_JIRA_EMAIL:
+        required: false
       JIRA_ATTESTOR_APP_PRIVATE_KEY:
         required: false
 permissions: {}
@@ -60,7 +62,7 @@ jobs:
           ROLE: ${{ inputs.role }}
           OPS_DIGEST: ${{ inputs.ops-digest }}
           SOX_JIRA_BACKEND: ${{ vars.SOX_JIRA_BACKEND || 'cloud' }}
-          SOX_JIRA_EMAIL: ${{ vars.SOX_JIRA_EMAIL }}
+          SOX_JIRA_EMAIL: ${{ secrets.SOX_JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           SOX_JIRA_STORE_BRANCH: sox-jira-fake
           SOX_JIRA_STORE_TOKEN: ${{ steps.app.outputs.token }}

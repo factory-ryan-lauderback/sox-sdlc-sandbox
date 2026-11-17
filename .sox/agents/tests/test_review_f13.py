@@ -1,4 +1,5 @@
-"""F13/F17: the binding check run opens before the model, and only an attested pass succeeds."""
+"""F13/F17/F18: the binding check run opens before the model, the verdict reaches record only sealed,
+and only this run's attested pass succeeds."""
 import base64
 import contextlib
 import hashlib
@@ -13,12 +14,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 import checks  # noqa: E402
 import review_agent  # noqa: E402
+import seal  # noqa: E402
 
 HEAD = "a" * 40
 APP = 42
 PR = {"number": 7, "state": "open", "head": {"sha": HEAD, "ref": "story/FRQ-5-x"}, "base": {"sha": "b" * 40, "ref": "release/r1"},
       "user": {"login": "acme-dev-agent[bot]", "type": "Bot"}, "title": "t", "body": ""}
 DIFF = b"diff --git a/x b/x\n"
+SECRET = "-----BEGIN RSA PRIVATE KEY-----\nreview-test\n-----END RSA PRIVATE KEY-----\n"
+
+
+def sealed(verdict, run="1234", secret=SECRET):
+    with mock.patch.dict(os.environ, {"GITHUB_RUN_ID": run}):
+        return seal.seal(seal.public_key(secret, review_agent.SEAL_PURPOSE), json.dumps(verdict).encode())
 
 
 def fake_gh(check_run=None):
@@ -53,16 +61,17 @@ def do_open(**kw):
     return start, complete, (json.load(open(ctx)) if os.path.exists(ctx) else None), out
 
 
-def do_record(verdict=None, result="success", existing=None, check_status="in_progress", tamper=False, head_moved=False):
+def do_record(verdict=None, result="success", existing=None, check_status="in_progress", tamper=False, head_moved=False,
+              raw_output=None):
     _, _, _, ctxdir = do_open()
     raw = open(f"{ctxdir}/context.json", "rb").read()
     digest = "sha256:" + hashlib.sha256(raw).hexdigest()
     if tamper:
         digest = "sha256:" + "0" * 64
-    env = {"REVIEW_RESULT": result, "OPEN_CONTEXT_DIGEST": digest}
+    env = {"REVIEW_RESULT": result, "OPEN_CONTEXT_DIGEST": digest, "SEAL_SECRET": SECRET}
     if verdict is not None:
         verdict = {**verdict, "contextDigest": "sha256:" + hashlib.sha256(raw).hexdigest()}
-        env["VERDICT_B64"] = base64.b64encode(json.dumps(verdict).encode()).decode()
+        env["VERDICT_SEALED"] = raw_output(verdict) if raw_output else sealed(verdict)
     out = tempfile.mkdtemp()
     gh = fake_gh({"id": 9, "app": {"id": APP}, "head_sha": HEAD, "name": review_agent.CHECK_NAME, "status": check_status})
     if head_moved:
@@ -101,7 +110,19 @@ class OpenTest(unittest.TestCase):
         ex = mock.Mock(predicate={"outcome": "pass", "round": 1, "checkRunId": 5}, digest="sha256:x", identity={})
         start, complete, _, _ = do_open(runs=[{"id": 5, "status": "in_progress"}], existing=ex)
         start.assert_not_called()
+        complete.assert_called_once()
         self.assertEqual((complete.call_args.args[3], complete.call_args.kwargs.get("run_id")), ("success", 5))
+        self.assertIsNone(complete.call_args.kwargs.get("external_id"))
+
+    def test_attested_head_gets_no_unpaired_run(self):
+        # A new run would carry this run's ID without an attestation from it and block the head.
+        for outcome in ("pass", "changes_requested"):
+            ex = mock.Mock(predicate={"outcome": outcome, "round": 1, "checkRunId": 5}, digest="sha256:x", identity={})
+            for runs in ([], [{"id": 5, "status": "completed", "conclusion": "success"}],
+                         [{"id": 6, "status": "in_progress"}]):
+                start, complete, ctx, _ = do_open(runs=runs, existing=ex)
+                start.assert_not_called(); complete.assert_not_called()
+                self.assertIsNone(ctx, (outcome, runs))
 
     def test_loop_exhausted_posts_completed_failure_and_escalates(self):
         start, complete, _, out = do_open(prior=[str(i) * 40 for i in range(10)])
@@ -126,10 +147,20 @@ class RecordTest(unittest.TestCase):
             self.assertEqual((plan["attest"], plan["conclusion"], pred["outcome"]), (True, "failure", "changes_requested"), kw)
 
     def test_existing_verdict_is_never_resigned(self):
-        ex = mock.Mock(predicate={"outcome": "changes_requested"}, digest="sha256:x", identity={})
-        plan, pred = do_record(self.PASS, existing=ex)
-        self.assertEqual((plan["attest"], plan["conclusion"]), (False, "failure"))
-        self.assertIsNone(pred)
+        # Even an existing pass: this run's check run has no attestation from this run.
+        for outcome in ("changes_requested", "pass"):
+            ex = mock.Mock(predicate={"outcome": outcome}, digest="sha256:x", identity={})
+            plan, pred = do_record(self.PASS, existing=ex)
+            self.assertEqual((plan["attest"], plan["conclusion"]), (False, "failure"), outcome)
+            self.assertIsNone(pred)
+
+    def test_unsealed_or_foreign_verdict_is_no_verdict(self):
+        b64 = lambda v: base64.b64encode(json.dumps(v).encode()).decode()  # noqa: E731
+        for wrap in (b64, lambda v: seal.PREFIX + b64(v), lambda v: sealed(v, run="999"),
+                     lambda v: sealed(v, secret="other key"), lambda v: sealed(v)[:-8]):
+            plan, pred = do_record(self.PASS, raw_output=wrap)
+            self.assertEqual((plan["conclusion"], pred["outcome"], pred["verdictValid"]),
+                             ("failure", "changes_requested", False))
 
     def test_completed_run_is_left_alone(self):
         plan, _ = do_record(self.PASS, check_status="completed")
@@ -164,6 +195,12 @@ class FinishTest(unittest.TestCase):
     def test_no_plan_completes_failure(self):
         c, _ = self._finish(None, {})
         self.assertEqual((c.call_args.args[3], c.call_args.kwargs["run_id"]), ("failure", 9))
+
+    def test_unattested_plan_never_succeeds(self):
+        for env in ({}, {"ATTEST_OUTCOME": "success", "ATTESTATION_URL": "https://x"}):
+            c, gh = self._finish({"attest": False, "pr": 7, "conclusion": "success", "title": "t", "summary": ""}, env)
+            self.assertEqual((c.call_args.args[3], c.call_args.kwargs["run_id"]), ("failure", 9))
+            gh.request.assert_not_called()
 
     def test_failed_attest_completes_failure(self):
         c, gh = self._finish({"attest": True, "pr": 7, "conclusion": "success", "title": "t", "summary": ""},
