@@ -1,9 +1,11 @@
-# Only human approvers appear here. GitHub Apps cannot be code owners, and the repository owner
-# account is Platform Admin only, so it is deliberately absent.
-*                 @factory-aman
-/.github/         @factory-aman
-/.sox/            @factory-aman
-/.factory/        @factory-aman
-/tools/           @factory-aman
-/CODEOWNERS       @factory-aman
-/.github/CODEOWNERS @factory-aman
+# Only the human release approver appears here. GitHub Apps cannot be code owners.
+# Sandbox shortcut (sod-shortcut-owner-approver, 2026-11-17): the sole approver is the
+# repository owner account, which the agent machines also hold, so a code-owner approval
+# asserts human approval but does not prove it. Production needs separate approver identities.
+*                 @factory-ryan-lauderback
+/.github/         @factory-ryan-lauderback
+/.sox/            @factory-ryan-lauderback
+/.factory/        @factory-ryan-lauderback
+/tools/           @factory-ryan-lauderback
+/CODEOWNERS       @factory-ryan-lauderback
+/.github/CODEOWNERS @factory-ryan-lauderback
