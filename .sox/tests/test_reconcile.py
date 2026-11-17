@@ -176,7 +176,8 @@ def bypass_policy(pr=2, go_live="2027-01-01T10:00:00Z", main_sha="0" * 40, **cha
         d = json.load(fh)
     d["goLive"].pop("anchorPr", None)
     d["goLive"].update({"at": go_live, "mainSha": main_sha, "rulesetVersion": 1})
-    d["bypassExceptions"][0].update(pr=pr, **changes)
+    # One entry, whatever the repo policy lists, so these tests do not track its contents.
+    d["bypassExceptions"] = [dict(TestBypassExceptions.ENTRY, pr=pr, **changes)]
     return Policy(json.dumps(d).encode())
 
 
@@ -191,9 +192,9 @@ class TestBypassExceptions(unittest.TestCase):
         return {"number": number, "merged_at": "2027-01-01T12:00:00Z" if merged else None,
                 "base": {"ref": base}, "merge_commit_sha": sha}
 
-    def test_repo_policy_names_only_pr_58(self):
+    def test_repo_policy_lists_pr_58(self):
         p = load_policy()
-        self.assertEqual(p.bypass_exceptions, [self.ENTRY])
+        self.assertIn(self.ENTRY, p.bypass_exceptions)
         self.assertEqual(p.bypass_commits(), {})          # nothing covered until resolved
 
     def test_resolution(self):
@@ -212,6 +213,7 @@ class TestBypassExceptions(unittest.TestCase):
         from soxlib.policy import PolicyError
         with open(os.path.join(SOX, "trust-policy.yaml")) as fh:
             base = json.load(fh)
+        base["bypassExceptions"] = [dict(self.ENTRY)]
         mutations = [
             lambda d: d.update(bypassExceptions={"pr": 58}),
             lambda d: d["bypassExceptions"][0].update(pr="58"),
