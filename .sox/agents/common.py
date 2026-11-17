@@ -94,9 +94,13 @@ def now_utc():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def positive_int(raw, name="value"):
+# GitHub check-run ids passed 9 digits in 2026 (134129588395); int64 holds 19.
+CHECK_RUN_ID_DIGITS = 19
+
+
+def positive_int(raw, name="value", digits=9):
     s = str(raw).strip()
-    if not re.fullmatch(r"[1-9][0-9]{0,8}", s):
+    if not re.fullmatch(rf"[1-9][0-9]{{0,{digits - 1}}}", s):
         raise SystemExit(f"{name} must be a positive integer, got {s[:20]!r}")
     return int(s)
 
