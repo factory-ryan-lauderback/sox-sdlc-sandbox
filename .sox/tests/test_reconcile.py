@@ -27,11 +27,12 @@ def tearDownModule():
     TMP.cleanup()
 
 
-def load_policy(go_live=None):
+def load_policy(go_live=None, main_sha="0" * 40):
     with open(os.path.join(SOX, "trust-policy.yaml")) as fh:
         d = json.load(fh)
     if go_live:
-        d["goLive"].update({"at": go_live, "mainSha": "0" * 40, "rulesetVersion": 1})
+        d["goLive"].pop("anchorPr", None)
+        d["goLive"].update({"at": go_live, "mainSha": main_sha, "rulesetVersion": 1})
     return Policy(json.dumps(d).encode())
 
 
@@ -135,7 +136,7 @@ class TestPopulation(unittest.TestCase):
     def test_after_go_live_missing_merge_record_is_an_exception(self):
         w = World()
         w.atts[w.merges[0]] = [merge_record(w.merges[0])]
-        pol = load_policy(go_live="2027-01-01T11:00:00Z")
+        pol = load_policy(go_live="2027-01-01T10:00:00Z", main_sha=w.merges[0])
         r = w.rec(pol).report()
         rows = {row["sha"]: row for row in r["rows"]}
         self.assertEqual(rows[w.merges[0]]["exception"], RC.BOOTSTRAP)       # before go-live
@@ -149,7 +150,7 @@ class TestPopulation(unittest.TestCase):
         w = World()
         w.atts[w.merges[1]] = [merge_record(w.merges[1], ["app-key-exposed-not-rotated",
                                                           "sod-shortcut-owner-approver"])]
-        pol = load_policy(go_live="2027-01-01T11:00:00Z")
+        pol = load_policy(go_live="2027-01-01T10:00:00Z", main_sha=w.merges[0])
 
         class Ev:
             def __init__(self, ok):
@@ -168,6 +169,71 @@ class TestPopulation(unittest.TestCase):
         r = w.rec(previous={"id": "2027-01-01T00:00:00Z", "digest": "sha256:p", "period_end": "2027-01-01T00:00:00Z",
                             "highWater": {"mainSha": "f" * 40}}).report()
         self.assertIn("history-rewritten", [e["kind"] for e in r["exceptions"]])
+
+
+class TestGoLiveAnchor(unittest.TestCase):
+    """goLive.anchorPr: go-live is the merge of that PR into main, resolved from the Pulls API."""
+
+    def pr(self, merged=True, base="main", sha="a" * 40):
+        return {"number": 45, "merged_at": "2027-01-01T10:00:00Z" if merged else None,
+                "base": {"ref": base}, "merge_commit_sha": sha}
+
+    def test_repo_policy_is_anchored(self):
+        p = load_policy()
+        self.assertEqual(p.data["goLive"]["anchorPr"], 45)
+        self.assertIsNone(p.go_live_at)
+
+    def test_resolution(self):
+        p = load_policy()
+        p.resolve_go_live(lambda path: self.pr())
+        self.assertEqual((p.go_live_sha, p.go_live_at), ("a" * 40, parse_time("2027-01-01T10:00:00Z")))
+        for bad in (self.pr(merged=False), self.pr(base="release/x"), self.pr(sha=None), None):
+            p = load_policy()
+            p.resolve_go_live(lambda path, bad=bad: bad)
+            self.assertIsNone(p.go_live_at, bad)
+            self.assertIsNone(p.go_live_sha)
+
+    def test_loader_rules(self):
+        from soxlib.policy import PolicyError
+        with open(os.path.join(SOX, "trust-policy.yaml")) as fh:
+            base = json.load(fh)
+        for mutate in (lambda g: g.update(anchorPr="45"), lambda g: g.update(anchorPr=0),
+                       lambda g: g.update(at="2027-01-01T00:00:00Z", mainSha="a" * 40, rulesetVersion=1)):
+            d = json.loads(json.dumps(base))
+            mutate(d["goLive"])
+            with self.assertRaises(PolicyError):
+                Policy(json.dumps(d).encode())
+
+    def test_rows_through_the_go_live_merge_are_bootstrap(self):
+        w = World()
+        pol = load_policy()
+        pol.resolve_go_live(lambda path: dict(self.pr(sha=w.merges[0]), merged_at=w.prs[0]["merged_at"]))
+        r = w.rec(pol).report()
+        rows = {row["sha"]: row for row in r["rows"]}
+        self.assertEqual(rows[w.seed]["exception"], RC.BOOTSTRAP)
+        self.assertEqual(rows[w.merges[0]]["exception"], RC.BOOTSTRAP)
+        self.assertEqual(rows[w.merges[1]]["result"], "fail")      # no merge-record after go-live
+        self.assertEqual(r["goLive"], {"at": "2027-01-01T10:00:00Z", "mainSha": w.merges[0], "anchorPr": 45})
+
+    def test_go_live_sha_not_on_main_is_an_exception(self):
+        w = World()
+        r = w.rec(load_policy(go_live="2027-01-01T10:00:00Z")).report()
+        self.assertIn("go-live-not-on-main", [e["kind"] for e in r["exceptions"]])
+
+    def test_train_baseline_follows_the_anchor(self):
+        sys.path.insert(0, os.path.dirname(SOX))
+        from tools.sox_release import train
+
+        class Gh:
+            def __init__(self, pr):
+                self.pr = pr
+
+            def get(self, path):
+                assert path.endswith("/pulls/45"), path
+                return self.pr
+        path = os.path.join(SOX, "trust-policy.yaml")
+        self.assertEqual(train.go_live_sha(path, gh=Gh(self.pr())), "a" * 40)
+        self.assertIsNone(train.go_live_sha(path, gh=Gh(self.pr(merged=False))))
 
 
 class TestAppKeys(unittest.TestCase):

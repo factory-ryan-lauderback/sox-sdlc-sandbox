@@ -23,7 +23,7 @@ import sys
 from tools.sox_release import evidence
 from tools.sox_release.common import (HOTFIX_BRANCH, RELEASE_BRANCH, REPO, ROOT, SHA, RefusedError, digest_of, now_iso,
                                       ordered, services, services_touched, subject_key, write_json)
-from tools.sox_release.gh import GitHub
+from tools.sox_release.gh import GitHub, GitHubError
 
 LOOKBACK_DAYS = 45
 # Predicate field and value that a paired success check's attestation must carry.
@@ -308,12 +308,18 @@ def plan_digest(p):
     return digest_of({k: v for k, v in p.items() if k not in skip})
 
 
-def go_live_sha(path=None):
-    """goLive.mainSha from the trust policy on main: the first train's window starts after it."""
+def go_live_sha(path=None, gh=None):
+    """goLive.mainSha from the trust policy on main: the first train's window starts after it.
+    With goLive.anchorPr it is that PR's merge commit into main, or None until it is merged."""
     path = pathlib.Path(path or ROOT / ".sox" / "trust-policy.yaml")
     try:
-        sha = json.loads(path.read_text())["goLive"]["mainSha"]
-    except (OSError, ValueError, KeyError, TypeError):
+        g = json.loads(path.read_text())["goLive"]
+        sha = g.get("mainSha")
+        if not sha and g.get("anchorPr"):
+            pr = (gh or GitHub()).get(f"/repos/{REPO}/pulls/{int(g['anchorPr'])}") or {}
+            if pr.get("merged_at") and (pr.get("base") or {}).get("ref") == "main":
+                sha = pr.get("merge_commit_sha")
+    except (OSError, ValueError, KeyError, TypeError, GitHubError):
         return None
     return sha if SHA.match(sha or "") else None
 

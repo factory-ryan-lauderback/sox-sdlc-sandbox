@@ -163,6 +163,12 @@ class Policy:
         in-scope merge-record and reconciliation item carries its label. It relaxes no check."""
         g = self.data.get("goLive") or {}
         self._go_live_at = None
+        anchor = g.get("anchorPr")
+        if anchor is not None:
+            if not isinstance(anchor, int) or isinstance(anchor, bool) or anchor <= 0:
+                raise PolicyError("goLive.anchorPr must be a PR number")
+            if g.get("at") is not None or g.get("mainSha") is not None:
+                raise PolicyError("goLive.anchorPr and goLive.at/mainSha are exclusive")
         if g.get("at") is not None:
             at = _epoch(g.get("at"), "goLive.at")
             if not re.fullmatch(r"[0-9a-f]{40}", str(g.get("mainSha") or "")):
@@ -275,6 +281,22 @@ class Policy:
     @property
     def go_live_sha(self):
         return (self.data.get("goLive") or {}).get("mainSha")
+
+    def resolve_go_live(self, get):
+        """With goLive.anchorPr, go-live is that PR's merge into main: mainSha is its merge commit
+        and at its merged_at, read through get(path) -> JSON. Until it is merged, nothing is
+        resolved and every change is bootstrap. A no-op for an explicit goLive.at."""
+        g = self.data["goLive"]
+        n = g.get("anchorPr")
+        if self._go_live_at is not None or n is None:
+            return
+        pr = get(f"/repos/{self.repo}/pulls/{n}") or {}
+        sha = pr.get("merge_commit_sha") or ""
+        if not pr.get("merged_at") or (pr.get("base") or {}).get("ref") != "main" \
+                or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return
+        g["mainSha"], g["at"] = sha, pr["merged_at"]
+        self._go_live_at = _epoch(pr["merged_at"], f"merged_at of PR {n}")
 
     @property
     def go_live_at(self):
