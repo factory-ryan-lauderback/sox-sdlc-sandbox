@@ -1,4 +1,4 @@
-"""api: loan API in front of db. GET /api/loans returns loans with a computed monthly payment."""
+"""api: loan API in front of db. GET /api/loans adds monthly payments and payoff amounts."""
 import json
 import os
 import urllib.request
@@ -15,7 +15,14 @@ def monthly_payment(amount, annual_rate=ANNUAL_RATE, months=TERM_MONTHS):
 
 
 def enrich(loans):
-    return [dict(l, monthly_payment=monthly_payment(l["amount"])) for l in loans]
+    return [
+        dict(
+            l,
+            monthly_payment=monthly_payment(l["amount"]),
+            payoff_amount=round(l["amount"] + l["amount"] * ANNUAL_RATE / 12, 2),
+        )
+        for l in loans
+    ]
 
 
 class Handler(BaseHTTPRequestHandler):
