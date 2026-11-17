@@ -241,6 +241,12 @@ def jira_human_approval(policy, pred, kind, waived=None):
                      f"by {acct}" + ("; " + "; ".join(why) if why else "") + note)
 
 
+def story_keys(entries):
+    """Story keys of a release-manifest `stories` list, whose entries are objects with a `key`
+    (or bare keys)."""
+    return {e.get("key") if isinstance(e, dict) else e for e in entries or []}
+
+
 def classify(pd, policy):
     if pd.base_ref == "main":
         if RELEASE_RE.match(pd.head_ref):
@@ -449,7 +455,7 @@ class Evaluation:
             return None
         p = man.predicate
         declared = sorted(set(p.get("declaredServices") or []))
-        listed = sorted(set(p.get("stories") or []))
+        listed = sorted(story_keys(p.get("stories")))
         self.facts["manifest"] = {"digest": man.digest, "stories": listed,
                                   "declaredServices": declared}
         out = sorted(set(touched) - set(declared))
@@ -472,7 +478,7 @@ class Evaluation:
             om = self.get("release", other, "release-manifest")
             if om is None:
                 continue
-            both = sorted(mine & set(om.predicate.get("stories") or []))
+            both = sorted(mine & story_keys(om.predicate.get("stories")))
             if both:
                 dup.append(f"{other}: {both}")
                 seen.append(om.digest)
