@@ -245,7 +245,8 @@ class Train(unittest.TestCase):
             routes[f"/repos/{common.REPO}/pulls/{n}/files"] = [{"filename": f} for f in fl]
         return FakeGH(routes)
 
-    def fetch_factory(self, approved=True, prod_state=None, missing=(), mutate=None, checks_paired=True, labels=None):
+    def fetch_factory(self, approved=True, prod_state=None, missing=(), mutate=None, checks_paired=True, labels=None,
+                      merges=None, approved_merge=M3):
         heads = {10: "h" * 40, 11: H}
         paired = {n: paired_checks(h, n, mutate if n == 11 else None) for n, h in heads.items()}
 
@@ -254,7 +255,9 @@ class Train(unittest.TestCase):
             if name in missing:
                 return []
             if name == "merge-record" and kind == "commit":
-                n = {M2: 10, M3: 11}[ident]
+                n = (merges or {M2: 10, M3: 11}).get(ident)
+                if n is None:
+                    return []
                 return [att({"mergeCommitSha": ident, "prNumber": n, "treeMatch": True, "jiraKeys": [f"FRQ-{n}"],
                              "checks": paired[n][0], "checksPaired": checks_paired,
                              **({"labels": labels} if labels else {})})]
@@ -263,14 +266,16 @@ class Train(unittest.TestCase):
                 return paired[n][1].get(name, []) if n else []
             if name == "human-approval":
                 n = int(ident)
-                return [att({"commitId": {10: "h" * 40, 11: H}[n], "prNumber": n, "baseRef": "refs/heads/main",
+                if n not in heads:
+                    return []
+                return [att({"commitId": heads[n], "prNumber": n, "baseRef": "refs/heads/main",
                              "sod": {"result": "pass"}, "reviewer": {"login": "factory-aman"}})]
             if name == "env-deploy":
                 return [att({"outcome": "pass", "headSha": H, "prNumber": 11, "baseRef": "refs/heads/main",
                              "images": [{"service": n, "digest": D[n]} for n in ("db", "api", "ui")]})]
             if name == "release-approval" and approved:
                 svc = next(n for n, d in D.items() if d == ident)
-                return [att({"service": svc, "imageDigest": ident, "mergeCommitSha": M3, "environment": "production",
+                return [att({"service": svc, "imageDigest": ident, "mergeCommitSha": approved_merge, "environment": "production",
                              "humanApproval": "sha256:x"}, subjects=[{"name": f"{common.REGISTRY}/{svc}", "digest": {"sha256": ident[7:]}}])]
             if name == "deploy-result" and prod_state and ident == "2026-11-10":
                 return [att({"outcome": "success", "environment": "production", "service": s, "imageDigest": d,
@@ -349,6 +354,55 @@ class Train(unittest.TestCase):
         self.assertEqual(p["outcome"], "planned", p["problems"])
         self.assertEqual([r.get("labels") for r in p["releases"]], [labels] * 2)
         self.assertEqual([r.get("sodShortcuts") for r in p["releases"]], [["sod-shortcut-owner-approver"]] * 2)
+
+    BYPASS = {"pr": 58, "label": "bypass-exception-1", "approvedBy": "factory-ryan-lauderback", "approvedAt": "2026-11-17",
+              "reason": "PM/TL context hidden-files fix; no control-change path yet"}
+
+    def bypass_gh(self, merge58=M2, files58=(".github/workflows/sox-pm-agent.yml",)):
+        """Window M2, M3 on main: M2 is PR 58's merge (bypassed the gate), M3 is release PR 11."""
+        gh = self.gh({M2: pr(58, "pipeline/context-hidden-files", "5" * 40, M2), M3: pr(11, "release/b", H, M3)},
+                     {11: ["services/ui/app.py"], 58: list(files58)})
+        gh.routes[f"/repos/{common.REPO}/pulls/58"] = pr(58, "pipeline/context-hidden-files", "5" * 40, merge58)
+        return gh
+
+    def test_bypass_exception_accepts_exactly_that_commit(self):
+        pol = dict(self.POLICY, bypassExceptions=[self.BYPASS])
+        p = train.plan(self.bypass_gh(), self.fetch_factory(merges={M3: 11}), M3, self.today, M1, policy=pol)
+        self.assertEqual(p["outcome"], "planned", p["problems"])
+        self.assertEqual([r["prNumber"] for r in p["releases"]], [11])
+        self.assertEqual([(e["prNumber"], e["mergeCommitSha"], e["label"], e["kind"], e["touchedServices"]) for e in p["exceptions"]],
+                         [(58, M2, "bypass-exception-1", "bypass-exception", [])])
+
+        other = self.bypass_gh()
+        other.routes[f"/repos/{common.REPO}/pulls/57"] = pr(57, "x", "6" * 40, "7" * 40)
+        refusals = {
+            "not listed": (dict(self.POLICY), self.bypass_gh()),
+            "other PR listed": (dict(self.POLICY, bypassExceptions=[dict(self.BYPASS, pr=57)]), other),
+            "PR 58 merge commit differs": (pol, self.bypass_gh(merge58="9" * 40)),
+            "malformed entry": (dict(self.POLICY, bypassExceptions=[dict(self.BYPASS, label="")]), self.bypass_gh()),
+            "bypass changes a service": (pol, self.bypass_gh(files58=("services/api/app.py",))),
+        }
+        for label, (policy, gh) in refusals.items():
+            p = train.plan(gh, self.fetch_factory(merges={M3: 11}), M3, self.today, M1, policy=policy)
+            self.assertEqual((p["outcome"], p["order"]), ("refused", []), label)
+
+    def test_other_unrecorded_commit_still_refuses_with_bypass_listed(self):
+        pol = dict(self.POLICY, bypassExceptions=[self.BYPASS])
+        gh = self.gh({M2: pr(57, "pipeline/other", "6" * 40, M2), M3: pr(11, "release/b", H, M3)},
+                     {57: [".github/workflows/x.yml"], 11: ["services/ui/app.py"]})
+        gh.routes[f"/repos/{common.REPO}/pulls/58"] = pr(58, "pipeline/context-hidden-files", "5" * 40, "8" * 40)
+        p = train.plan(gh, self.fetch_factory(merges={M3: 11}), M3, self.today, M1, policy=pol)
+        self.assertEqual((p["outcome"], p["exceptions"]), ("refused", []))
+        self.assertTrue(any("PR #57" in x for x in p["problems"]), p["problems"])
+
+    def test_bypass_after_last_release_keeps_release_approval(self):
+        pol = dict(self.POLICY, bypassExceptions=[self.BYPASS])
+        gh = self.gh({M2: pr(11, "release/b", H, M2), M3: pr(58, "pipeline/context-hidden-files", "5" * 40, M3)},
+                     {11: ["services/ui/app.py"], 58: [".github/workflows/sox-pm-agent.yml"]})
+        gh.routes[f"/repos/{common.REPO}/pulls/58"] = pr(58, "pipeline/context-hidden-files", "5" * 40, M3)
+        p = train.plan(gh, self.fetch_factory(merges={M2: 11}, approved_merge=M2), M3, self.today, M1, policy=pol)
+        self.assertEqual(p["outcome"], "planned", p["problems"])
+        self.assertEqual((p["cutoffSha"], [e["prNumber"] for e in p["exceptions"]]), (M3, [58]))
 
     def test_refuses_unpaired_or_mismatched_check(self):
         self.assertEqual(train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1, policy=self.POLICY)["outcome"], "planned")

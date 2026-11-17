@@ -10,7 +10,9 @@ The plan is computed only from primary sources and verified evidence:
 - images come from the env-deploy of the last release head (what QA tested), and each needs a
   verified release-approval naming the cutoff merge;
 - each service deploys at most once, in dependency order, and only if production does not
-  already run that digest.
+  already run that digest;
+- the only other commit accepted is one listed in the trust policy's bypassExceptions (resolved by
+  PR number); it is reported under exceptions and is never evidence.
 """
 import argparse
 import datetime as dt
@@ -236,6 +238,24 @@ def desired_images(fetch, rel, cutoff, svc, only=None):
     return images, ed.get("digest"), problems
 
 
+def bypass_exceptions(gh, policy):
+    """{merge commit: exception} for the trust policy's bypassExceptions. Each entry names one PR; its
+    merge commit comes from the Pulls API, so exactly that commit is accepted and nothing else. An
+    entry that is malformed or whose PR is not merged into main accepts nothing (fail closed)."""
+    out = {}
+    for e in policy.get("bypassExceptions") or []:
+        if not (isinstance(e, dict) and isinstance(e.get("pr"), int) and not isinstance(e.get("pr"), bool)
+                and all(isinstance(e.get(k), str) and e.get(k) for k in ("label", "approvedBy", "approvedAt", "reason"))):
+            continue
+        pr = gh.get(f"/repos/{{repo}}/pulls/{e['pr']}") or {}
+        sha = pr.get("merge_commit_sha")
+        if pr.get("merged_at") and (pr.get("base") or {}).get("ref") == "main" and SHA.match(sha or ""):
+            out[sha] = {"kind": "bypass-exception", "prNumber": e["pr"], "mergeCommitSha": sha,
+                        "headRef": (pr.get("head") or {}).get("ref"), "label": e["label"],
+                        "approvedBy": e["approvedBy"], "approvedAt": e["approvedAt"], "reason": e["reason"]}
+    return out
+
+
 def plan(gh, fetch, cutoff, today, baseline, mode="train", emergency_pr=None, root=None, policy=None):
     if not SHA.match(cutoff or ""):
         raise RefusedError("cutoff must be a commit SHA")
@@ -254,7 +274,20 @@ def plan(gh, fetch, cutoff, today, baseline, mode="train", emergency_pr=None, ro
         if cmp["status"] not in ("ahead", "identical"):
             raise RefusedError(f"emergency merge {target} is not on main")
     window = first_parent_window(gh, prev_sha, target)
+    bypass = bypass_exceptions(gh, policy) if window else {}
+    exceptions = []
     for sha in window:
+        if sha in bypass:
+            # A human-approved merge that bypassed the gate. It is reported as an exception, never
+            # used as evidence, and never ships service code.
+            ex = dict(bypass[sha])
+            files = [f["filename"] for f in gh.paginate(f"/repos/{{repo}}/pulls/{ex['prNumber']}/files")]
+            ex["touchedServices"] = ordered(svc, services_touched(files, svc)[0])
+            if ex["touchedServices"]:
+                problems.append(f"PR #{ex['prNumber']} ({ex['label']}) bypassed the gate and changes services "
+                                f"{ex['touchedServices']}; a bypass exception never ships service code")
+            exceptions.append(ex)
+            continue
         rec, errs = release_for_commit(gh, fetch, sha, svc, policy)
         problems += errs
         if rec:
@@ -271,7 +304,8 @@ def plan(gh, fetch, cutoff, today, baseline, mode="train", emergency_pr=None, ro
         scope = None
     images, env_deploy = {}, None
     if last and not problems:
-        images, env_deploy, errs = desired_images(fetch, last, target, svc, only=scope)
+        # Approvals name the last release's merge; only bypass exceptions can follow it in the window.
+        images, env_deploy, errs = desired_images(fetch, last, last["mergeCommitSha"], svc, only=scope)
         problems += errs
     desired = {n: i["digest"] for n, i in images.items()}
     to_deploy = [n for n in ordered(svc, desired) if (state.get(n) or {}).get("digest") != desired[n]]
@@ -283,7 +317,7 @@ def plan(gh, fetch, cutoff, today, baseline, mode="train", emergency_pr=None, ro
         "prNumber": None, "headSha": None, "baseSha": None, "baseRef": None,
         "trainId": train_id, "trainDate": today.isoformat(), "outcome": outcome,
         "cutoffSha": target, "previousTrainCutoffSha": prev_sha, "previousTrainId": (prev or {}).get("trainId"),
-        "releases": releases, "touchedServices": ordered(svc, touched),
+        "releases": releases, "exceptions": exceptions, "touchedServices": ordered(svc, touched),
         "order": to_deploy if outcome == "planned" else [],
         "images": [images[n] for n in ordered(svc, images)],
         "unchanged": sorted(n for n in desired if n not in to_deploy),
