@@ -415,6 +415,18 @@ class TestStoryPR(unittest.TestCase):
         self.assertEqual(ev.kind, "invalid-main")
         self.assertIn("F5.topology", failed(ev))
 
+    def test_review_author_from_attested_login(self):
+        """The Review agent cannot resolve private App ids (authorAppId null); the gate maps the
+        attested authorLogin through the trust policy, and the author must not be the reviewer."""
+        for login, ok in ((None, False), ("someone-else", False), ("review", False), ("dev", True)):
+            w = World()
+            for a in w.atts:
+                if a.name == "review-verdict":
+                    a.predicate["authorAppId"] = None
+                    a.predicate["authorLogin"] = w.pol.bot_login(login) if login in ("dev", "review") else login
+            ev, _ = w.evaluate(10)
+            self.assertEqual("SDLC-06.review#10" not in failed(ev), ok, login)
+
 
 class TestReleasePR(unittest.TestCase):
     def test_awaiting_approval_presents_packet(self):
@@ -765,6 +777,32 @@ class TestScope(unittest.TestCase):
         w2.atts.append(w2.manifest(["api"], 45, stories=("FRQ-77",), slug="other"))
         ev, _ = w2.evaluate(10)
         self.assertNotIn("SDLC-04.story-in-two-releases", failed(ev))
+
+    def test_manifest_stories_as_objects(self):
+        """Release emits manifest stories as objects ({key, epic, services, ...})."""
+        def objects(w):
+            for a in w.atts:
+                if a.name == "release-manifest":
+                    a.predicate["stories"] = [{"key": s, "epic": "FRQ-5", "services": ["api"], "dependsOn": []}
+                                              for s in a.predicate["stories"]]
+        w = World()
+        objects(w)
+        for n in (10, 20):
+            ev, _ = w.evaluate(n)
+            self.assertNotIn("SDLC-04.story-not-in-manifest", failed(ev))
+            self.assertNotIn("SDLC-04.story-in-two-releases", failed(ev))
+        self.assertEqual(ev.facts["manifest"]["stories"], ["FRQ-6"])
+        w = World()
+        w.atts.append(w.manifest(["api"], 45, stories=("FRQ-9",)))
+        objects(w)
+        ev, _ = w.evaluate(10)
+        self.assertIn("SDLC-04.story-not-in-manifest", failed(ev))
+        w = World()
+        w.other_releases = ["other"]
+        w.atts.append(w.manifest(["api"], 45, slug="other"))
+        objects(w)
+        ev, _ = w.evaluate(10)
+        self.assertIn("SDLC-04.story-in-two-releases", failed(ev))
 
 
 class TestApprovalStale(unittest.TestCase):

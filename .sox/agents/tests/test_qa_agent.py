@@ -329,9 +329,17 @@ class RecordTest(unittest.TestCase):
         self.assertTrue(gate_sdlc08(pred))
         self.assertEqual((pred["checkRunId"], pred["qaAppId"], pred["loopKey"]), (9, APP, f"release:{SLUG}"))
         self.assertFalse(list(floats(pred)), "canonical predicates carry no floats")
-        for s in (f"sox:commit:{HEAD}", "sox:pr:12", f"sox:release:{SLUG}", "sox:jira:FRQ-2", "sox:jira:FRQ-3",
-                  "sox:report:" + pred["reportDigest"]):
+        for s in (f"sox:commit:{HEAD}", "sox:pr:12", f"sox:release:{SLUG}", "sox:jira:FRQ-2", "sox:jira:FRQ-3"):
             self.assertIn(s, subjects)
+        self.assertNotIn("sox:report:", subjects)
+        # Every subject must be one the verifier accepts (it rejects 'sox:report:sha256:...').
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+        from soxlib import subject
+        for line in subjects.splitlines():
+            digest, name = line.split("  ", 1)
+            parsed = subject.parse_name(name)
+            if parsed:
+                self.assertEqual(digest, subject.key(qa_agent.REPO, *parsed), name)
         self.assertEqual(len(ops), 2)
 
     def test_any_non_pass_fails(self):

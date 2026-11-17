@@ -424,8 +424,9 @@ def record(args):
         "checkRunId": cid, "qaAppId": qa_app,
     }
     with open(f"{args.out}/subjects.txt", "w") as f:
-        f.write(subject_lines([("commit", head), ("pr", n), ("release", slug)] + [("jira", k) for k in stories]
-                              + [("report", report_digest)]))
+        # No report subject: sox:report:<id> is reserved for dated reconciliation reports and the verifier
+        # rejects any other id. The report stays bound through reportDigest in the predicate.
+        f.write(subject_lines([("commit", head), ("pr", n), ("release", slug)] + [("jira", k) for k in stories]))
     dump_json(f"{args.out}/predicate.json", predicate)
     plan.update(attest=True, conclusion="success" if outcome == "pass" else "failure", round=round_no)
     failed = [t for t in tests if t["status"] != PASSED]
