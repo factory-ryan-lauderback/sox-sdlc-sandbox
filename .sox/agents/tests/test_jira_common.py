@@ -31,7 +31,7 @@ class FileJiraTest(unittest.TestCase):
         k = j.create("Story", "s", "", "techlead")
         with self.assertRaises(jira_adapter.JiraError):
             j.transition(k, "Bogus", "factory-aman")
-        for s in ("Approved", "Approach Approved", "ECAB Approved"):
+        for s in ("Approved", "Approach Approved", "ECAB Approved", "Re-plan"):
             with self.assertRaises(jira_adapter.JiraError):
                 j.transition(k, s, "techlead")
         j.transition(k, "Plan Ready", "techlead")

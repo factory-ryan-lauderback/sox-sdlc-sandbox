@@ -21,7 +21,9 @@ import jira_attestor as att  # noqa: E402
 import jira_snapshot  # noqa: E402
 import planning_agent as pa  # noqa: E402
 from soxlib import gate  # noqa: E402
-from test_jira_attestor import POLICY, MemLookup, clock  # noqa: E402
+from test_jira_attestor import AUTOMATION, HUMAN, POLICY, RAW_POLICY, MemLookup, clock, shortcut_policy  # noqa: E402
+
+APPROVER_LOGIN = sorted(RAW_POLICY["humans"]["releaseApprovers"])[0]
 
 API_TEST = "services.api.test_app.PayoffTest.test_payoff_quote"
 UI_TEST = "services.ui.test_e2e_payoff.PayoffPageTest.test_quote_shown"
@@ -85,7 +87,7 @@ class Flow(unittest.TestCase):
         req = self.j.create("Requirement", "Loan payoff quote",
                             "Borrowers see a payoff quote (principal plus accrued interest) on the loans page.", "intake")
         self.j.comment(req, "[sox:intake] filed", "intake")
-        self.j.transition(req, "Approved", "factory-aman")
+        self.j.transition(req, "Approved", HUMAN)
         return req
 
     def pm(self, req):
@@ -159,7 +161,7 @@ class Flow(unittest.TestCase):
         req = self.j.create("Requirement", "r", "d", "intake")
         pa.select_pm(self.snapshot(), None, os.path.join(self.tmp, "c"))
         self.assertEqual(self.outputs()["mode"], "none")
-        self.j.transition(req, "Approved", "factory-aman")
+        self.j.transition(req, "Approved", HUMAN)
         self.j.update(req, "intake", description="edited after approval")
         pa.select_pm(self.snapshot(), None, os.path.join(self.tmp, "c"))
         self.assertEqual(self.outputs()["mode"], "none")
@@ -169,8 +171,8 @@ class Flow(unittest.TestCase):
         epic = self.pm(req)
         refs = self.plan_v1(epic)
         s1, s2 = refs["s1"], refs["s2"]
-        self.j.comment(epic, "Also show the payoff date.", "factory-aman")
-        self.j.transition(epic, "Re-plan", "factory-aman")
+        self.j.comment(epic, "Also show the payoff date.", HUMAN)
+        self.j.transition(epic, "Re-plan", HUMAN)
         ctx_dir = os.path.join(self.tmp, "ctx-tl2")
         pa.select_techlead(self.snapshot(), None, ctx_dir, gh=FakeGH())
         ctx = json.load(open(f"{ctx_dir}/context.json"))
@@ -197,18 +199,59 @@ class Flow(unittest.TestCase):
         req = self.approved_requirement()
         epic = self.pm(req)
         self.plan_v1(epic)
-        review = {"id": 7, "state": "CHANGES_REQUESTED", "user": {"login": "factory-aman"}, "body": "Round to cents.",
+        review = {"id": 7, "state": "CHANGES_REQUESTED", "user": {"login": APPROVER_LOGIN}, "body": "Round to cents.",
                   "submitted_at": "2026-11-10T23:00:00Z", "commit_id": "abc"}
-        bot = dict(review, id=8, user={"login": "factory-ryan-lauderback"})
+        bot = dict(review, id=8, user={"login": "factory-riya-bhivare"})
         ctx_dir = os.path.join(self.tmp, "ctx-h")
         pa.select_techlead(self.snapshot(), None, ctx_dir, gh=FakeGH([bot]))
-        self.assertEqual(self.outputs()["mode"], "none")  # only Release Approvers / Control Owners count
+        self.assertEqual(self.outputs()["mode"], "none")  # only Release Approvers / Control Owners count (a developer does not)
         pa.select_techlead(self.snapshot(), None, ctx_dir, gh=FakeGH([review]))
         ctx = json.load(open(f"{ctx_dir}/context.json"))
         self.assertEqual((ctx["reason"], ctx["feedback"][0]["reviewId"]), ("loop-h", 7))
         old = dict(review, submitted_at="2026-11-10T00:00:00Z")
         pa.select_techlead(self.snapshot(), None, ctx_dir, gh=FakeGH([old]))
         self.assertEqual(self.outputs()["mode"], "none")  # already addressed by the newer plan
+
+    def test_requirement_approval_rules_and_shortcut(self):
+        log = lambda who: [{"id": "1", "created": "2026-11-10T10:00:00Z", "author": {"accountId": who, "accountType": "atlassian"},  # noqa: E731
+                            "items": [{"field": "status", "from": "10070", "to": "10071"}]}]
+        own = {"changelog": log(AUTOMATION), "reporter": {"accountId": AUTOMATION}, "creator": {"accountId": AUTOMATION}}
+        human = {"changelog": log("someone"), "reporter": {"accountId": AUTOMATION}, "creator": {"accountId": AUTOMATION}}
+        with mock.patch.dict(os.environ, {"SOX_TRUST_POLICY": self._policy(None)}):
+            ok, why = pa.requirement_approved(own)
+            self.assertFalse(ok)
+            self.assertIn("automation-account, creator, reporter", why)
+            self.assertTrue(pa.requirement_approved(human)[0])
+        with shortcut_policy():
+            ok, why = pa.requirement_approved(own)
+            self.assertTrue(ok, why)
+            self.assertIn("sod-shortcut-owner-approver", why)
+            self.assertNotIn("sod-shortcut", pa.requirement_approved(human)[1])
+        with shortcut_policy(waives=["automation-account", "reporter"]):
+            ok, why = pa.requirement_approved(own)
+            self.assertFalse(ok)
+            self.assertIn("creator", why)
+        with shortcut_policy(jiraAccountId="712020:someone-else"):
+            self.assertFalse(pa.requirement_approved(own)[0])
+
+    def test_shortcut_account_comments_are_human_only_without_prefix(self):
+        issue = {"key": "FRQ-1", "comments": [
+            {"author": {"accountId": AUTOMATION}, "body": "[sox:techlead] plan v1", "created": "1"},
+            {"author": {"accountId": AUTOMATION}, "body": "Please add the payoff date.", "created": "2"}]}
+        with mock.patch.dict(os.environ, {"SOX_TRUST_POLICY": self._policy(None)}):
+            self.assertEqual(pa.human_comments(issue), [])
+        with shortcut_policy():
+            self.assertEqual([c["body"] for c in pa.human_comments(issue)], ["Please add the payoff date."])
+
+    def _policy(self, sc):
+        import copy
+        pol = copy.deepcopy(RAW_POLICY)
+        pol.pop("sodShortcut", None)
+        if sc:
+            pol["sodShortcut"] = sc
+        path = os.path.join(self.tmp, "policy.json")
+        json.dump(pol, open(path, "w"))
+        return path
 
     def test_compose_rejects_bad_plans(self):
         req = self.approved_requirement()

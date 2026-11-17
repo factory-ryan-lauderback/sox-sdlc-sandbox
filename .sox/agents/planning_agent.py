@@ -25,7 +25,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import jira_adapter as ja  # noqa: E402
-from common import REPO, GitHub, digest_of, dump_json, jira_key, load_json, set_output  # noqa: E402
+from common import (REPO, GitHub, digest_of, dump_json, jira_key, load_json, set_output, sod_shortcut,  # noqa: E402
+                    trust_policy)
 
 ROLES = ("pm", "techlead")
 PLANNING = ("Planning", "Re-plan")
@@ -104,12 +105,22 @@ def children(issues, epic_key):
                   key=lambda i: keynum(i["key"]))
 
 
+def _agent_comment(c, agents, sc):
+    who = (c.get("author") or {}).get("accountId")
+    if who not in agents:
+        return False
+    # The owner-approver shortcut account also writes for every agent; only its unprefixed comments are human.
+    if sc and who == sc["jiraAccountId"] and "automation-account" in sc["waives"]:
+        return (c.get("body") or "").lstrip().startswith("[sox:")
+    return True
+
+
 def human_comments(issue, since=None):
-    agents = agent_accounts()
+    agents, sc = agent_accounts(), sod_shortcut()
     out = []
     for c in issue.get("comments") or []:
         who = (c.get("author") or {}).get("accountId")
-        if who in agents or (since and str(c.get("created")) <= str(since)):
+        if _agent_comment(c, agents, sc) or (since and str(c.get("created")) <= str(since)):
             continue
         out.append({"source": f"Jira comment on {issue['key']}", "author": (c.get("author") or {}).get("displayName") or who,
                     "at": c.get("created"), "body": (c.get("body") or "")[:8000]})
@@ -118,16 +129,27 @@ def human_comments(issue, since=None):
 
 def requirement_approved(issue):
     """Planning reads the gate's rule ahead of time: an Approved transition after the last content
-    change, by a human Atlassian account that is not the reporter or creator. The gate re-derives it."""
+    change, by a human Atlassian account that is not an automation account, the reporter or the
+    creator. The trust policy's sodShortcut identity is excused only from the rules it lists in
+    `waives`, and its approval is labelled. The gate re-derives all of it."""
     from jira_attestor import approval_entry
     entry = approval_entry(issue.get("changelog") or [], ja.STATUS_IDS["Approved"])
     if not entry:
         return False, "no Approved transition after the last content change"
     who = entry.get("author") or {}
-    people = {(issue.get("reporter") or {}).get("accountId"), (issue.get("creator") or {}).get("accountId")}
-    if who.get("accountType") != "atlassian" or who.get("accountId") in agent_accounts() | people:
-        return False, "the Approved transition is not by an independent human account"
-    return True, f"approved by {who.get('accountId')} at {entry['created']}"
+    acct = who.get("accountId")
+    if who.get("accountType") != "atlassian":
+        return False, "the Approved transition is not by a human Atlassian account"
+    broken = {name for name, hit in (("automation-account", acct in agent_accounts()),
+                                     ("reporter", acct == (issue.get("reporter") or {}).get("accountId")),
+                                     ("creator", acct == (issue.get("creator") or {}).get("accountId"))) if hit}
+    sc = sod_shortcut()
+    label = ""
+    if broken and sc and acct == sc["jiraAccountId"] and broken <= sc["waives"]:
+        broken, label = set(), f" ({sc['label']})"
+    if broken:
+        return False, f"the Approved transition is not by an independent human account ({', '.join(sorted(broken))})"
+    return True, f"approved by {acct} at {entry['created']}{label}"
 
 
 def write_context(out, ctx, md, repo_files=()):
@@ -202,7 +224,7 @@ def _release_reviews(gh, slug_name, approvers):
 
 
 def _approvers():
-    pol = load_json(os.path.join(ROOT, ".sox", "trust-policy.yaml"))
+    pol = trust_policy()
     h = pol.get("humans") or {}
     return set(h.get("releaseApprovers") or []) | set(h.get("controlOwners") or [])
 
