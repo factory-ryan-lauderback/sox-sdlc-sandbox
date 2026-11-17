@@ -12,6 +12,11 @@ WORKFLOW_RE = re.compile(r"^\.github/workflows/sox-[a-z0-9-]+\.ya?ml$")
 SAFE_TRIGGERS = {"workflow_dispatch", "schedule", "repository_dispatch", "check_run",
                  "workflow_run"}
 EXPOSED_NOT_ROTATED = "app-key-exposed-not-rotated"
+SOD_SHORTCUT_LABEL = "sod-shortcut-owner-approver"
+# Separation-of-duties rules an approval by the sodShortcut identity may skip. Nothing else is
+# waivable: the approver must still be listed, pinned by id, atlassian, on the right SHA or status.
+SOD_WAIVABLE = frozenset({"automation-account", "reporter", "creator", "author-pusher",
+                          "platform-admin"})
 
 
 class PolicyError(ValueError):
@@ -96,6 +101,7 @@ class Policy:
             if ptype in self.predicate_types:
                 raise PolicyError(f"predicate type {ptype} listed twice")
             self.predicate_types[ptype] = name
+        self._validate_sod_shortcut()
         self._validate_humans()
         self._validate_jira()
         self._validate_go_live()
@@ -114,18 +120,34 @@ class Policy:
             if hit:
                 raise PolicyError(f"{where} contains neverApprovers login(s) {hit}")
 
+    def _validate_sod_shortcut(self):
+        s = self.data.get("sodShortcut")
+        if s is None:
+            return
+        if not isinstance(s, dict) or s.get("label") != SOD_SHORTCUT_LABEL:
+            raise PolicyError(f"sodShortcut.label must be {SOD_SHORTCUT_LABEL!r}")
+        if not s.get("githubLogin") or self.human_id(s["githubLogin"]) is None:
+            raise PolicyError("sodShortcut.githubLogin must be pinned in humans.ids")
+        if not s.get("jiraAccountId"):
+            raise PolicyError("sodShortcut.jiraAccountId is required")
+        waives = s.get("waives")
+        if not isinstance(waives, list) or not set(waives) <= SOD_WAIVABLE:
+            raise PolicyError(f"sodShortcut.waives must be a subset of {sorted(SOD_WAIVABLE)}")
+
     def _validate_jira(self):
         j = self.data.get("jira") or {}
         never = set(j.get("neverApprovers") or [])
         shared = j.get("sharedAutomationAccount")
-        if shared and shared not in never:
-            raise PolicyError("jira.sharedAutomationAccount must be in jira.neverApprovers")
+        shortcut = shared if self.sod_waives("automation-account", jira_account=shared) else None
+        if shared and shared not in never and shared != shortcut:
+            raise PolicyError("jira.sharedAutomationAccount must be in jira.neverApprovers "
+                              "unless sodShortcut names it and waives automation-account")
         for kind, accounts in (j.get("humanApprovers") or {}).items():
             if kind.startswith("$"):
                 continue
             if not isinstance(accounts, list):
                 raise PolicyError(f"jira.humanApprovers.{kind} must be a list of accountIds")
-            bad = sorted(set(accounts) & (never | {shared}))
+            bad = sorted(set(accounts) & (never | {shared}) - {shortcut})
             if bad:
                 raise PolicyError(f"jira.humanApprovers.{kind} contains automation or "
                                   f"never-approver accounts {bad}")
@@ -217,6 +239,18 @@ class Policy:
 
     def human_id(self, login):
         return ((self.data.get("humans") or {}).get("ids") or {}).get(login)
+
+    @property
+    def sod_shortcut(self):
+        return self.data.get("sodShortcut") or {}
+
+    def sod_waives(self, rule, login=None, jira_account=None):
+        """True when the sodShortcut identity (by GitHub login or Jira accountId) may skip rule."""
+        s = self.sod_shortcut
+        if rule not in (s.get("waives") or []):
+            return False
+        return bool((login and login == s.get("githubLogin"))
+                    or (jira_account and jira_account == s.get("jiraAccountId")))
 
     @property
     def jira(self):

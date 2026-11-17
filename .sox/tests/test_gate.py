@@ -30,11 +30,14 @@ B0 = "6" * 40      # merge base of release and main
 MERGE = "7" * 40   # merge commit of the release PR
 IMG = "sha256:" + "ab" * 32
 DEV, QA, BUNDLER = "acme-dev-agent[bot]", "acme-qa-agent[bot]", "acme-release-bundler[bot]"
-AMAN = {"login": "factory-aman", "id": 320644755}
 RIYA = {"login": "factory-riya-bhivare", "id": 351550958}
 OWNER = {"login": "factory-ryan-lauderback", "id": 344896283}
-AMAN_J = "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+FORMER = {"login": "factory-aman", "id": 320644755}   # no longer an approver
 SHARED_J = "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
+# sodShortcut: the owner is the sole approver, and in Jira the shared automation account.
+APPROVER, APPROVER_J = OWNER, SHARED_J
+OTHER_J = "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+SOD = "sod-shortcut-owner-approver"
 PO_J = "712020:00000000-0000-0000-0000-0000000000po"
 
 
@@ -58,7 +61,7 @@ def req_approval(changelog, reporter=PO_J, creator=PO_J, at=10):
 
 
 def approved_log():
-    return [jira_entry(1, 2, PO_J, [edit()]), jira_entry(2, 5, AMAN_J, [to_status("10071")])]
+    return [jira_entry(1, 2, PO_J, [edit()]), jira_entry(2, 5, APPROVER_J, [to_status("10071")])]
 
 
 def pin_ids(d):
@@ -428,24 +431,24 @@ class TestReleasePR(unittest.TestCase):
     def test_approval_after_presentation_passes(self):
         w = World()
         w.present_packet(600)
-        w.review(AMAN, "APPROVED", 700)
+        w.review(APPROVER, "APPROVED", 700)
         ev, ctx = w.evaluate(20)
         self.assertTrue(ev.ok, failed(ev))
         ha = next(e for e in R.plan_open(ev, ctx) if e.name == "human-approval")
-        self.assertEqual(ha.predicate["reviewer"]["id"], AMAN["id"])
+        self.assertEqual(ha.predicate["reviewer"]["id"], APPROVER["id"])
         self.assertEqual(ha.predicate["packetDigest"], ev.facts["packetDigest"])
         self.assertIn(("release", "autopay"), ha.subjects)
         self.assertIn(("jira", "FRQ-5"), ha.subjects)
 
     def test_approval_before_presentation_fails(self):
         w = World()
-        w.review(AMAN, "APPROVED", 550)
+        w.review(APPROVER, "APPROVED", 550)
         w.present_packet(600)
         ev, _ = w.evaluate(20)
         self.assertIn("SDLC-09.approval", failed(ev))
 
-    def test_owner_and_developer_approvals_do_not_count(self):
-        for user in (OWNER, RIYA, dict(AMAN, id=1)):
+    def test_non_approver_and_developer_approvals_do_not_count(self):
+        for user in (FORMER, RIYA, dict(APPROVER, id=1)):
             w = World()
             w.present_packet(600)
             w.review(user, "APPROVED", 700)
@@ -455,7 +458,7 @@ class TestReleasePR(unittest.TestCase):
     def test_base_change_after_review_fails(self):
         w = World()
         w.present_packet(600)
-        w.review(AMAN, "APPROVED", 700)
+        w.review(APPROVER, "APPROVED", 700)
         w.release_timeline.append({"event": "base_ref_changed", "created_at": t(750)})
         ev, _ = w.evaluate(20)
         self.assertIn("SDLC-09.approval", failed(ev))
@@ -482,13 +485,33 @@ class TestReleasePR(unittest.TestCase):
         w.release_files = [{"filename": "services/api/app.py"}, {"filename": ".sox/trust-policy.yaml"}]
         w.atts.append(w.manifest(["api", "controls"], 45))
         w.present_packet(600)
-        w.review(AMAN, "APPROVED", 700)
+        w.review(APPROVER, "APPROVED", 700)
         ev, ctx = w.evaluate(20)
         self.assertTrue(ev.ok, failed(ev))
         self.assertTrue(ev.facts["sodShortcut"])
         ha = next(e for e in R.plan_open(ev, ctx) if e.name == "human-approval")
         self.assertTrue(ha.predicate["controlChange"])
         self.assertTrue(ha.predicate["sodShortcut"])
+
+    def test_owner_approval_waives_platform_admin_and_participation(self):
+        w = World()
+        # the owner authored the release commit, so is a participant in the change
+        w.extra_routes = {f"/repos/{REPO}/pulls/20/commits": [
+            {"sha": R1, "author": {"login": OWNER["login"]}, "committer": {"login": BUNDLER}}]}
+        w.present_packet(600)
+        w.review(OWNER, "APPROVED", 700)
+        ev, ctx = w.evaluate(20)
+        self.assertTrue(ev.ok, failed(ev))
+        self.assertEqual(ev.facts["sodWaived"]["human-approval:" + OWNER["login"]],
+                         ["platform-admin", "author-pusher"])
+        out = {e.name: e.predicate for e in R.plan_open(ev, ctx)}
+        self.assertEqual(out["human-approval"]["sod"]["waived"], ["platform-admin", "author-pusher"])
+        self.assertIn(SOD, out["human-approval"]["labels"])
+        self.assertIn(SOD, out["gate-decision"]["labels"])
+        for rule in ("platform-admin", "author-pusher"):
+            w.pol.data["sodShortcut"]["waives"].remove(rule)
+            ev, _ = w.evaluate(20)
+            self.assertIn("SDLC-09.approval", failed(ev), rule)
 
 
 class TestLoopH(unittest.TestCase):
@@ -499,10 +522,10 @@ class TestLoopH(unittest.TestCase):
         w.present_packet(600)
         if on_closed_pr:
             w.other_release_prs = [{"number": 19, "state": "closed", "head": {"sha": R1, "ref": "release/autopay"},
-                                    "_reviews": [{"id": 77, "user": dict(AMAN), "state": "CHANGES_REQUESTED",
+                                    "_reviews": [{"id": 77, "user": dict(APPROVER), "state": "CHANGES_REQUESTED",
                                                   "commit_id": R1, "submitted_at": t(650)}]}]
         else:
-            w.review(AMAN, "DISMISSED" if dismiss else "CHANGES_REQUESTED", 650, rid=77)
+            w.review(APPROVER, "DISMISSED" if dismiss else "CHANGES_REQUESTED", 650, rid=77)
             if dismiss:
                 w.release_timeline.append({"event": "review_dismissed", "created_at": t(660),
                                            "dismissed_review": {"review_id": 77, "state": "changes_requested"}})
@@ -513,7 +536,7 @@ class TestLoopH(unittest.TestCase):
 
     def _approve(self, w, at=1000):
         w.present_packet(at)
-        w.review(AMAN, "APPROVED", at + 100, commit=R2)
+        w.review(APPROVER, "APPROVED", at + 100, commit=R2)
         ev, ctx = w.evaluate(20)
         return ev, ctx
 
@@ -543,7 +566,7 @@ class TestLoopH(unittest.TestCase):
     def test_cr_is_recorded_once(self):
         w = World()
         w.present_packet(600)
-        w.review(AMAN, "CHANGES_REQUESTED", 650, rid=77)
+        w.review(APPROVER, "CHANGES_REQUESTED", 650, rid=77)
         ev, ctx = w.evaluate(20)
         hcr = [e for e in R.plan_open(ev, ctx) if e.name == "human-changes-requested"]
         self.assertEqual(len(hcr), 1)
@@ -622,7 +645,7 @@ class TestLoopHBindsStoriesAndEpics(unittest.TestCase):
                           [("commit", "8" * 40), ("pr", "19"), ("release", "alpha"),
                            ("jira", "FRQ-5"), ("jira", "FRQ-6")],
                           {"prNumber": 19, "reviewId": 77, "commitId": "8" * 40,
-                           "reviewer": dict(AMAN), "submittedAt": t(350)}, 355))
+                           "reviewer": dict(APPROVER), "submittedAt": t(350)}, 355))
         return w
 
     def test_rebundle_without_replan_blocks(self):
@@ -636,7 +659,7 @@ class TestLoopHBindsStoriesAndEpics(unittest.TestCase):
         plan["planDigest"] = "sha256:plan2"
         w.atts.append(Att("techlead-plan", [("jira", "FRQ-5"), ("jira", "FRQ-6")], plan, 370))
         w.present_packet(600)
-        w.review(AMAN, "APPROVED", 700)
+        w.review(APPROVER, "APPROVED", 700)
         ev, _ = w.evaluate(20)
         self.assertTrue(ev.ok, failed(ev))
 
@@ -644,7 +667,7 @@ class TestMergedRelease(unittest.TestCase):
     def _merged(self):
         w = World()
         w.present_packet(600)
-        w.review(AMAN, "APPROVED", 700)
+        w.review(APPROVER, "APPROVED", 700)
         w.add_gate_success(R1, 880)
         w.release_merged = True
         ev, ctx = w.evaluate(20)
@@ -759,7 +782,7 @@ class TestApprovalStale(unittest.TestCase):
     def _approved(self):
         w = World()
         w.present_packet(600)
-        w.review(AMAN, "APPROVED", 700)
+        w.review(APPROVER, "APPROVED", 700)
         ev, _ = w.evaluate(20)
         self.assertTrue(ev.ok, failed(ev))
         return w
@@ -770,11 +793,11 @@ class TestApprovalStale(unittest.TestCase):
         ev, _ = w.evaluate(20)
         self.assertIn("SDLC-09.approval-stale", failed(ev))
         self.assertIn("SDLC-09.approval", failed(ev))
-        why = ev.facts["approvalCandidates"]["factory-aman"]
+        why = ev.facts["approvalCandidates"][APPROVER["login"]]
         self.assertTrue(any("releaseManifest" in x and "declaredServices" in x for x in why), why)
         # a new presentation and a new approval clear it
         w.present_packet(800)
-        w.review(AMAN, "APPROVED", 900)
+        w.review(APPROVER, "APPROVED", 900)
         ev, _ = w.evaluate(20)
         self.assertTrue(ev.ok, failed(ev))
 
@@ -785,7 +808,7 @@ class TestApprovalStale(unittest.TestCase):
         w.atts.append(Att("techlead-plan", [("jira", "FRQ-5"), ("jira", "FRQ-6")], plan, 750))
         ev, _ = w.evaluate(20)
         self.assertIn("SDLC-09.approval-stale", failed(ev))
-        why = ev.facts["approvalCandidates"]["factory-aman"]
+        why = ev.facts["approvalCandidates"][APPROVER["login"]]
         self.assertTrue(any("planDigests" in x for x in why), why)
 
     def test_signed_approval_for_old_packet_not_used_for_release_approval(self):
@@ -793,7 +816,7 @@ class TestApprovalStale(unittest.TestCase):
         ev, _ = w.evaluate(20)
         w.atts.append(Att("human-approval", [("commit", R1), ("pr", "20")],
                           {"prNumber": 20, "commitId": R1, "baseRef": "refs/heads/main",
-                           "packetDigest": "sha256:old", "reviewer": AMAN}, 710))
+                           "packetDigest": "sha256:old", "reviewer": APPROVER}, 710))
         w.atts.append(w.manifest(["api", "db"], 750))
         ev, _ = w.evaluate(20)
         self.assertIn("SDLC-09.approval-stale", failed(ev))
@@ -802,11 +825,15 @@ class TestJiraIdentities(unittest.TestCase):
     """Jira approvals are re-derived from the attested changelog; agent-created issues need the
     role's own account or the shared account with the acting-role marker."""
 
-    def _sdlc01(self, changelog, **kw):
+    def _sdlc01(self, changelog, mutate=None, full=False, **kw):
         w = World()
+        if mutate:
+            d = json.loads(w.pol.raw)
+            mutate(d)
+            w.pol = Policy(json.dumps(d).encode())
         w.atts[0] = req_approval(changelog, **kw)
         ev, _ = w.evaluate(10)
-        return [r for r in ev.reqs if r.id.startswith("SDLC-01.req")][0]
+        return ev if full else [r for r in ev.reqs if r.id.startswith("SDLC-01.req")][0]
 
     def test_human_approval_passes(self):
         r = self._sdlc01(approved_log())
@@ -814,10 +841,10 @@ class TestJiraIdentities(unittest.TestCase):
 
     def test_rejected_approvals(self):
         cases = {
-            "automation author": [jira_entry(2, 5, SHARED_J, [to_status("10071")])],
-            "non-atlassian author": [jira_entry(2, 5, AMAN_J, [to_status("10071")], account_type="app")],
+            "former approver": [jira_entry(2, 5, OTHER_J, [to_status("10071")])],
+            "non-atlassian author": [jira_entry(2, 5, APPROVER_J, [to_status("10071")], account_type="app")],
             "unlisted human": [jira_entry(2, 5, PO_J, [to_status("10071")])],
-            "other status": [jira_entry(2, 5, AMAN_J, [to_status("10073")])],
+            "other status": [jira_entry(2, 5, APPROVER_J, [to_status("10073")])],
             "edited after approval": approved_log() + [jira_entry(3, 7, PO_J, [edit("summary")])],
             "attachment after approval": approved_log() + [jira_entry(3, 7, PO_J, [edit("Attachment")])],
             "no changelog": None,
@@ -826,12 +853,41 @@ class TestJiraIdentities(unittest.TestCase):
             self.assertFalse(self._sdlc01(log).ok, name)
 
     def test_reporter_or_creator_cannot_approve(self):
-        self.assertFalse(self._sdlc01(approved_log(), reporter=AMAN_J).ok)
-        self.assertFalse(self._sdlc01(approved_log(), creator=AMAN_J).ok)
+        log = [jira_entry(1, 2, PO_J, [edit()]), jira_entry(2, 5, OTHER_J, [to_status("10071")])]
+        add_other = lambda d: d["jira"]["humanApprovers"]["requirementApproval"].append(OTHER_J)
+        self.assertTrue(self._sdlc01(log, mutate=add_other).ok)
+        self.assertFalse(self._sdlc01(log, mutate=add_other, reporter=OTHER_J).ok)
+        self.assertFalse(self._sdlc01(log, mutate=add_other, creator=OTHER_J).ok)
+
+    def test_sod_shortcut_waives_only_its_rules(self):
+        """The owner approves issues the shared account (the same accountId) reported and created,
+        and the approval carries the label; drop a waiver and the same approval fails."""
+        ev = self._sdlc01(approved_log(), reporter=SHARED_J, creator=SHARED_J, full=True)
+        r = [r for r in ev.reqs if r.id.startswith("SDLC-01.req")][0]
+        self.assertTrue(r.ok, r.detail)
+        self.assertIn(SOD, r.detail)
+        self.assertEqual(ev.facts["sodWaived"]["requirement-approval:FRQ-1"],
+                         ["automation-account", "reporter", "creator"])
+        self.assertIn(SOD, ev.labels())
+        # dropping automation-account is a loader error (TestPolicyJira)
+        for rule in ("reporter", "creator"):
+            drop = lambda d, rule=rule: d["sodShortcut"]["waives"].remove(rule)
+            self.assertFalse(self._sdlc01(approved_log(), reporter=SHARED_J, creator=SHARED_J,
+                                          mutate=drop).ok, rule)
+
+    def test_shared_account_without_shortcut_fails(self):
+        def no_shortcut(d):
+            del d["sodShortcut"]
+            d["jira"]["neverApprovers"] = [SHARED_J]
+            for kind in ("requirementApproval", "approachApproval", "emergencyApproval", "domainApproval"):
+                d["jira"]["humanApprovers"][kind] = [OTHER_J]
+        ev = self._sdlc01(approved_log(), mutate=no_shortcut, full=True)
+        self.assertTrue(any(f.startswith("SDLC-01.req") for f in failed(ev)))
+        self.assertNotIn(SOD, ev.labels())
 
     def test_reapproval_after_edit_passes(self):
         log = approved_log() + [jira_entry(3, 7, PO_J, [edit()]),
-                                jira_entry(4, 8, AMAN_J, [to_status("10071", frm="10070")])]
+                                jira_entry(4, 8, APPROVER_J, [to_status("10071", frm="10070")])]
         self.assertTrue(self._sdlc01(log).ok)
 
     def test_non_content_edit_does_not_reopen(self):
@@ -866,7 +922,7 @@ class TestJiraIdentities(unittest.TestCase):
             self.assertNotIn("jiraSharedIdentity", ev.facts)
 
     def test_other_creator_fails(self):
-        ev = self._plan_world(creator=AMAN_J)
+        ev = self._plan_world(creator=OTHER_J)
         self.assertTrue(any(f.startswith("SDLC-03.plan") for f in failed(ev)))
 
     def test_story_type_from_plan(self):
@@ -921,17 +977,37 @@ class TestPolicyJira(unittest.TestCase):
 
     def test_repo_policy_loads(self):
         p = self._load(lambda j: None)
-        self.assertIn(p.jira["sharedAutomationAccount"], p.jira["neverApprovers"])
+        self.assertEqual(p.jira["sharedAutomationAccount"], p.sod_shortcut["jiraAccountId"])
+        self.assertEqual(p.sod_shortcut["label"], SOD)
+        for kind in ("requirementApproval", "approachApproval", "emergencyApproval", "domainApproval"):
+            self.assertEqual(p.jira["humanApprovers"][kind], [SHARED_J])
+        for role in ("releaseApprovers", "controlOwners", "ecab", "techLeads"):
+            self.assertEqual(p.humans(role), [OWNER["login"]])
 
     def test_rejects_bad_jira_blocks(self):
         from soxlib.policy import PolicyError
-        bad = [lambda j: j.update(neverApprovers=[]),
-               lambda j: j["humanApprovers"]["requirementApproval"].append(SHARED_J),
-               lambda j: j["humanApprovers"].update(domainApproval=AMAN_J),
+        bad = [lambda j: j["humanApprovers"]["requirementApproval"].append(OTHER_J) or
+               j.update(neverApprovers=[OTHER_J]),
+               lambda j: j["humanApprovers"].update(domainApproval=OTHER_J),
                lambda j: j["approvalStatuses"].update(requirementApproval="Approved")]
         for m in bad:
             with self.assertRaises(PolicyError):
                 self._load(m)
+
+    def test_shared_account_approver_needs_shortcut(self):
+        from soxlib.policy import PolicyError
+        with open(os.path.join(SOX, "trust-policy.yaml")) as fh:
+            base = json.load(fh)
+        for mutate in (lambda d: d.pop("sodShortcut"),
+                       lambda d: d["sodShortcut"]["waives"].remove("automation-account"),
+                       lambda d: d["sodShortcut"].update(jiraAccountId=OTHER_J),
+                       lambda d: d["sodShortcut"]["waives"].append("approver-list"),
+                       lambda d: d["sodShortcut"].update(label="shortcut"),
+                       lambda d: d["sodShortcut"].update(githubLogin="factory-aman")):
+            d = copy.deepcopy(base)
+            mutate(d)
+            with self.assertRaises(PolicyError):
+                Policy(json.dumps(d).encode())
 
 def golive_policy(at=1000, rotated=False, **mut):
     """Trust policy with test App ids and a goLive block set at T0 + at."""
@@ -1005,13 +1081,13 @@ class TestPairedChecks(unittest.TestCase):
     def test_forged_gate_success_on_open_head_blocks(self):
         w = World()
         w.present_packet(600)
-        w.review(AMAN, "APPROVED", 700)
+        w.review(APPROVER, "APPROVED", 700)
         w.add_gate_success(R1, 750, paired=False)
         ev, _ = w.evaluate(20)
         self.assertEqual(failed(ev), ["CC-02.check-without-evidence:sox/evidence-gate", "SDLC-09.packet"])
         w2 = World()
         w2.present_packet(600)
-        w2.review(AMAN, "APPROVED", 700)
+        w2.review(APPROVER, "APPROVED", 700)
         w2.add_gate_success(R1, 750)
         ev, _ = w2.evaluate(20)
         self.assertTrue(ev.ok, failed(ev))
@@ -1025,7 +1101,7 @@ class TestPairedChecks(unittest.TestCase):
     def test_success_gate_decision_signed_every_run_with_check_id(self):
         w = World()
         w.present_packet(600)
-        w.review(AMAN, "APPROVED", 700)
+        w.review(APPROVER, "APPROVED", 700)
         for cid in (4242, 4243):
             ev, ctx = w.evaluate(20)
             ctx.check_run_id = cid
@@ -1041,7 +1117,7 @@ class TestMergeRecordChecks(unittest.TestCase):
     def _merged(self, paired=True):
         w = World()
         w.present_packet(600)
-        w.review(AMAN, "APPROVED", 700)
+        w.review(APPROVER, "APPROVED", 700)
         w.gate_runs[R1] = [dict(check("sox/evidence-gate", "gate", 650), conclusion="failure")]
         w.add_gate_success(R1, 880, paired=paired)
         w.release_merged = True
@@ -1253,10 +1329,10 @@ class TestGoLiveKeys(unittest.TestCase):
     def test_merge_record_carries_label(self):
         ev, ctx = TestMergeRecordChecks()._merged()
         mr = R.plan_merged(ev, ctx)[0][0].predicate
-        self.assertEqual(mr["labels"], ["app-key-exposed-not-rotated"])
+        self.assertEqual(mr["labels"], ["app-key-exposed-not-rotated", SOD])
         self.assertEqual(mr["outcome"], "recorded")
         ctx.policy.data["goLive"]["appKeyExposure"]["rotated"] = True
-        self.assertEqual(R.plan_merged(ev, ctx)[0][0].predicate["labels"], [])
+        self.assertEqual(R.plan_merged(ev, ctx)[0][0].predicate["labels"], [SOD])
 class TestScopeMapFile(unittest.TestCase):
     def test_repo_services_yaml_loads_and_digest_is_git_blob(self):
         import subprocess
@@ -1336,7 +1412,7 @@ class TestCli(unittest.TestCase):
         w = World()
         w._release = True
         w.present_packet(600)
-        w.review(AMAN, "APPROVED", 700)
+        w.review(APPROVER, "APPROVED", 700)
         rc, api, a = self._run(w)
         self.assertEqual(json.load(open(os.path.join(a.out, "state.json")))["conclusion"], "success")
         moved = w.api()

@@ -502,29 +502,26 @@
   "humans": {
     "$comment": "Logins are pinned to numeric user IDs; a renamed or recreated account does not match.",
     "ids": {
-      "factory-aman": 320644755,
       "factory-riya-bhivare": 351550958,
       "factory-ryan-lauderback": 344896283
     },
     "releaseApprovers": [
-      "factory-aman"
+      "factory-ryan-lauderback"
     ],
     "controlOwners": [
-      "factory-aman"
+      "factory-ryan-lauderback"
     ],
-    "sodShortcut": "sandbox-only: Release Approver and Control Owner are the same person (matrix CC-08)",
+    "sodShortcut": "sandbox-only: Release Approver, Control Owner, ECAB and Tech Lead are one person, who is also the repository owner (Platform Admin); see sodShortcut",
     "developers": [
       "factory-riya-bhivare"
     ],
     "ecab": [
-      "factory-aman"
-    ],
-    "techLeads": [
-      "factory-aman"
-    ],
-    "neverApprovers": [
       "factory-ryan-lauderback"
     ],
+    "techLeads": [
+      "factory-ryan-lauderback"
+    ],
+    "neverApprovers": [],
     "platformAdmins": [
       "factory-ryan-lauderback"
     ]
@@ -555,24 +552,22 @@
       "techLeads": "frq-tech-leads",
       "ecab": "frq-ecab"
     },
-    "$commentIdentities": "Every Jira identity is an Atlassian accountId. Sandbox: one shared automation account (the owner's) acts for every agent role; it never counts as an approval and is in neverApprovers. The gate reads a human approval from the attested changelog: the latest transition to approvalStatuses[type] after the last change to contentFields, by an atlassian account listed in humanApprovers[type], never the reporter or creator. Issues the shared account creates need the acting-role property and the comment prefix and are marked jira-shared-identity.",
+    "$commentIdentities": "Every Jira identity is an Atlassian accountId. Sandbox: one shared automation account (the owner's) acts for every agent role. Under sodShortcut the same account is also the only human approver: its approvals count only through the rules sodShortcut.waives and carry sodShortcut.label. The gate reads a human approval from the attested changelog: the latest transition to approvalStatuses[type] after the last change to contentFields, by an atlassian account listed in humanApprovers[type], not in neverApprovers and not the reporter or creator unless sodShortcut waives it. Issues the shared account creates need the acting-role property and the comment prefix and are marked jira-shared-identity.",
     "sharedAutomationAccount": "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457",
-    "neverApprovers": [
-      "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
-    ],
+    "neverApprovers": [],
     "humanApprovers": {
-      "$comment": "factory-aman. Requirement, approach and ECAB transitions are also restricted to this account in Jira (FRQ-9, FRQ-10); domain approvals are enforced here only.",
+      "$comment": "factory-ryan-lauderback (the shared automation account, sodShortcut). Requirement, approach and ECAB transitions are also restricted in Jira (FRQ-9, FRQ-10); domain approvals are enforced here only.",
       "requirementApproval": [
-        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+        "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
       ],
       "approachApproval": [
-        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+        "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
       ],
       "emergencyApproval": [
-        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+        "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
       ],
       "domainApproval": [
-        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+        "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
       ]
     },
     "approvalStatuses": {
@@ -588,6 +583,19 @@
     ],
     "actingRoleProperty": "sox.actingRole",
     "actingRoleCommentPrefix": "[sox:<role>]"
+  },
+  "sodShortcut": {
+    "$comment": "Demo shortcut (decision 2026-11-17): the repository owner is the sole human approver on GitHub and in Jira, where the same account is the shared automation account. An approval by this identity is accepted only for the rules listed in waives; every other rule still applies, and the approval, its gate-decision and merge-record carry label.",
+    "label": "sod-shortcut-owner-approver",
+    "githubLogin": "factory-ryan-lauderback",
+    "jiraAccountId": "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457",
+    "waives": [
+      "automation-account",
+      "reporter",
+      "creator",
+      "author-pusher",
+      "platform-admin"
+    ]
   },
   "loops": {
     "maxReviewRounds": 10,

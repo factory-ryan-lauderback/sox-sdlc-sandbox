@@ -111,7 +111,8 @@ def gate_decision(ev, forgeries, check_run_id=None):
               "requirementsDigest": requirement_key(ev),
               "policyDigest": ev.policy.digest, "packetDigest": f.get("packetDigest"),
               "packet": f.get("packet") if f.get("packetReady") else None,
-              "forgeryAttempts": sorted({x.get("digest") or "" for x in forgeries} - {""})})
+              "forgeryAttempts": sorted({x.get("digest") or "" for x in forgeries} - {""}),
+              "labels": ev.labels(), "sodWaived": {k: v for k, v in (f.get("sodWaived") or {}).items() if v}})
     return Emission("gate-decision", p, [("commit", ev.pd.head), ("pr", str(ev.pd.number))])
 
 
@@ -149,6 +150,7 @@ def human_approval(ev, review):
     owners = set(ev.policy.humans("controlOwners"))
     login = review["user"]["login"]
     excluded = sorted(l for l, why in (f.get("approvalCandidates") or {}).items() if why != ["ok"])
+    waived = (f.get("sodWaived") or {}).get(f"human-approval:{login}") or []
     p = common(ev, "SDLC-09", "approved", upstream=f["upstream"].values())
     p.update({"reviewer": {"login": login, "id": review["user"]["id"]},
               "reviewId": review["id"], "commitId": review["commit_id"],
@@ -157,7 +159,8 @@ def human_approval(ev, review):
               "packetPresentedAt": f.get("packetPresentedAt"),
               "sod": {"participants": f.get("participants", []),
                       "excluded": sorted(set(ev.policy.humans("neverApprovers")) | set(excluded)),
-                      "result": "pass"},
+                      "waived": waived, "result": "pass"},
+              "labels": list(ev.policy.key_labels) + ([ev.policy.sod_shortcut["label"]] if waived else []),
               "controlChange": ev.control_change()})
     if ev.control_change():
         p["controlOwnerApproval"] = {"login": login, "reviewId": review["id"],
@@ -263,7 +266,7 @@ def merge_record(ev, mirror):
               "mergedAt": pd.pr.get("merged_at"),
               "checks": checks, "checksPaired": paired,
               # Known exceptions (spec 7.6); they relax no check above.
-              "labels": list(ev.policy.key_labels),
+              "labels": ev.labels(),
               "gateAsOfMerge": {"result": "pass" if ev.ok else "fail",
                                 "failed": [r.id for r in ev.reqs if not r.ok],
                                 "requirementsDigest": requirement_key(ev)}})

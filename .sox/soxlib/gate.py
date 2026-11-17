@@ -185,11 +185,12 @@ def _jira_time(s):
         return None
 
 
-def jira_human_approval(policy, pred, kind):
+def jira_human_approval(policy, pred, kind, waived=None):
     """(ok, detail) for a human Jira approval, re-derived from the attested changelog: the latest
     transition into approvalStatuses[kind] after the last change to a content field (a later edit
     reopens the approval), by an atlassian account in humanApprovers[kind] that is not an
-    automation or never-approver account, the reporter, or the creator."""
+    automation or never-approver account, the reporter, or the creator. The sodShortcut account
+    may skip only the rules sodShortcut.waives; the skipped rules are appended to waived."""
     j = policy.jira
     status = (j.get("approvalStatuses") or {}).get(kind)
     allowed = set((j.get("humanApprovers") or {}).get(kind) or [])
@@ -214,17 +215,30 @@ def jira_human_approval(policy, pred, kind):
     h = max(moves, key=lambda h: (_jira_time(h.get("created")), str(h.get("id"))))
     author = h.get("author") or {}
     acct = author.get("accountId")
-    why = []
+    why, skipped = [], []
+
+    def rule(name, broken, reason):
+        if not broken:
+            return
+        if policy.sod_waives(name, jira_account=acct):
+            skipped.append(name)
+        else:
+            why.append(reason)
     if author.get("accountType") != "atlassian":
         why.append(f"author accountType {author.get('accountType')!r} is not atlassian")
-    if acct in set(j.get("neverApprovers") or []) or acct == j.get("sharedAutomationAccount"):
-        why.append("author is an automation identity (jira.neverApprovers)")
+    if acct in set(j.get("neverApprovers") or []):
+        why.append("author is in jira.neverApprovers")
+    rule("automation-account", acct == j.get("sharedAutomationAccount"),
+         "author is the shared automation account")
     if acct not in allowed:
         why.append(f"author is not in jira.humanApprovers.{kind}")
-    if acct in (pred.get("reporter"), pred.get("creator")):
-        why.append("author is the issue's reporter or creator")
+    rule("reporter", acct == pred.get("reporter"), "author is the issue's reporter")
+    rule("creator", acct == pred.get("creator"), "author is the issue's creator")
+    if skipped and not why and waived is not None:
+        waived.extend(skipped)
+    note = f"; waived {skipped} ({policy.sod_shortcut.get('label')})" if skipped and not why else ""
     return not why, (f"changelog entry {h.get('id')} moved to status {status} at {h.get('created')} "
-                     f"by {acct}" + ("; " + "; ".join(why) if why else ""))
+                     f"by {acct}" + ("; " + "; ".join(why) if why else "") + note)
 
 
 def classify(pd, policy):
@@ -397,7 +411,8 @@ class Evaluation:
             self.req(f"SDLC-01.req{t}", "SDLC-01", False,
                      f"missing: requirement-approval {rk} with content digest {rdig}")
         else:
-            a_ok, a_detail = jira_human_approval(pol, ra.predicate, "requirementApproval")
+            a_ok, a_detail = jira_human_approval(pol, ra.predicate, "requirementApproval",
+                                                 self.sod_waived(f"requirement-approval:{rk}"))
             in_order = ra.integrated_time <= pm.integrated_time
             self.req(f"SDLC-01.req{t}", "SDLC-01", a_ok and in_order,
                      f"{rk}: {a_detail}; attested {ra.time_iso}"
@@ -405,7 +420,8 @@ class Evaluation:
         if "risk-high" in (p.get("epicLabels") or []):
             aa = self.get("jira", epic, "approach-approval",
                           where=lambda a: a.predicate.get("planDigest") == p.get("planDigest"))
-            a_ok, a_detail = (jira_human_approval(pol, aa.predicate, "approachApproval") if aa else
+            a_ok, a_detail = (jira_human_approval(pol, aa.predicate, "approachApproval",
+                                                  self.sod_waived(f"approach-approval:{epic}")) if aa else
                               (False, "missing: approach-approval of the current plan digest"))
             self.req(f"SDLC-03b.approach{t}", "SDLC-03", a_ok,
                      f"risk-high epic {epic} needs approach-approval of plan {p.get('planDigest')}: "
@@ -699,7 +715,8 @@ class Evaluation:
             self.facts.update({"emergency": key, "stories": [key]})
             ec = self.get("jira", key, "emergency-change")
             self.use(f"emergency-change:{key}", ec)
-            e_ok, e_detail = (jira_human_approval(pol, ec.predicate, "emergencyApproval") if ec else
+            e_ok, e_detail = (jira_human_approval(pol, ec.predicate, "emergencyApproval",
+                                                  self.sod_waived(f"emergency-change:{key}")) if ec else
                               (False, f"missing: emergency-change for {key}"))
             self.req("CC-04.ecab", "CC-04", e_ok, f"emergency-change {key}: {e_detail}",
                      [ec.digest] if ec else [])
@@ -923,6 +940,18 @@ class Evaluation:
         self.req("LOOP-Q", "LOOP-Q", n < mx, f"{n} heads with a verified failing qa-result"
                  + (" (loop-exhausted)" if n >= mx else ""))
 
+    def sod_waived(self, where):
+        """List to collect the rules the sodShortcut identity skipped for one approval. Any entry
+        stamps the shortcut label on this evaluation's gate-decision and merge-record."""
+        return self.facts.setdefault("sodWaived", {}).setdefault(where, [])
+
+    def labels(self):
+        """Known-exception labels this evaluation carries (spec 7.6 key exposure, sodShortcut)."""
+        out = list(self.policy.key_labels)
+        if any((getattr(self, "facts", None) or {}).get("sodWaived", {}).values()):
+            out.append(self.policy.sod_shortcut.get("label"))
+        return out
+
     def participants(self):
         pd = self.pd
         out = set()
@@ -987,7 +1016,9 @@ class Evaluation:
                 latest[(r.get("user") or {}).get("login")] = r
         approvers = set(pol.humans("releaseApprovers"))
         owners = set(pol.humans("controlOwners"))
-        never = set(pol.humans("neverApprovers")) | set(pol.humans("platformAdmins"))
+        never = set(pol.humans("neverApprovers"))
+        admins = set(pol.humans("platformAdmins"))
+        skipped = {}
         participants = self.participants() | ctx.participants
         self.facts["participants"] = sorted(participants)
         base_changes = [parse_time(e.get("created_at")) for e in pd.timeline
@@ -1010,8 +1041,13 @@ class Evaluation:
                 why.append("not an authorized approver (login and user id)")
             if login in never:
                 why.append("in neverApprovers")
-            if login in participants:
-                why.append("participated in the change")
+            for rule, broken, reason in (("platform-admin", login in admins, "is a Platform Admin"),
+                                         ("author-pusher", login in participants,
+                                          "participated in the change")):
+                if broken and pol.sod_waives(rule, login=login):
+                    skipped.setdefault(login, []).append(rule)
+                elif broken:
+                    why.append(reason)
             if presented_at is None or sub is None or sub <= presented_at:
                 prior = [a for a in older if sub is not None and a.integrated_time < sub]
                 if prior:
@@ -1046,6 +1082,9 @@ class Evaluation:
                   ("" if presented_at else " (packet presented in this evaluation)"))
                  + (f"; outstanding changes requested by {blocking}" if blocking else ""))
         self.facts["approval"] = good[-1] if good else None
+        if good and skipped.get(good[-1]["user"]["login"]):
+            self.sod_waived(f"human-approval:{good[-1]['user']['login']}").extend(
+                skipped[good[-1]["user"]["login"]])
         if self.control_change():
             co = [r for r in good if r["user"]["login"] in owners]
             self.facts["sodShortcut"] = bool(co) and any(r["user"]["login"] in approvers for r in co)
