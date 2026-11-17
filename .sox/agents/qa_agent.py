@@ -21,12 +21,15 @@ Two scopes, both posting `sox/qa-agent` (the bundler merges a story PR only with
 
 The tests run in a job with no App key and no id-token: it checks out the PR head and runs the
 required tests (unit tests and `test_e2e_*` against the environment re-created from the verified
-env-deploy images). The results reach `record` only as a job output. LOOP-Q: rounds are the distinct
+env-deploy images). The results reach `record` only as a job output sealed to a per-run key that only
+env agent-qa can derive (seal.py, red team F18), so they are not readable in a log before they are
+attested. A check run succeeds only on an attestation from the run named in its external_id: for a
+head that already has a qa-result, `open` completes that result's own stale run and posts nothing new,
+and `record`/`finish` never complete this run's check run as success without this run's attestation. LOOP-Q: rounds are the distinct
 heads with a verified failing qa-result for the release (story and release scopes alike, loop key
 release:<slug>); at 10 the release is escalated to a human and no further QA runs.
 """
 import argparse
-import base64
 import gzip
 import hashlib
 import json
@@ -39,6 +42,7 @@ from common import (REPO, GitHub, digest_of, dump_json, load_json, now_utc, posi
                     set_output, sha256_hex, subject_lines)
 import checks  # noqa: E402
 import rounds  # noqa: E402
+import seal  # noqa: E402
 from planning_agent import dir_digest  # noqa: E402
 
 CHECK_NAME = "sox/qa-agent"
@@ -49,6 +53,7 @@ STORY_BRANCH = re.compile(r"^(?:story|qa-fix)/(FRQ-[1-9][0-9]{0,6})-[a-z0-9][a-z
 TEST_ID = re.compile(r"^services\.[a-z0-9_]+(\.[A-Za-z_][A-Za-z0-9_]*){1,4}$")
 PASSED = "passed"
 MAX_TESTS = 300
+SEAL_PURPOSE = "qa-results"
 
 
 def run_id():
@@ -226,13 +231,12 @@ def open_(args):
         p = existing.predicate
         conclusion = "success" if p.get("outcome") == "pass" else "failure"
         mine = [r for r in runs if r["id"] == p.get("checkRunId")]
-        title = f"QA: {p.get('outcome')} (existing verified qa-result)"
-        text = f"Attestation {existing.digest}"
+        # Only the result's own run is paired with its attestation; a new run posted here would carry
+        # this run's ID and no attestation, and would block the head under run-ID pairing.
         if mine and mine[0]["status"] != "completed":
-            checks.complete(app, CHECK_NAME, head, conclusion, title, "A verified qa-result exists for this head.", text,
-                            run_id=p.get("checkRunId"))
-        elif not any(r["status"] == "completed" and r.get("conclusion") == conclusion for r in runs):
-            post(conclusion, title, "A verified qa-result exists for this head; it is re-posted, not re-run.", text)
+            checks.complete(app, CHECK_NAME, head, conclusion, f"QA: {p.get('outcome')} (existing verified qa-result)",
+                            "A verified qa-result exists for this head; its own check run is completed here, not re-run.",
+                            f"Attestation {existing.digest}", run_id=p.get("checkRunId"))
         return done("qa-result already attested for this head")
     state = checks.head_state(runs)
     if state != "none":
@@ -304,13 +308,13 @@ def runtests(args):
     print(f"ran {len(results)} required test(s)")
 
 
-def encode_results(path):
+def encode_results(path, seal_pub):
     raw = json.dumps(load_json(path), sort_keys=True).encode()
-    return base64.b64encode(gzip.compress(raw, mtime=0)).decode()
+    return seal.seal(seal_pub, gzip.compress(raw, mtime=0))
 
 
-def decode_results(b64):
-    return json.loads(gzip.decompress(base64.b64decode(b64, validate=True)))
+def decode_results(sealed, secret):
+    return json.loads(gzip.decompress(seal.unseal(secret, SEAL_PURPOSE, sealed)))
 
 
 # --------------------------------------------------------------------------------------------- record
@@ -355,9 +359,11 @@ def record(args):
         return finish_plan("already completed", "The check run is already completed.")
     existing = rounds.verdict_for_head(head, ctx["baseRef"], predicate="qa-result")
     if existing:
-        plan["conclusion"] = "success" if existing.predicate.get("outcome") == "pass" else "failure"
-        return finish_plan(f"QA: {existing.predicate.get('outcome')} (existing verified qa-result)",
-                           "A verified qa-result already exists for this head; it is not re-tested.", existing.digest)
+        # Another run attested this head after open: never sign a second result. This run's check run
+        # has no attestation of its own, so it cannot be completed as success.
+        return finish_plan(f"QA: {existing.predicate.get('outcome')} (qa-result attested by another run)",
+                           "A verified qa-result for this head was attested by another run while this one was testing. "
+                           "This run signs nothing, so its check run is not evidence and blocks the head.", existing.digest)
     pr = gh.pr(n)
     if pr["head"]["sha"] != head:
         return finish_plan("Superseded", "The release head moved during QA; the new head gets its own QA run.")
@@ -376,7 +382,7 @@ def record(args):
                            "after this head was opened for QA (environment or runner failure). No qa-result is signed; "
                            "the head is blocked until a new head is tested.")
     try:
-        results = decode_results(os.environ.get("RESULTS_B64") or "")
+        results = decode_results(os.environ.get("RESULTS_SEALED") or "", os.environ.get("SEAL_SECRET"))
         assert isinstance(results, list) and all(isinstance(r, dict) and isinstance(r.get("id"), str) for r in results)
     except Exception:
         return finish_plan("QA results unreadable", "The test job's results could not be decoded; no qa-result is signed.")
@@ -449,7 +455,9 @@ def finish(args):
                 "summary": "The QA run failed or was cancelled after this head was opened. This head is blocked; "
                            "a new head on the release branch gets a fresh QA run.", "details": ""}
     conclusion, details = plan["conclusion"], plan.get("details", "")
-    if plan.get("attest"):
+    if not plan.get("attest"):
+        conclusion = "failure"  # success needs this run's attestation (run-ID pairing)
+    else:
         if os.environ.get("ATTEST_OUTCOME") != "success" or not os.environ.get("ATTESTATION_URL"):
             conclusion, plan["title"] = "failure", "Attestation failed"
             plan["summary"] = "The qa-result attestation was not created, so the result is not evidence."
@@ -472,7 +480,7 @@ def main():
     f = sub.add_parser("finish"); f.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.cmd == "encode":
-        return set_output("results", encode_results(args.results))
+        return set_output("results", encode_results(args.results, os.environ.get("SEAL_PUB")))
     {"select": select, "open": open_, "runtests": runtests, "record": record, "finish": finish}[args.cmd](args)
 
 

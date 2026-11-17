@@ -5,7 +5,8 @@ name: sox-jira-read
 # output `digest` = "sha256:<hex>" of its exact bytes. A key-holding consumer that binds Jira facts
 # must check the artifact against `digest` from this job in the same run (or re-read Jira itself).
 # Callers: `uses: ./.github/workflows/sox-jira-read.yml` with `permissions: contents: read` and
-# `secrets: { JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }} }` (resolved from env jira-attestor here).
+# `secrets: { JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}, SOX_JIRA_EMAIL: ${{ secrets.SOX_JIRA_EMAIL }} }`
+# (resolved from env jira-attestor here).
 on:
   workflow_call:
     inputs:
@@ -26,6 +27,8 @@ on:
       # An environment secret reaches a reusable workflow only if the caller passes it by name; the
       # value used is still the one in env jira-attestor (main only).
       JIRA_API_TOKEN:
+        required: false
+      SOX_JIRA_EMAIL:
         required: false
     outputs:
       digest:
@@ -52,7 +55,7 @@ jobs:
       - id: snap
         env:
           SOX_JIRA_BACKEND: cloud
-          SOX_JIRA_EMAIL: ${{ vars.SOX_JIRA_EMAIL }}
+          SOX_JIRA_EMAIL: ${{ secrets.SOX_JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           PRESET: ${{ inputs.preset }}
           KEYS: ${{ inputs.keys }}

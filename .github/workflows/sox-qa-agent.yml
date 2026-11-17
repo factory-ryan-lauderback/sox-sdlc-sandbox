@@ -8,6 +8,8 @@ name: sox-qa-agent
 #      this run's ID, before any test runs; LOOP-Q exhaustion escalates instead)
 #   -> test (no App key, no id-token: re-creates the environment from the env-deploy image digests
 #      with the controls from main, then runs the required tests from the release head checkout)
+#      The results travel to record only sealed to a per-run public key from open (F18: step env is
+#      printed in the public log; only env agent-qa can derive the private key).
 #   -> record (env agent-qa: re-derives everything it signs, attests qa-result, then completes the
 #      check run with the attested outcome; any other ending completes it as failure)
 #   -> jira (sox-jira-write.yml, role qa)
@@ -83,6 +85,7 @@ jobs:
     outputs:
       mode: ${{ steps.open.outputs.mode }}
       check_run_id: ${{ steps.open.outputs.check_run_id }}
+      seal_pub: ${{ steps.seal.outputs.seal_pub }}
     steps:
       - name: Refuse to run outside main
         run: test "$GITHUB_REF" = "refs/heads/main"
@@ -99,6 +102,12 @@ jobs:
         with:
           app-id: ${{ vars.QA_APP_ID }}
           private-key: ${{ secrets.QA_APP_PRIVATE_KEY }}
+      # Public key for sealing the results; the private key is re-derived only in `record`. Before
+      # `open`, so a failure here cannot leave an opened check run behind.
+      - id: seal
+        env:
+          SEAL_SECRET: ${{ secrets.QA_APP_PRIVATE_KEY }}
+        run: python3 .sox/agents/seal.py pubkey --purpose qa-results
       - id: open
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -167,6 +176,8 @@ jobs:
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
           timeout 1500 python3 "$GITHUB_WORKSPACE/.sox/agents/qa_agent.py" runtests --ids "$RUNNER_TEMP/ctx/required-tests.json" --out "$RUNNER_TEMP/results.json"
       - id: enc
+        env:
+          SEAL_PUB: ${{ needs.open.outputs.seal_pub }}
         run: python3 .sox/agents/qa_agent.py encode --results "$RUNNER_TEMP/results.json"
 
   # Key-holding: QA App token, id-token, attestations. Checks out main only; never runs release code.
@@ -206,7 +217,8 @@ jobs:
           CONTEXT_DIGEST: ${{ needs.select.outputs.context_digest }}
           CHECK_RUN_ID: ${{ needs.open.outputs.check_run_id }}
           TEST_RESULT: ${{ needs.test.result }}
-          RESULTS_B64: ${{ needs.test.outputs.results }}
+          RESULTS_SEALED: ${{ needs.test.outputs.results }}
+          SEAL_SECRET: ${{ secrets.QA_APP_PRIVATE_KEY }}
         run: python3 .sox/agents/qa_agent.py record --ctx "$RUNNER_TEMP/ctx" --out "$RUNNER_TEMP/out"
       - id: attest1
         if: steps.rec.outputs.attest == 'true'
@@ -258,6 +270,7 @@ jobs:
     uses: ./.github/workflows/sox-jira-write.yml
     secrets:
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      SOX_JIRA_EMAIL: ${{ secrets.SOX_JIRA_EMAIL }}
     with:
       role: qa
       artifact-pattern: jira-ops-qa-*

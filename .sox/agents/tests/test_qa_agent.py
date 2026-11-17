@@ -13,6 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(HERE, "..", ".."))
 import qa_agent  # noqa: E402
+import seal  # noqa: E402
 from planning_agent import dir_digest  # noqa: E402
 from soxlib import gate  # noqa: E402
 
@@ -24,6 +25,14 @@ REQ = ["services.api.test_e2e_pay.PayE2E.test_pay", "services.api.test_app.T.tes
 PR = {"number": 12, "state": "open", "draft": False, "head": {"sha": HEAD, "ref": f"release/{SLUG}",
       "repo": {"full_name": qa_agent.REPO, "owner": {"login": qa_agent.REPO.split("/")[0]}}},
       "base": {"sha": BASE, "ref": "main"}}
+SECRET = "-----BEGIN RSA PRIVATE KEY-----\nqa-test\n-----END RSA PRIVATE KEY-----\n"
+
+
+def sealed_results(path, run="4321", secret=SECRET):
+    with mock.patch.dict(os.environ, {"GITHUB_RUN_ID": run}):
+        return qa_agent.encode_results(path, seal.public_key(secret, qa_agent.SEAL_PURPOSE))
+
+
 STORY_PR = {**PR, "number": 13, "head": {**PR["head"], "ref": "story/FRQ-2-payoff-quote"}, "base": {"sha": BASE, "ref": f"release/{SLUG}"}}
 
 
@@ -188,12 +197,24 @@ class OpenTest(unittest.TestCase):
         start.assert_not_called()
         self.assertEqual(o["mode"], "done")
 
-    def test_existing_qa_result_reposted_not_retested(self):
+    def test_existing_qa_result_heals_its_own_run_not_retested(self):
         ex = mock.Mock(predicate={"outcome": "fail", "checkRunId": 5}, digest="sha256:x")
         start, complete, o, _ = do_open(runs=[{"id": 5, "status": "in_progress"}], existing=ex)
         start.assert_not_called()
+        complete.assert_called_once()
         self.assertEqual((complete.call_args.args[3], complete.call_args.kwargs.get("run_id")), ("failure", 5))
+        self.assertIsNone(complete.call_args.kwargs.get("external_id"))
         self.assertEqual(o["mode"], "done")
+
+    def test_existing_qa_result_posts_no_unpaired_run(self):
+        # A new run would carry this run's ID without an attestation from it and block the head.
+        for outcome in ("pass", "fail"):
+            ex = mock.Mock(predicate={"outcome": outcome, "checkRunId": 5}, digest="sha256:x")
+            for runs in ([], [{"id": 5, "status": "completed", "conclusion": "success"}],
+                         [{"id": 6, "status": "in_progress"}]):
+                start, complete, o, _ = do_open(runs=runs, existing=ex)
+                start.assert_not_called(); complete.assert_not_called()
+                self.assertEqual(o["mode"], "done", (outcome, runs))
 
     def test_loop_q_exhausted_escalates(self):
         start, complete, o, out = do_open(prior=[str(i) * 40 for i in range(10)])
@@ -242,7 +263,22 @@ class RunTestsTest(unittest.TestCase):
     def test_encode_roundtrip(self):
         f = tempfile.mktemp()
         json.dump([{"id": "x", "status": "passed"}], open(f, "w"))
-        self.assertEqual(qa_agent.decode_results(qa_agent.encode_results(f)), [{"id": "x", "status": "passed"}])
+        with mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "4321"}):
+            got = qa_agent.decode_results(sealed_results(f), SECRET)
+        self.assertEqual(got, [{"id": "x", "status": "passed"}])
+
+    def test_encoded_results_are_not_readable(self):
+        f = tempfile.mktemp()
+        json.dump([{"id": "services.api.test_app.T.test_unit", "status": "passed"}], open(f, "w"))
+        out = sealed_results(f)
+        self.assertTrue(out.startswith(seal.PREFIX))
+        import base64, gzip  # noqa: E401
+        raw = base64.b64decode(out[len(seal.PREFIX):])
+        self.assertNotIn(b"test_unit", raw)
+        with self.assertRaises(Exception):
+            gzip.decompress(raw)
+        with self.assertRaises(ValueError):
+            qa_agent.encode_results(f, "")
 
 
 def do_record(statuses=None, result="success", existing=None, status="in_progress", head_moved=False,
@@ -251,12 +287,12 @@ def do_record(statuses=None, result="success", existing=None, status="in_progres
     statuses = statuses if statuses is not None else {t: "passed" for t in REQ}
     f = tempfile.mktemp()
     json.dump([{"id": k, "status": v} for k, v in statuses.items()], open(f, "w"))
-    b64 = qa_agent.encode_results(f) if results_b64 is None else results_b64
+    b64 = sealed_results(f) if results_b64 is None else results_b64
     pr = {**pr, "head": {**pr["head"], "sha": "c" * 40}} if head_moved else pr
     gh = fake_gh({"id": 9, "app": {"id": APP}, "head_sha": HEAD, "name": qa_agent.CHECK_NAME, "status": status}, pr=pr)
     out = tempfile.mkdtemp()
-    env = {"CONTEXT_DIGEST": digest, "CHECK_RUN_ID": "9", "TEST_RESULT": result, "RESULTS_B64": b64,
-           "GITHUB_SHA": "d" * 40}
+    env = {"CONTEXT_DIGEST": digest, "CHECK_RUN_ID": "9", "TEST_RESULT": result, "RESULTS_SEALED": b64,
+           "SEAL_SECRET": SECRET, "GITHUB_SHA": "d" * 40}
     with patched(gh, fetch=fetch, existing=existing, prior=prior, env=env):
         qa_agent.record(mock.Mock(ctx=ctx, out=out))
     load = lambda n: json.load(open(f"{out}/{n}")) if os.path.exists(f"{out}/{n}") else None  # noqa: E731
@@ -319,16 +355,23 @@ class RecordTest(unittest.TestCase):
             self.assertIsNone(pred)
 
     def test_unreadable_results_sign_nothing(self):
-        for b in ("not base64!", "aGVsbG8="):
+        f = tempfile.mktemp()
+        json.dump([{"id": t, "status": "passed"} for t in REQ], open(f, "w"))
+        import base64, gzip  # noqa: E401
+        plain = base64.b64encode(gzip.compress(json.dumps(json.load(open(f))).encode())).decode()
+        # Garbage, the old unsealed encoding, and results sealed to another run's or another key's key.
+        for b in ("not base64!", "aGVsbG8=", plain, seal.PREFIX + plain, sealed_results(f, run="999"),
+                  sealed_results(f, secret="other")):
             plan, pred, _, _ = do_record(results_b64=b)
-            self.assertEqual((plan["attest"], plan["conclusion"]), (False, "failure"))
+            self.assertEqual((plan["attest"], plan["conclusion"], plan["title"]), (False, "failure", "QA results unreadable"))
 
     def test_changed_env_or_moved_head_signs_nothing(self):
         ctx, digest = ctxdir()
         gh, out = fake_gh(), tempfile.mkdtemp()
         f = tempfile.mktemp()
         json.dump([{"id": t, "status": "passed"} for t in REQ], open(f, "w"))
-        env = {"CONTEXT_DIGEST": digest, "CHECK_RUN_ID": "9", "TEST_RESULT": "success", "RESULTS_B64": qa_agent.encode_results(f)}
+        env = {"CONTEXT_DIGEST": digest, "CHECK_RUN_ID": "9", "TEST_RESULT": "success", "RESULTS_SEALED": sealed_results(f),
+               "SEAL_SECRET": SECRET}
         with patched(gh, fetch=make_fetch(envs=[env_att(digest="sha256:" + "4" * 64, t=9)]), env=env):
             qa_agent.record(mock.Mock(ctx=ctx, out=out))
         plan = json.load(open(f"{out}/plan.json"))
@@ -337,10 +380,12 @@ class RecordTest(unittest.TestCase):
         self.assertEqual((plan["attest"], plan["title"]), (False, "Superseded"))
 
     def test_existing_result_never_resigned(self):
-        ex = mock.Mock(predicate={"outcome": "fail"}, digest="sha256:x")
-        plan, pred, _, _ = do_record(existing=ex)
-        self.assertEqual((plan["attest"], plan["conclusion"]), (False, "failure"))
-        self.assertIsNone(pred)
+        # Even an existing pass: this run's check run has no attestation from this run.
+        for outcome in ("fail", "pass"):
+            ex = mock.Mock(predicate={"outcome": outcome}, digest="sha256:x")
+            plan, pred, _, _ = do_record(existing=ex)
+            self.assertEqual((plan["attest"], plan["conclusion"]), (False, "failure"), outcome)
+            self.assertIsNone(pred)
 
     def test_completed_run_left_alone(self):
         plan, _, _, _ = do_record(status="completed")
@@ -388,9 +433,10 @@ class FinishTest(unittest.TestCase):
         self.assertEqual(c.call_args.args[3], "success")
         self.assertIn("https://x", c.call_args.args[6])
 
-    def test_existing_verified_pass_is_reposted(self):
-        c = self._finish({"attest": False, "conclusion": "success", "title": "t", "summary": ""}, {})
-        self.assertEqual(c.call_args.args[3], "success")
+    def test_unattested_plan_never_succeeds(self):
+        for env in ({}, {"ATTEST_OUTCOME": "success", "ATTESTATION_URL": "https://x"}):
+            c = self._finish({"attest": False, "conclusion": "success", "title": "t", "summary": ""}, env)
+            self.assertEqual((c.call_args.args[3], c.call_args.kwargs["run_id"]), ("failure", 9))
 
     def test_completed_untouched(self):
         c = self._finish({"attest": True, "conclusion": "success", "title": "t", "summary": ""},
