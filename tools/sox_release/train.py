@@ -45,53 +45,56 @@ def check_predicates(policy):
 
 
 def unpaired_checks(fetch, mr_pred, pr_number, head, policy):
-    """Problems with merge-record.checks[]: every required check must appear once, from its pinned
-    App, as a paired success, and the paired attestation must verify and match the check run
-    (certificate run ID = externalId, checkRunId, headSha, outcome)."""
+    """Problems with merge-record.checks[]: every required check must appear, every entry must come
+    from its pinned App as a paired success, and each paired attestation must verify and match its
+    check run (certificate run ID = externalId, checkRunId, headSha, outcome). The gate records every
+    agent check run on the merged head, so a check may have several entries; all of them must pass."""
     problems, apps, preds = [], policy.get("apps") or {}, check_predicates(policy)
     recorded = [c for c in mr_pred.get("checks") or [] if isinstance(c, dict)]
     required = {n: r for n, r in (policy.get("requiredChecks") or {}).items() if not n.startswith("$")}
     if not required:
         return [f"PR #{pr_number}: trust policy lists no required checks"]
+    if mr_pred.get("checksPaired") is not True:
+        problems.append(f"PR #{pr_number}: merge-record checksPaired is not true (check-without-evidence)")
     for name, role in sorted(required.items()):
         tag = f"PR #{pr_number} {name}"
         entries = [c for c in recorded if c.get("name") == name]
-        if len(entries) != 1:
-            problems.append(f"{tag}: {len(entries)} entries in merge-record.checks (need exactly 1)")
+        if not entries:
+            problems.append(f"{tag}: no entry in merge-record.checks")
             continue
-        c = entries[0]
         app_id = (apps.get(role) or {}).get("id")
         if not isinstance(app_id, int):
             problems.append(f"{tag}: App id for role {role} not set in the trust policy")
             continue
-        if c.get("appId") != app_id:
-            problems.append(f"{tag}: check posted by App {c.get('appId')}, pinned App is {app_id}")
-            continue
-        if (c.get("paired") is not True or c.get("conclusion") != "success" or not isinstance(c.get("checkRunId"), int)
-                or not str(c.get("externalId") or "").isdigit() or not c.get("pairedAttestation")):
-            problems.append(f"{tag}: unpaired or not a success in merge-record (check-without-evidence)")
-            continue
-        pred = preds.get(name)
-        if pred not in CHECK_OUTCOME:
-            problems.append(f"{tag}: no pairing predicate known for this check")
-            continue
-        field, want = CHECK_OUTCOME[pred]
-        try:
-            items = fetch(f"commit:{head}", pred)
-            match = [i for i in items if i.get("digest") == c["pairedAttestation"]]
-            if not match:
-                match = [i for i in fetch(f"pr:{pr_number}", pred) if i.get("digest") == c["pairedAttestation"]]
-        except evidence.EvidenceUnavailable as e:
-            problems.append(f"{tag}: verifier unavailable: {e}")
-            continue
-        if not match:
-            problems.append(f"{tag}: paired attestation {c['pairedAttestation']} is not a verified {pred}")
-            continue
-        p, run = match[0]["predicate"], RUN_URI.match(match[0].get("run") or "")
-        if not (p.get("checkRunId") == c["checkRunId"] and p.get("headSha") == head and p.get(field) == want
-                and run and run.group(1) == str(c["externalId"])):
-            problems.append(f"{tag}: paired {pred} does not match the check run (run, checkRunId, head or outcome)")
+        for c in entries:
+            problems += _check_entry_problems(fetch, c, tag, app_id, preds.get(name), pr_number, head)
     return problems
+
+
+def _check_entry_problems(fetch, c, tag, app_id, pred, pr_number, head):
+    tag = f"{tag} run {c.get('checkRunId')}"
+    if c.get("appId") != app_id:
+        return [f"{tag}: check posted by App {c.get('appId')}, pinned App is {app_id}"]
+    if (c.get("paired") is not True or c.get("conclusion") != "success" or not isinstance(c.get("checkRunId"), int)
+            or not str(c.get("externalId") or "").isdigit() or not c.get("pairedAttestation")):
+        return [f"{tag}: unpaired or not a success in merge-record (check-without-evidence)"]
+    if pred not in CHECK_OUTCOME:
+        return [f"{tag}: no pairing predicate known for this check"]
+    field, want = CHECK_OUTCOME[pred]
+    try:
+        match = [i for i in fetch(f"commit:{head}", pred) if i.get("digest") == c["pairedAttestation"]]
+        if not match:
+            match = [i for i in fetch(f"pr:{pr_number}", pred) if i.get("digest") == c["pairedAttestation"]]
+    except evidence.EvidenceUnavailable as e:
+        return [f"{tag}: verifier unavailable: {e}"]
+    if not match:
+        return [f"{tag}: paired attestation {c['pairedAttestation']} is not a verified {pred}"]
+    p, run = match[0]["predicate"], RUN_URI.match(match[0].get("run") or "")
+    if not (p.get("checkRunId") == c["checkRunId"] and p.get("headSha") == head and p.get(field) == want
+            and (pred != "review-verdict" or p.get("outcome", "pass") == "pass")
+            and run and run.group(1) == str(c["externalId"])):
+        return [f"{tag}: paired {pred} does not match the check run (run, checkRunId, head or outcome)"]
+    return []
 
 
 def train_dates(today, days=LOOKBACK_DAYS):
@@ -191,11 +194,20 @@ def release_for_commit(gh, fetch, sha, svc, policy):
            "emergencyChange": ec and ec.get("digest"), "ecabApprover": ec and ec["predicate"].get("ecabApprover"),
            "jiraKeys": sorted(set((mr or {}).get("predicate", {}).get("jiraKeys") or [])
                               | set((ha or {}).get("predicate", {}).get("jiraKeys") or []) | ({hm.group(1)} if hm else set()))}
+    # Known exceptions the gate attached to the evidence (e.g. app-key exposure, owner approver).
+    labels = set()
+    for a in (mr, ha):
+        labels.update(x for x in ((a or {}).get("predicate", {}).get("labels") or []) if isinstance(x, str))
+    if labels:
+        rec["labels"] = sorted(labels)
     # Sandbox demo shortcut: the repository owner, whose credentials agent machines also hold, may
     # approve. Such an approval is asserted, not proven, so the plan labels it for the auditor.
-    owners = {policy.get("owner")} | set((policy.get("humans") or {}).get("platformAdmins") or [])
-    if owners & {rec["humanApprover"], rec["ecabApprover"]} - {None}:
-        rec["sodShortcuts"] = ["sod-shortcut-owner-approver"]
+    shortcut = policy.get("sodShortcut") if isinstance(policy.get("sodShortcut"), dict) else {}
+    label = shortcut.get("label") or "sod-shortcut-owner-approver"
+    owners = ({policy.get("owner"), shortcut.get("githubLogin")}
+              | set((policy.get("humans") or {}).get("platformAdmins") or [])) - {None}
+    if owners & {rec["humanApprover"], rec["ecabApprover"]} or label in labels:
+        rec["sodShortcuts"] = [label]
     return rec, problems
 
 
