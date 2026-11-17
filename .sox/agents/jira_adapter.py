@@ -34,6 +34,9 @@ STATUS_IDS = {
 }
 STATUSES = list(STATUS_IDS)
 HUMAN_ONLY = {"Approved", "Approach Approved", "ECAB Approved"}
+# Re-plan by a human Tech Lead resets LOOP-R. Under the owner-approver shortcut a human's transition and
+# an agent's carry the same Jira account, so agents must never make it.
+AGENT_REFUSED = HUMAN_ONLY | {"Re-plan"}
 TYPES = ("Requirement", "Epic", "Story", "Task", "Bug")
 # Until the "Requirement" work type exists, a requirement is a Story carrying this label.
 REQUIREMENT_LABEL = "sox-requirement"
@@ -44,7 +47,8 @@ ROLE_PROPERTY = "sox.actingRole"
 ROLES = ("intake", "pm", "techlead", "review", "dev", "qa", "attestor", "bundler")
 # FileJira authors (asserted). Cloud authorship is always the token's account.
 ROLE_ACCOUNTS = {r: f"svc-{r}-agent" for r in ROLES} | {"attestor": "svc-jira-attestor", "bundler": "svc-release-bundler"}
-FAKE_HUMANS = {"factory-aman": "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"}
+FAKE_HUMANS = {"factory-aman": "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd",
+               "factory-ryan-lauderback": AUTOMATION_ACCOUNT}
 
 
 def _now():
@@ -124,8 +128,8 @@ class JiraAdapter:
     def _check_transition(self, to_status, actor):
         if to_status not in STATUS_IDS:
             raise JiraError(f"unknown status {to_status!r}")
-        if actor.role and to_status in HUMAN_ONLY:
-            raise JiraError(f"{to_status!r} is a human-only approval; agents cannot perform it")
+        if actor.role and to_status in AGENT_REFUSED:
+            raise JiraError(f"{to_status!r} is a human-only transition; agents cannot perform it")
 
 
 def _person_fake(name):

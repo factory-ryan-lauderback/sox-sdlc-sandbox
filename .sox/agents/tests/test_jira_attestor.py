@@ -1,4 +1,6 @@
 """sox-jira-attestor predicates, checked with the Gates' own rules (soxlib.gate)."""
+import contextlib
+import copy
 import itertools
 import json
 import os
@@ -17,10 +19,31 @@ import jira_adapter as ja  # noqa: E402
 import jira_attestor as att  # noqa: E402
 from soxlib import gate  # noqa: E402
 from soxlib.policy import Policy  # noqa: E402
+from common import TRUST_POLICY, load_json, sod_shortcut  # noqa: E402
 
 POLICY = Policy.load(os.path.join(SOX, "trust-policy.yaml"))
 AMAN = "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
 AUTOMATION = "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
+RAW_POLICY = load_json(TRUST_POLICY)
+_SC = sod_shortcut(RAW_POLICY)
+# The approving human the real trust policy names: the owner-approver shortcut once it is declared.
+HUMAN, HUMAN_ID = (_SC["githubLogin"], _SC["jiraAccountId"]) if _SC else ("factory-aman", AMAN)
+SHORTCUT = {"label": "sod-shortcut-owner-approver", "githubLogin": "factory-ryan-lauderback", "jiraAccountId": AUTOMATION,
+            "waives": ["automation-account", "reporter", "creator", "author-pusher"]}
+
+
+@contextlib.contextmanager
+def shortcut_policy(**over):
+    """The real trust policy with the owner-approver shortcut declared (and its login a Tech Lead)."""
+    pol = copy.deepcopy(RAW_POLICY)
+    pol["sodShortcut"] = {**SHORTCUT, **over}
+    humans = pol.setdefault("humans", {})
+    humans["techLeads"] = sorted(set(humans.get("techLeads") or []) | {pol["sodShortcut"]["githubLogin"]})
+    path = os.path.join(tempfile.mkdtemp(), "trust-policy.yaml")
+    with open(path, "w") as f:
+        json.dump(pol, f)
+    with mock.patch.dict(os.environ, {"SOX_TRUST_POLICY": path}):
+        yield pol
 
 
 class FakeAtt:
@@ -71,10 +94,10 @@ class Chain(unittest.TestCase):
     def test_requirement_approval_by_human_passes_gate_rule(self):
         key = self.requirement()
         self.assertEqual(att.build(self.j, "requirement-approval", key, "", self.lk)[0], None)
-        self.j.transition(key, "Approved", "factory-aman")
+        self.j.transition(key, "Approved", HUMAN)
         a = self.sign("requirement-approval", key)
         p = a.predicate
-        self.assertEqual((p["approver"], p["reporter"], p["creator"], p["step"]), (AMAN, "svc-intake-agent", "svc-intake-agent", "SDLC-01"))
+        self.assertEqual((p["approver"], p["reporter"], p["creator"], p["step"]), (HUMAN_ID, "svc-intake-agent", "svc-intake-agent", "SDLC-01"))
         self.assertEqual(p["changelog"], self.j.changelog(key))
         ok, detail = gate.jira_human_approval(POLICY, p, "requirementApproval")
         self.assertTrue(ok, detail)
@@ -83,12 +106,12 @@ class Chain(unittest.TestCase):
 
     def test_edit_after_approval_reopens_it(self):
         key = self.requirement()
-        self.j.transition(key, "Approved", "factory-aman")
+        self.j.transition(key, "Approved", HUMAN)
         self.sign("requirement-approval", key)
         self.j.update(key, "intake", description="changed scope")
         self.assertIsNone(att.build(self.j, "requirement-approval", key, "", self.lk)[0])
         self.j.transition(key, "Spec Review", "intake")
-        self.j.transition(key, "Approved", "factory-aman")
+        self.j.transition(key, "Approved", HUMAN)
         a = self.sign("requirement-approval", key)
         self.assertTrue(gate.jira_human_approval(POLICY, a.predicate, "requirementApproval")[0])
 
@@ -100,7 +123,7 @@ class Chain(unittest.TestCase):
 
     def full_chain(self):
         req = self.requirement()
-        self.j.transition(req, "Approved", "factory-aman")
+        self.j.transition(req, "Approved", HUMAN)
         ra = self.sign("requirement-approval", req)
         _, refs = ja.apply_ops(self.j, [
             {"op": "create", "ref": "e", "type": "Epic", "summary": "Payoff quote", "fields": {"requirementKey": req, "idempotencyKey": "pm:x"}},
@@ -156,7 +179,7 @@ class Chain(unittest.TestCase):
 
     def test_approach_approval_binds_current_plan(self):
         req, epic, refs, ra, pm, tp = self.full_chain()
-        self.j.transition(epic, "Approach Approved", "factory-aman")
+        self.j.transition(epic, "Approach Approved", HUMAN)
         aa = self.sign("approach-approval", epic)
         p = aa.predicate
         self.assertEqual((p["planDigest"], p["upstream"]), (tp.predicate["planDigest"], [tp.digest]))
@@ -172,27 +195,52 @@ class Chain(unittest.TestCase):
         self.assertFalse(gate.jira_human_approval(POLICY, p_now, "approachApproval")[0])
 
     def test_human_replan_is_recorded_once_for_the_loop_reset(self):
-        req, epic, refs, ra, pm, tp = self.full_chain()
-        tp.integrated_time = att._time(ja._now())
-        s1 = refs["s1"]
-        ja.apply_ops(self.j, [{"op": "transition", "key": s1, "to": "Blocked - Human Escalation"}], "review")
-        ja.apply_ops(self.j, [{"op": "transition", "key": s1, "to": "Re-plan"}], "techlead")
-        self.assertIsNone(att.build(self.j, "techlead-plan", epic, "", self.lk)[0], "an agent's Re-plan is not a reset")
-        self.j.transition(s1, "Blocked - Human Escalation", "review")
-        self.j.transition(s1, "Re-plan", "factory-aman")
-        tp2 = self.sign("techlead-plan", epic)
-        p = tp2.predicate
-        self.assertEqual((p["replanApprovedBy"], p["replanApproval"]["issueKey"], p["replanApproval"]["accountId"]),
-                         ("factory-aman", s1, AMAN))
-        self.assertIn(p["replanApprovedBy"], POLICY.humans("techLeads"))
-        tp2.integrated_time = att._time(ja._now())
-        self.assertIsNone(att.build(self.j, "techlead-plan", epic, "", self.lk)[0], "recorded once")
-        ja.apply_ops(self.j, [{"op": "attach", "key": epic, "filename": "plan.md", "content": "# plan v2"}], "techlead")
-        self.assertNotIn("replanApprovedBy", self.sign("techlead-plan", epic).predicate)
+        with shortcut_policy() as pol:
+            req, epic, refs, ra, pm, tp = self.full_chain()
+            tp.integrated_time = att._time(ja._now())
+            s1 = refs["s1"]
+            ja.apply_ops(self.j, [{"op": "transition", "key": s1, "to": "Blocked - Human Escalation"}], "review")
+            with self.assertRaises(ja.JiraError):  # an agent's Re-plan would look like the human's
+                ja.apply_ops(self.j, [{"op": "transition", "key": s1, "to": "Re-plan"}], "techlead")
+            self.j.transition(s1, "Re-plan", "factory-aman")  # a human who is not a mapped Tech Lead
+            self.assertIsNone(att.build(self.j, "techlead-plan", epic, "", self.lk)[0], "not a Tech Lead's Re-plan")
+            self.j.transition(s1, "Blocked - Human Escalation", "review")
+            self.j.transition(s1, "Re-plan", "factory-ryan-lauderback")
+            tp2 = self.sign("techlead-plan", epic)
+            p = tp2.predicate
+            self.assertEqual((p["replanApprovedBy"], p["replanApproval"]["issueKey"], p["replanApproval"]["accountId"],
+                              p["replanApproval"]["sodShortcut"]),
+                             ("factory-ryan-lauderback", s1, AUTOMATION, "sod-shortcut-owner-approver"))
+            self.assertIn(p["replanApprovedBy"], pol["humans"]["techLeads"])
+            tp2.integrated_time = att._time(ja._now())
+            self.assertIsNone(att.build(self.j, "techlead-plan", epic, "", self.lk)[0], "recorded once")
+            ja.apply_ops(self.j, [{"op": "attach", "key": epic, "filename": "plan.md", "content": "# plan v2"}], "techlead")
+            self.assertNotIn("replanApprovedBy", self.sign("techlead-plan", epic).predicate)
+
+    def test_shortcut_approval_is_labelled(self):
+        with shortcut_policy():
+            key = self.requirement()
+            self.j.transition(key, "Approved", "factory-ryan-lauderback")
+            p = self.sign("requirement-approval", key).predicate
+            self.assertEqual((p["approver"], p["sodShortcut"]), (AUTOMATION, "sod-shortcut-owner-approver"))
+            k2 = self.requirement()
+            self.j.transition(k2, "Approved", "factory-aman")
+            self.assertNotIn("sodShortcut", self.sign("requirement-approval", k2).predicate)
+        key = self.requirement()
+        self.j.transition(key, "Approved", "factory-ryan-lauderback")
+        with mock.patch.dict(os.environ, {"SOX_TRUST_POLICY": self._policy_without_shortcut()}):
+            self.assertNotIn("sodShortcut", self.sign("requirement-approval", key).predicate)
+
+    def _policy_without_shortcut(self):
+        pol = copy.deepcopy(RAW_POLICY)
+        pol.pop("sodShortcut", None)
+        path = os.path.join(tempfile.mkdtemp(), "p.json")
+        json.dump(pol, open(path, "w"))
+        return path
 
     def test_agents_cannot_approve(self):
         req = self.requirement()
-        for s in ("Approved", "Approach Approved", "ECAB Approved"):
+        for s in ("Approved", "Approach Approved", "ECAB Approved", "Re-plan"):
             with self.assertRaises(ja.JiraError):
                 ja.apply_ops(self.j, [{"op": "transition", "key": req, "to": s}], "techlead")
 
@@ -213,9 +261,9 @@ class Chain(unittest.TestCase):
 
     def test_emergency_change(self):
         k = self.j.create("Story", "hotfix", "fix", "intake", labels=["hotfix"])
-        self.j.transition(k, "ECAB Approved", "factory-aman")
+        self.j.transition(k, "ECAB Approved", HUMAN)
         p = self.sign("emergency-change", k).predicate
-        self.assertEqual(p["ecabApprover"], AMAN)
+        self.assertEqual(p["ecabApprover"], HUMAN_ID)
         self.assertTrue(gate.jira_human_approval(POLICY, p, "emergencyApproval")[0])
 
     def test_candidates_are_hints_only(self):
@@ -226,11 +274,26 @@ class Chain(unittest.TestCase):
         self.assertTrue(all(set(c) == {"kind", "key", "release"} for c in att.candidates(self.j)))
 
 
+class SodShortcutTest(unittest.TestCase):
+    def test_parsed_only_when_complete_and_waivers_filtered(self):
+        self.assertIsNone(sod_shortcut({}))
+        self.assertIsNone(sod_shortcut({"sodShortcut": "sandbox-only text"}))
+        self.assertIsNone(sod_shortcut({"sodShortcut": {**SHORTCUT, "jiraAccountId": ""}}))
+        sc = sod_shortcut({"sodShortcut": {**SHORTCUT, "waives": ["creator", "everything"]}})
+        self.assertEqual((sc["label"], sc["waives"]), ("sod-shortcut-owner-approver", frozenset({"creator"})))
+
+    def test_tech_leads_only_through_the_shortcut_join(self):
+        base = {"humans": {"techLeads": ["factory-ryan-lauderback"]}}
+        self.assertEqual(att.tech_leads(base), {})
+        self.assertEqual(att.tech_leads({**base, "sodShortcut": SHORTCUT}), {AUTOMATION: "factory-ryan-lauderback"})
+        self.assertEqual(att.tech_leads({"humans": {"techLeads": ["factory-aman"]}, "sodShortcut": SHORTCUT}), {})
+
+
 class CloudChangelogTest(unittest.TestCase):
     def test_real_cloud_timestamps_parse_in_gate(self):
         log = [{"id": "1", "created": "2026-11-10T12:00:00.000-0800", "author": {"accountId": "x", "accountType": "atlassian"},
                 "items": [{"field": "description", "from": None, "to": None, "fromString": "a", "toString": "b"}]},
-               {"id": "2", "created": "2026-11-10T12:05:00.123-0800", "author": {"accountId": AMAN, "accountType": "atlassian"},
+               {"id": "2", "created": "2026-11-10T12:05:00.123-0800", "author": {"accountId": HUMAN_ID, "accountType": "atlassian"},
                 "items": [{"field": "status", "from": "10070", "to": "10071", "fromString": "Spec Review", "toString": "Approved"}]}]
         self.assertEqual(att.approval_entry(log, "10071")["id"], "2")
         ok, detail = gate.jira_human_approval(POLICY, {"changelog": log, "reporter": AUTOMATION, "creator": AUTOMATION},

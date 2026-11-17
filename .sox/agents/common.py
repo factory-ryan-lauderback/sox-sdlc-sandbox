@@ -18,6 +18,26 @@ JIRA_KEY_RE = re.compile(r"^FRQ-[1-9][0-9]{0,6}$")
 STORY_BRANCH_RE = re.compile(r"^(story|qa-fix)/(FRQ-[1-9][0-9]{0,6})(-[a-z0-9][a-z0-9-]{0,60})?$")
 RELEASE_BRANCH_RE = re.compile(r"^release/([a-z0-9][a-z0-9-]{0,60})$")
 CONTROL_PATHS = (".github/", ".sox/", ".factory/", "tools/", "CODEOWNERS")
+TRUST_POLICY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trust-policy.yaml")
+SOD_WAIVERS = frozenset({"automation-account", "reporter", "creator", "author-pusher"})
+
+
+def trust_policy():
+    return load_json(os.environ.get("SOX_TRUST_POLICY") or TRUST_POLICY)
+
+
+def sod_shortcut(policy=None):
+    """The trust policy's declared owner-approver shortcut, or None.
+
+    {label, githubLogin, jiraAccountId, waives}: one identity that is both the sole human approver and
+    an automation identity. Matching it waives only the listed rules, and every approval it gives is
+    stamped with `label`. Unknown waiver names are dropped, so a typo never widens the waiver."""
+    sc = (policy if policy is not None else trust_policy()).get("sodShortcut")
+    if not isinstance(sc, dict) or not all(isinstance(sc.get(k), str) and sc.get(k)
+                                           for k in ("label", "githubLogin", "jiraAccountId")):
+        return None
+    return {"label": sc["label"], "githubLogin": sc["githubLogin"], "jiraAccountId": sc["jiraAccountId"],
+            "waives": frozenset(w for w in sc.get("waives") or [] if w in SOD_WAIVERS)}
 
 
 def predicate_type(name):

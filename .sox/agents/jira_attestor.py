@@ -29,7 +29,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import jira_adapter as ja  # noqa: E402
-from common import REPO, digest_of, dump_json, jira_key, now_utc, set_output, sha256_hex, subject_lines  # noqa: E402
+from common import (REPO, digest_of, dump_json, jira_key, now_utc, set_output, sha256_hex, sod_shortcut,  # noqa: E402
+                    subject_lines, trust_policy)
 
 CONTENT_FIELDS = ("summary", "description", "Attachment")
 APPROVALS = {"requirement-approval": "10071", "approach-approval": "10082", "emergency-change": "10089"}
@@ -40,10 +41,22 @@ STEP = {"requirement-approval": "SDLC-01", "pm-decomposition": "SDLC-02", "techl
         "approach-approval": "SDLC-03", "release-manifest": "SDLC-04", "emergency-change": "CC-04"}
 OUTCOME = {"requirement-approval": "approved", "approach-approval": "approved", "emergency-change": "approved"}
 HOOK = os.path.join(ROOT, ".sox", "release", "manifest_predicate.py")
-# Jira accountId -> GitHub login of the human Tech Leads (trust policy humans.techLeads). The policy
-# pins Jira approvers by accountId and humans by GitHub login but has no join between the two.
-TECH_LEADS = {"712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd": "factory-aman"}
 MAX_CANDIDATES = 40
+
+
+def tech_leads(policy=None):
+    """Jira accountId -> GitHub login of the human Tech Leads (trust policy humans.techLeads). The only
+    join the policy has between a Jira account and a GitHub login is sodShortcut, so that is the only
+    source; a Tech Lead without it cannot reset LOOP-R from Jira."""
+    pol = policy if policy is not None else trust_policy()
+    sc = sod_shortcut(pol)
+    leads = set((pol.get("humans") or {}).get("techLeads") or [])
+    return {sc["jiraAccountId"]: sc["githubLogin"]} if sc and sc["githubLogin"] in leads else {}
+
+
+def _shortcut_label(account_id):
+    sc = sod_shortcut()
+    return sc["label"] if sc and account_id == sc["jiraAccountId"] else None
 
 
 class Lookup:
@@ -88,7 +101,7 @@ def approval_entry(changelog, status_id):
 
 def human_replan(j, keys, leads=None):
     """Latest transition to Re-plan by a human Tech Lead on any of the issues: (entry, login, key) or None."""
-    leads = TECH_LEADS if leads is None else leads
+    leads = tech_leads() if leads is None else leads
     target, best = ja.STATUS_IDS["Re-plan"], None
     for k in keys:
         for h in j.changelog(k):
@@ -188,6 +201,8 @@ def build_approval(j, kind, key, lk):
               "reporter": reporter, "creator": creator, "changelog": log,
               "approver": approver, "approvedAt": entry["created"], "approvalChangelogId": str(entry["id"]),
               "approverGroups": _groups(j, approver)}
+    if _shortcut_label(approver):
+        fields["sodShortcut"] = _shortcut_label(approver)
     upstream, inputs = [], [{"name": "jira-changelog", "digest": _sha(digest_of(log))},
                             {"name": "jira-content", "digest": _sha(cdig)}]
     keys = [key]
@@ -260,8 +275,11 @@ def build_plan(j, key, lk):
     rp = human_replan(j, [key] + [s["key"] for s in entries])
     if rp and (prev is None or _time(rp[0]["created"]) > (prev.integrated_time or 0)):
         fields["replanApprovedBy"] = rp[1]
+        acct = (rp[0].get("author") or {}).get("accountId")
         fields["replanApproval"] = {"issueKey": rp[2], "changelogId": str(rp[0]["id"]), "at": rp[0]["created"],
-                                    "accountId": (rp[0].get("author") or {}).get("accountId")}
+                                    "accountId": acct}
+        if _shortcut_label(acct):
+            fields["replanApproval"]["sodShortcut"] = _shortcut_label(acct)
     elif prev and prev.predicate.get("dedupeKey") == fields["dedupeKey"]:
         return None, f"unchanged since {prev.digest}"
     upstream = []
