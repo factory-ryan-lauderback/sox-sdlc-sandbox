@@ -31,6 +31,7 @@ jobs:
     uses: ./.github/workflows/sox-jira-read.yml
     secrets:
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      SOX_JIRA_EMAIL: ${{ secrets.SOX_JIRA_EMAIL }}
     with:
       preset: releases
       artifact-name: jira-snapshot-releases
@@ -102,6 +103,7 @@ jobs:
     uses: ./.github/workflows/sox-jira-write.yml
     secrets:
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      SOX_JIRA_EMAIL: ${{ secrets.SOX_JIRA_EMAIL }}
     with:
       role: bundler
       artifact-pattern: jira-ops-bundler
