@@ -191,6 +191,11 @@ def release_for_commit(gh, fetch, sha, svc, policy):
            "emergencyChange": ec and ec.get("digest"), "ecabApprover": ec and ec["predicate"].get("ecabApprover"),
            "jiraKeys": sorted(set((mr or {}).get("predicate", {}).get("jiraKeys") or [])
                               | set((ha or {}).get("predicate", {}).get("jiraKeys") or []) | ({hm.group(1)} if hm else set()))}
+    # Sandbox demo shortcut: the repository owner, whose credentials agent machines also hold, may
+    # approve. Such an approval is asserted, not proven, so the plan labels it for the auditor.
+    owners = {policy.get("owner")} | set((policy.get("humans") or {}).get("platformAdmins") or [])
+    if owners & {rec["humanApprover"], rec["ecabApprover"]} - {None}:
+        rec["sodShortcuts"] = ["sod-shortcut-owner-approver"]
     return rec, problems
 
 

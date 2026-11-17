@@ -311,6 +311,14 @@ class Train(unittest.TestCase):
         self.assertEqual(p["outcome"], "refused")
         self.assertTrue(any("release-approval" in x for x in p["problems"]))
 
+    def test_owner_approver_is_labelled_shortcut(self):
+        p = train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1, policy=self.POLICY)
+        self.assertFalse(any("sodShortcuts" in r for r in p["releases"]))
+        owner = dict(self.POLICY, owner="factory-aman")
+        p = train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1, policy=owner)
+        self.assertEqual(p["outcome"], "planned", p["problems"])
+        self.assertEqual([r.get("sodShortcuts") for r in p["releases"]], [["sod-shortcut-owner-approver"]] * 2)
+
     def test_refuses_unpaired_or_mismatched_check(self):
         self.assertEqual(train.plan(self.standard_gh(), self.fetch_factory(), M3, self.today, M1, policy=self.POLICY)["outcome"], "planned")
 
