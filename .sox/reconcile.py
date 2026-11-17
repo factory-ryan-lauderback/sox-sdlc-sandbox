@@ -123,6 +123,7 @@ def build(policy, api, actions_api, mirror_path, workdir, inventory_file=None, n
 
 def write_report(report, out, repo):
     os.makedirs(out, exist_ok=True)
+    report["observedAt"] = RC.iso(time.time())
     body = json.dumps(report, indent=1, sort_keys=True)
     if len(body.encode()) > MAX_FILE:
         raise SystemExit(f"report is {len(body)} bytes; the evidence store serves files up to 1 MB")
