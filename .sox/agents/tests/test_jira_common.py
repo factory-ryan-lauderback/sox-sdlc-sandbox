@@ -121,6 +121,31 @@ class CloudPagingTest(unittest.TestCase):
         with self.assertRaises(jira_adapter.JiraError):
             c.comment("FRQ-1", "x", "pm")
 
+    def test_cloud_never_performs_human_only_transitions(self):
+        # S-13: the automation token can see these transitions, so the adapter refuses them for any
+        # actor, before any HTTP call, and so does every agent path (apply_ops for each role).
+        for status in ("Approved", "Approach Approved", "ECAB Approved", "Re-plan"):
+            for actor in ("pm", "techlead", "bundler", "svc-dev-agent", "factory-ryan-lauderback", "factory-aman",
+                          jira_adapter.Actor(human="someone")):
+                c, calls = self.cloud([])
+                with self.assertRaises(jira_adapter.JiraError, msg=(status, actor)):
+                    c.transition("FRQ-1", status, actor)
+                self.assertEqual(calls, [], (status, actor))
+            for role in jira_adapter.ROLES:
+                c, calls = self.cloud([])
+                with self.assertRaises(jira_adapter.JiraError, msg=(status, role)):
+                    jira_adapter.apply_ops(c, [{"op": "transition", "key": "FRQ-1", "to": status}], role)
+                self.assertEqual(calls, [], (status, role))
+        # Control: an ordinary agent transition still goes through.
+        c = jira_adapter.CloudJira("https://x.example", "e", "t", agent_accounts=[jira_adapter.AUTOMATION_ACCOUNT])
+        replies = iter([{"accountId": jira_adapter.AUTOMATION_ACCOUNT}, {"fields": {"status": {"name": "Planning"}}},
+                        {"transitions": [{"id": "31", "to": {"id": jira_adapter.STATUS_IDS["Plan Ready"]}}]}, {}])
+        sent = []
+        c._req = lambda method, path, *a, **kw: sent.append((method, path)) or next(replies)
+        c.raw = lambda key: c._req("GET", f"/rest/api/3/issue/{key}")
+        c.transition("FRQ-1", "Plan Ready", "techlead")
+        self.assertEqual(sent[-1], ("POST", "/rest/api/3/issue/FRQ-1/transitions"))
+
     def test_adf_round_trip(self):
         doc = jira_adapter.text_to_adf("line one\nline two\n\npara two")
         self.assertEqual(jira_adapter.adf_to_text(doc).strip(), "line one\nline two\n\npara two")

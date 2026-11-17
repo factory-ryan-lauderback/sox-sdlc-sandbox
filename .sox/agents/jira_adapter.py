@@ -570,6 +570,10 @@ class CloudJira(JiraAdapter):
     def transition(self, key, to_status, actor):
         actor = _as_actor(actor)
         self._check_transition(to_status, actor)
+        # Every Cloud write is made with the automation token, whatever actor the caller names, and
+        # that token can see the approval transitions (S-13). Humans approve only in the Jira UI.
+        if to_status in AGENT_REFUSED:
+            raise JiraError(f"{to_status!r} is a human-only transition; the automation token never performs it")
         self._check_agent_token()
         cur = self.raw(key)["fields"]["status"]["name"]
         if cur == to_status:
