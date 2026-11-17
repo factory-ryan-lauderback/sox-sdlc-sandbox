@@ -17,6 +17,8 @@ SOD_SHORTCUT_LABEL = "sod-shortcut-owner-approver"
 # waivable: the approver must still be listed, pinned by id, atlassian, on the right SHA or status.
 SOD_WAIVABLE = frozenset({"automation-account", "reporter", "creator", "author-pusher",
                           "platform-admin"})
+BYPASS_KEYS = frozenset({"pr", "label", "approvedBy", "approvedAt", "reason"})
+BYPASS_LABEL_RE = re.compile(r"bypass-exception-[1-9][0-9]*")
 
 
 class PolicyError(ValueError):
@@ -105,6 +107,7 @@ class Policy:
         self._validate_humans()
         self._validate_jira()
         self._validate_go_live()
+        self._validate_bypass()
         self._validate_judging()
 
     def _validate_humans(self):
@@ -200,6 +203,43 @@ class Policy:
             raise PolicyError(f"goLive.appKeyExposure.label must be {EXPOSED_NOT_ROTATED!r} while rotated is false")
         if not x["rotated"] and not x.get("decision"):
             raise PolicyError("goLive.appKeyExposure.decision must record who accepted the exposure and when")
+
+    def _validate_bypass(self):
+        """bypassExceptions: merges into main that the owner approved to land under a recorded
+        bypass of main-protection, without gate evidence. Each entry names one PR; only that PR's
+        merge commit, resolved from the Pulls API, is covered. Covered means reported in every
+        reconciliation report as an exception, never counted as evidence."""
+        items = self.data.get("bypassExceptions", [])
+        if not isinstance(items, list):
+            raise PolicyError("bypassExceptions must be a list")
+        self._bypass = {}
+        humans = self.data.get("humans") or {}
+        ids, never = humans.get("ids") or {}, set(humans.get("neverApprovers") or [])
+        anchor = (self.data.get("goLive") or {}).get("anchorPr")
+        prs, labels = set(), set()
+        for i, e in enumerate(items):
+            where = f"bypassExceptions[{i}]"
+            keys = {k for k in e if not k.startswith("$")} if isinstance(e, dict) else None
+            if keys != BYPASS_KEYS:
+                raise PolicyError(f"{where} must have exactly {sorted(BYPASS_KEYS)}")
+            pr = e["pr"]
+            if not isinstance(pr, int) or isinstance(pr, bool) or pr <= 0:
+                raise PolicyError(f"{where}.pr must be a PR number")
+            if pr == anchor:
+                raise PolicyError(f"{where}.pr is goLive.anchorPr; the go-live merge is bootstrap")
+            if not BYPASS_LABEL_RE.fullmatch(str(e["label"])):
+                raise PolicyError(f"{where}.label must match {BYPASS_LABEL_RE.pattern}")
+            if e["approvedBy"] not in ids or e["approvedBy"] in never:
+                raise PolicyError(f"{where}.approvedBy must be a human pinned in humans.ids "
+                                  "and not in neverApprovers")
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(e["approvedAt"])):
+                _epoch(e["approvedAt"], f"{where}.approvedAt")
+            if not isinstance(e["reason"], str) or not e["reason"].strip():
+                raise PolicyError(f"{where}.reason must say why")
+            if pr in prs or e["label"] in labels:
+                raise PolicyError(f"{where} repeats PR {pr} or label {e['label']}")
+            prs.add(pr)
+            labels.add(e["label"])
     def _validate_judging(self):
         for role, j in (self.data.get("judgingWorkflows") or {}).items():
             if role.startswith("$"):
@@ -297,6 +337,31 @@ class Policy:
             return
         g["mainSha"], g["at"] = sha, pr["merged_at"]
         self._go_live_at = _epoch(pr["merged_at"], f"merged_at of PR {n}")
+
+    @property
+    def bypass_exceptions(self):
+        return [dict(e) for e in self.data.get("bypassExceptions") or []]
+
+    def resolve_bypass(self, get):
+        """Each bypassExceptions PR's merge commit into main, read through get(path) -> JSON.
+        An entry whose PR is not (yet) merged into main covers no commit."""
+        self._bypass = {}
+        for e in self.bypass_exceptions:
+            pr = get(f"/repos/{self.repo}/pulls/{e['pr']}") or {}
+            sha = pr.get("merge_commit_sha") or ""
+            if pr.get("number") != e["pr"] or not pr.get("merged_at") \
+                    or (pr.get("base") or {}).get("ref") != "main" \
+                    or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                continue
+            self._bypass[sha] = dict(e, mergeCommitSha=sha, mergedAt=pr["merged_at"])
+
+    def bypass_for(self, sha):
+        """The bypassExceptions entry whose resolved merge commit is sha, or None."""
+        return self._bypass.get(sha)
+
+    def bypass_commits(self):
+        """{pr: resolved merge commit} for each bypassExceptions PR merged into main."""
+        return {e["pr"]: sha for sha, e in self._bypass.items()}
 
     @property
     def go_live_at(self):

@@ -171,6 +171,143 @@ class TestPopulation(unittest.TestCase):
         self.assertIn("history-rewritten", [e["kind"] for e in r["exceptions"]])
 
 
+def bypass_policy(pr=2, go_live="2027-01-01T10:00:00Z", main_sha="0" * 40, **changes):
+    with open(os.path.join(SOX, "trust-policy.yaml")) as fh:
+        d = json.load(fh)
+    d["goLive"].pop("anchorPr", None)
+    d["goLive"].update({"at": go_live, "mainSha": main_sha, "rulesetVersion": 1})
+    d["bypassExceptions"][0].update(pr=pr, **changes)
+    return Policy(json.dumps(d).encode())
+
+
+class TestBypassExceptions(unittest.TestCase):
+    """bypassExceptions: one approved merge under a recorded bypass of main-protection. Only that
+    PR's merge commit is covered, and it is an exception in every report, never evidence."""
+
+    ENTRY = {"pr": 58, "label": "bypass-exception-1", "approvedBy": "factory-ryan-lauderback",
+             "approvedAt": "2026-11-17", "reason": "PM/TL context hidden-files fix; no control-change path yet"}
+
+    def pr(self, number=58, merged=True, base="main", sha="b" * 40):
+        return {"number": number, "merged_at": "2027-01-01T12:00:00Z" if merged else None,
+                "base": {"ref": base}, "merge_commit_sha": sha}
+
+    def test_repo_policy_names_only_pr_58(self):
+        p = load_policy()
+        self.assertEqual(p.bypass_exceptions, [self.ENTRY])
+        self.assertEqual(p.bypass_commits(), {})          # nothing covered until resolved
+
+    def test_resolution(self):
+        p = load_policy()
+        p.resolve_bypass(lambda path: self.pr() if path.endswith("/pulls/58") else None)
+        self.assertEqual(p.bypass_commits(), {58: "b" * 40})
+        self.assertEqual(p.bypass_for("b" * 40)["label"], "bypass-exception-1")
+        self.assertIsNone(p.bypass_for("c" * 40))
+        for bad in (self.pr(merged=False), self.pr(base="release/x"), self.pr(sha=None),
+                    self.pr(number=59), None):
+            p = load_policy()
+            p.resolve_bypass(lambda path, bad=bad: bad)
+            self.assertEqual(p.bypass_commits(), {}, bad)
+
+    def test_loader_rules(self):
+        from soxlib.policy import PolicyError
+        with open(os.path.join(SOX, "trust-policy.yaml")) as fh:
+            base = json.load(fh)
+        mutations = [
+            lambda d: d.update(bypassExceptions={"pr": 58}),
+            lambda d: d["bypassExceptions"][0].update(pr="58"),
+            lambda d: d["bypassExceptions"][0].update(pr=0),
+            lambda d: d["bypassExceptions"][0].update(pr=True),
+            lambda d: d["bypassExceptions"][0].update(pr=45),             # goLive.anchorPr
+            lambda d: d["bypassExceptions"][0].update(label="bypass-1"),
+            lambda d: d["bypassExceptions"][0].update(approvedBy="someone-else"),
+            lambda d: d["bypassExceptions"][0].update(approvedAt="yesterday"),
+            lambda d: d["bypassExceptions"][0].update(approvedAt="2026-11-17T10:00:00"),
+            lambda d: d["bypassExceptions"][0].update(reason=" "),
+            lambda d: d["bypassExceptions"][0].update(commits=["a" * 40]),
+            lambda d: d["bypassExceptions"][0].pop("approvedBy"),
+            lambda d: d["bypassExceptions"].append(dict(d["bypassExceptions"][0], label="bypass-exception-2")),
+            lambda d: d["bypassExceptions"].append(dict(d["bypassExceptions"][0], pr=59)),
+        ]
+        for i, mutate in enumerate(mutations):
+            d = json.loads(json.dumps(base))
+            mutate(d)
+            with self.assertRaises(PolicyError, msg=f"mutation {i}"):
+                Policy(json.dumps(d).encode())
+        d = json.loads(json.dumps(base))
+        d["bypassExceptions"].append(dict(d["bypassExceptions"][0], pr=59, label="bypass-exception-2",
+                                          approvedAt="2026-11-18T10:00:00Z"))
+        self.assertEqual(len(Policy(json.dumps(d).encode()).bypass_exceptions), 2)
+
+    def resolved(self, w, pol, pr=2, sha=None):
+        pol.resolve_bypass(lambda path: dict(self.pr(number=pr, sha=sha or w.merges[pr - 1]),
+                                             merged_at=w.prs[pr - 1]["merged_at"]))
+        return pol
+
+    class Ev:
+        def __init__(self, ok):
+            self.ok, self.reqs = ok, [] if ok else [type("R", (), {"id": "F5.topology", "ok": False})()]
+
+    def test_bypass_merge_is_an_exception_in_every_report(self):
+        w = World()
+        pol = self.resolved(w, bypass_policy(main_sha=w.merges[0]))
+        r = w.rec(pol, evaluate=lambda n, at: self.Ev(False)).report()
+        row = [x for x in r["rows"] if x["sha"] == w.merges[1]][0]
+        self.assertEqual(row["result"], "fail")
+        self.assertEqual(row["bypassException"], dict(self.ENTRY, pr=2))
+        self.assertIn("bypass-exception-1", row["labels"])
+        self.assertEqual([e["kind"] for e in r["exceptions"]],
+                         ["bypass-exception", "merge-record-missing", "gate-reperformance-fail"])
+        for e in r["exceptions"]:
+            self.assertEqual(e["item"], f"commit:{w.merges[1]}")
+            self.assertIn("bypass-exception-1", e["labels"])
+        self.assertIn({"label": "bypass-exception-1", "kind": "known-exception"}, r["knownExceptions"])
+        self.assertEqual(r["bypassExceptions"], [dict(self.ENTRY, pr=2, mergeCommitSha=w.merges[1], onMain=True)])
+        self.assertEqual(r["populations"]["P2"]["bypassMerges"], 1)
+        self.assertEqual(r["outcome"], "exceptions")
+        # The next report, whose period starts after the merge, still carries it.
+        prev = {"id": r["id"], "digest": "sha256:p", "period_end": r["id"], "highWater": r["highWater"]}
+        r2 = w.rec(pol, evaluate=lambda n, at: self.Ev(False), previous=prev).report()
+        self.assertIn("bypass-exception", [e["kind"] for e in r2["exceptions"]])
+
+    def test_never_evidence_even_with_a_merge_record_and_passing_gate(self):
+        w = World()
+        w.atts[w.merges[1]] = [merge_record(w.merges[1])]
+        pol = self.resolved(w, bypass_policy(main_sha=w.merges[0]))
+        r = w.rec(pol, evaluate=lambda n, at: self.Ev(True)).report()
+        row = [x for x in r["rows"] if x["sha"] == w.merges[1]][0]
+        self.assertEqual(row["result"], "fail")
+        self.assertEqual([e["kind"] for e in r["exceptions"]], ["bypass-exception"])
+
+    def test_only_that_merge_commit_is_covered(self):
+        w = World()
+        git(w.path, "commit", "-q", "--allow-empty", "-m", "direct push", date="2027-01-01T13:00:00Z")
+        direct = git(w.path, "rev-parse", "HEAD")
+        pol = self.resolved(w, bypass_policy(main_sha=w.merges[0]))
+        r = w.rec(pol, evaluate=lambda n, at: self.Ev(False)).report()
+        rows = {x["sha"]: x for x in r["rows"]}
+        self.assertNotIn("bypassException", rows[direct])
+        self.assertNotIn("bypass-exception-1", rows[direct]["labels"])
+        self.assertNotIn("bypassException", rows[w.merges[0]])
+        kinds = [e["kind"] for e in r["exceptions"] if e["item"] == f"commit:{direct}"]
+        self.assertEqual(kinds, ["direct-push", "merge-record-missing"])
+        self.assertEqual(r["populations"]["P2"]["bypassMerges"], 1)
+
+    def test_unmerged_entry_covers_nothing(self):
+        w = World()
+        pol = bypass_policy(pr=58, main_sha=w.merges[0])
+        pol.resolve_bypass(lambda path: self.pr(merged=False))
+        r = w.rec(pol).report()
+        self.assertEqual(r["bypassExceptions"], [dict(self.ENTRY, mergeCommitSha=None, onMain=None)])
+        self.assertNotIn("bypass-exception", [e["kind"] for e in r["exceptions"]])
+        self.assertEqual(r["populations"]["P2"]["bypassMerges"], 0)
+
+    def test_bypass_merge_not_on_main_is_an_exception(self):
+        w = World()
+        pol = self.resolved(w, bypass_policy(main_sha=w.merges[0]), sha="c" * 40)
+        r = w.rec(pol).report()
+        self.assertIn("bypass-exception-not-on-main", [e["kind"] for e in r["exceptions"]])
+        self.assertEqual(r["bypassExceptions"][0]["onMain"], False)
+
 class TestGoLiveAnchor(unittest.TestCase):
     """goLive.anchorPr: go-live is the merge of that PR into main, resolved from the Pulls API."""
 

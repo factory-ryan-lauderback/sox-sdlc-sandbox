@@ -80,10 +80,10 @@ class Reconciler:
         gl = self.policy.go_live_at
         return gl is not None and t is not None and t > gl
 
-    def exception(self, control, item, kind, reason):
+    def exception(self, control, item, kind, reason, labels=()):
         eid = f"EXC-{iso(self.now)[:10]}-{len(self.exceptions) + 1:02d}"
         self.exceptions.append({"id": eid, "control": control, "item": item, "kind": kind,
-                                "reason": reason, "labels": list(self.labels)})
+                                "reason": reason, "labels": list(self.labels) + list(labels)})
         return eid
 
     def git(self, *args):
@@ -124,8 +124,17 @@ class Reconciler:
                                f"merge commit {p['merge_commit_sha']} is not on main's first-parent chain")
         p1 = {"count": len(rows), "query": f"git rev-list --first-parent {head}",
               "reachableCommits": len({c for r in rows for c in r["commits"]} | on_chain)}
+        self.bypass = []
+        for e in self.policy.bypass_exceptions:
+            sha = self.policy.bypass_commits().get(e["pr"])
+            self.bypass.append(dict(e, mergeCommitSha=sha, onMain=sha in on_chain if sha else None))
+            if sha and sha not in on_chain:
+                self.exception("SDLC-10", f"pr:{e['pr']}", "bypass-exception-not-on-main",
+                               f"bypass merge {sha} of PR #{e['pr']} is not on main's first-parent chain",
+                               [e["label"]])
         p2 = {"count": len(merged), "mergesOnMain": sum(1 for r in rows if r["pr"] is not None),
-              "mergedNotOnFirstParent": off}
+              "mergedNotOnFirstParent": off,
+              "bypassMerges": sum(1 for r in rows if r.get("bypassException"))}
         return head, rows, p1, p2
 
     def main_row(self, sha, parents, committed_at, pr, bootstrap=True):
@@ -151,6 +160,17 @@ class Reconciler:
                 row["labels"].append(BOOTSTRAP)
             return row
         problems = []
+        bp = self.policy.bypass_for(sha)
+        extra = []
+        if bp is not None:
+            # Reported, never evidence: the row keeps every other exception it earns.
+            row["bypassException"] = {k: bp[k] for k in ("pr", "label", "approvedBy", "approvedAt", "reason")}
+            extra = [bp["label"]]
+            if bp["label"] not in row["labels"]:
+                row["labels"].append(bp["label"])
+            problems.append(("SDLC-10", "bypass-exception",
+                             f"PR #{bp['pr']} merged under a recorded bypass of main-protection, approved "
+                             f"by {bp['approvedBy']} on {bp['approvedAt']}: {bp['reason']}"))
         if pr is None:
             problems.append(("SDLC-10", "direct-push", "no merged PR has this commit as its merge commit"))
         if mr is None:
@@ -168,7 +188,7 @@ class Reconciler:
             if not ev.ok:
                 problems.append(("SDLC-10", "gate-reperformance-fail",
                                  f"independent gate re-run as of merge fails {failed}"))
-        ids = [self.exception(c, f"commit:{sha}", k, why) for c, k, why in problems]
+        ids = [self.exception(c, f"commit:{sha}", k, why, extra) for c, k, why in problems]
         row["result"] = "fail" if ids else "pass"
         row["exception"] = ", ".join(ids) or None
         return row
@@ -298,6 +318,7 @@ class Reconciler:
                                                          "paired", "explained", "unexplainedUnpaired")}},
             "required_steps": REQUIRED_STEPS,
             "rows": rows, "appKeys": keys, "checkRuns": checks, "configDrift": [],
+            "bypassExceptions": self.bypass,
             "exceptions": self.exceptions, "knownExceptions": known,
             "openExceptions": len(self.exceptions),
             "bundleMerkleRoot": merkle_root(self.evidence_digests),
