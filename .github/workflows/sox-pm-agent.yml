@@ -71,6 +71,9 @@ jobs:
           name: pm-context
           path: ${{ runner.temp }}/ctx
           retention-days: 30
+          # The context holds repo/.sox/services.yaml and its digest covers it; upload-artifact
+          # v4 drops dotfiles unless asked, which breaks think's digest check.
+          include-hidden-files: true
 
   think:
     needs: select
