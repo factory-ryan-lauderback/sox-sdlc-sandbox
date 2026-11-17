@@ -612,6 +612,13 @@
       "approvedBy": "factory-ryan-lauderback",
       "approvedAt": "2026-11-17",
       "reason": "check-run ids exceed 9 digits"
+    },
+    {
+      "pr": 62,
+      "label": "bypass-exception-3",
+      "approvedBy": "factory-ryan-lauderback",
+      "approvedAt": "2026-11-17",
+      "reason": "FRQ-13 dry-run contract fixes: manifest story objects, review author id, qa-result subject, unpaired agent runs"
     }
   ],
   "loops": {
