@@ -11,10 +11,27 @@ WORKFLOW_RE = re.compile(r"^\.github/workflows/sox-[a-z0-9-]+\.ya?ml$")
 # unavailable for story PRs, and the certificate would carry a non-main ref.
 SAFE_TRIGGERS = {"workflow_dispatch", "schedule", "repository_dispatch", "check_run",
                  "workflow_run"}
+EXPOSED_NOT_ROTATED = "app-key-exposed-not-rotated"
+SOD_SHORTCUT_LABEL = "sod-shortcut-owner-approver"
+# Separation-of-duties rules an approval by the sodShortcut identity may skip. Nothing else is
+# waivable: the approver must still be listed, pinned by id, atlassian, on the right SHA or status.
+SOD_WAIVABLE = frozenset({"automation-account", "reporter", "creator", "author-pusher",
+                          "platform-admin"})
 
 
 class PolicyError(ValueError):
     pass
+
+
+def _epoch(value, where):
+    import datetime as dt
+    try:
+        t = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        raise PolicyError(f"{where} must be an ISO 8601 timestamp, got {value!r}")
+    if t.tzinfo is None:
+        raise PolicyError(f"{where} must carry a timezone")
+    return t.timestamp()
 
 
 class Policy:
@@ -84,8 +101,11 @@ class Policy:
             if ptype in self.predicate_types:
                 raise PolicyError(f"predicate type {ptype} listed twice")
             self.predicate_types[ptype] = name
+        self._validate_sod_shortcut()
         self._validate_humans()
         self._validate_jira()
+        self._validate_go_live()
+        self._validate_judging()
 
     def _validate_humans(self):
         humans = self.data.get("humans") or {}
@@ -100,18 +120,34 @@ class Policy:
             if hit:
                 raise PolicyError(f"{where} contains neverApprovers login(s) {hit}")
 
+    def _validate_sod_shortcut(self):
+        s = self.data.get("sodShortcut")
+        if s is None:
+            return
+        if not isinstance(s, dict) or s.get("label") != SOD_SHORTCUT_LABEL:
+            raise PolicyError(f"sodShortcut.label must be {SOD_SHORTCUT_LABEL!r}")
+        if not s.get("githubLogin") or self.human_id(s["githubLogin"]) is None:
+            raise PolicyError("sodShortcut.githubLogin must be pinned in humans.ids")
+        if not s.get("jiraAccountId"):
+            raise PolicyError("sodShortcut.jiraAccountId is required")
+        waives = s.get("waives")
+        if not isinstance(waives, list) or not set(waives) <= SOD_WAIVABLE:
+            raise PolicyError(f"sodShortcut.waives must be a subset of {sorted(SOD_WAIVABLE)}")
+
     def _validate_jira(self):
         j = self.data.get("jira") or {}
         never = set(j.get("neverApprovers") or [])
         shared = j.get("sharedAutomationAccount")
-        if shared and shared not in never:
-            raise PolicyError("jira.sharedAutomationAccount must be in jira.neverApprovers")
+        shortcut = shared if self.sod_waives("automation-account", jira_account=shared) else None
+        if shared and shared not in never and shared != shortcut:
+            raise PolicyError("jira.sharedAutomationAccount must be in jira.neverApprovers "
+                              "unless sodShortcut names it and waives automation-account")
         for kind, accounts in (j.get("humanApprovers") or {}).items():
             if kind.startswith("$"):
                 continue
             if not isinstance(accounts, list):
                 raise PolicyError(f"jira.humanApprovers.{kind} must be a list of accountIds")
-            bad = sorted(set(accounts) & (never | {shared}))
+            bad = sorted(set(accounts) & (never | {shared}) - {shortcut})
             if bad:
                 raise PolicyError(f"jira.humanApprovers.{kind} contains automation or "
                                   f"never-approver accounts {bad}")
@@ -120,6 +156,51 @@ class Policy:
                     and not re.fullmatch(r"[0-9]{1,12}", str(status)):
                 raise PolicyError(f"jira.approvalStatuses.{kind} must be a numeric status id or null")
 
+    def _validate_go_live(self):
+        """goLive (evidence spec 7.6, F16). appKeys pins each App's in-scope key by its role in
+        `apps` (appId, public-key fingerprint; never key material) and must cover every App.
+        appKeyExposure records the accepted, unremediated exposure: while rotated is false every
+        in-scope merge-record and reconciliation item carries its label. It relaxes no check."""
+        g = self.data.get("goLive") or {}
+        self._go_live_at = None
+        if g.get("at") is not None:
+            at = _epoch(g.get("at"), "goLive.at")
+            if not re.fullmatch(r"[0-9a-f]{40}", str(g.get("mainSha") or "")):
+                raise PolicyError("goLive.mainSha must be a 40-hex commit SHA once goLive.at is set")
+            if not isinstance(g.get("rulesetVersion"), int) or isinstance(g.get("rulesetVersion"), bool):
+                raise PolicyError("goLive.rulesetVersion must be an integer once goLive.at is set")
+            self._go_live_at = at
+        keys = g.get("appKeys")
+        if not isinstance(keys, dict):
+            raise PolicyError("goLive.appKeys must map every App in apps to its pinned key")
+        apps = {r: a for r, a in (self.data.get("apps") or {}).items()
+                if not r.startswith("$") and isinstance(a, dict)}
+        extra = sorted(k for k in keys if not k.startswith("$") and k not in apps)
+        if extra:
+            raise PolicyError(f"goLive.appKeys names Apps not in apps: {extra}")
+        for role in sorted(apps):
+            e = keys.get(role)
+            if not isinstance(e, dict):
+                raise PolicyError(f"goLive.appKeys.{role} missing: every App needs a pinned key")
+            if e.get("appId") is None or e.get("appId") != apps[role].get("id"):
+                raise PolicyError(f"goLive.appKeys.{role}.appId {e.get('appId')!r} does not match "
+                                  f"apps.{role}.id {apps[role].get('id')!r}")
+            if not re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}=?", str(e.get("keyFingerprint") or "")):
+                raise PolicyError(f"goLive.appKeys.{role}.keyFingerprint must be SHA256:<base64 of 32 bytes>")
+        x = g.get("appKeyExposure")
+        if not isinstance(x, dict) or not isinstance(x.get("rotated"), bool):
+            raise PolicyError("goLive.appKeyExposure.rotated must be true or false")
+        if not x["rotated"] and x.get("label") != EXPOSED_NOT_ROTATED:
+            raise PolicyError(f"goLive.appKeyExposure.label must be {EXPOSED_NOT_ROTATED!r} while rotated is false")
+        if not x["rotated"] and not x.get("decision"):
+            raise PolicyError("goLive.appKeyExposure.decision must record who accepted the exposure and when")
+    def _validate_judging(self):
+        for role, j in (self.data.get("judgingWorkflows") or {}).items():
+            if role.startswith("$"):
+                continue
+            if not isinstance(j, dict) or j.get("workflow") not in self.SIGNER_WORKFLOWS \
+                    or not j.get("job") or not j.get("predicate"):
+                raise PolicyError(f"judgingWorkflows.{role} needs a signer workflow, job and predicate")
     # convenience accessors
     @property
     def repo(self):
@@ -160,6 +241,18 @@ class Policy:
         return ((self.data.get("humans") or {}).get("ids") or {}).get(login)
 
     @property
+    def sod_shortcut(self):
+        return self.data.get("sodShortcut") or {}
+
+    def sod_waives(self, rule, login=None, jira_account=None):
+        """True when the sodShortcut identity (by GitHub login or Jira accountId) may skip rule."""
+        s = self.sod_shortcut
+        if rule not in (s.get("waives") or []):
+            return False
+        return bool((login and login == s.get("githubLogin"))
+                    or (jira_account and jira_account == s.get("jiraAccountId")))
+
+    @property
     def jira(self):
         return self.data.get("jira") or {}
 
@@ -182,3 +275,27 @@ class Policy:
     @property
     def go_live_sha(self):
         return (self.data.get("goLive") or {}).get("mainSha")
+
+    @property
+    def go_live_at(self):
+        """Epoch of goLive.at, or None before go-live (bootstrap)."""
+        return self._go_live_at
+
+    def app_key(self, role):
+        """The role's pinned in-scope key {appId, keyFingerprint}."""
+        return (self.data["goLive"]["appKeys"]).get(role)
+
+    @property
+    def key_labels(self):
+        """Labels every in-scope merge-record and reconciliation item carries (spec 7.6)."""
+        x = self.data["goLive"]["appKeyExposure"]
+        return [] if x["rotated"] else [x["label"]]
+
+    def role_of_login(self, login):
+        for role, a in (self.data.get("apps") or {}).items():
+            if isinstance(a, dict) and login and a.get("botLogin") == login:
+                return role
+        return None
+
+    def judging(self, role):
+        return (self.data.get("judgingWorkflows") or {}).get(role)

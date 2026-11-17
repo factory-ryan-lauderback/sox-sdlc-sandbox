@@ -126,17 +126,21 @@ class TestPolicyLoading(unittest.TestCase):
             self.assertIn("workflow_dispatch", str(cm.exception))
 
     def test_rejects_never_approver_in_any_role_list(self):
+        def never(d, role=None, where=None):
+            d["humans"]["neverApprovers"] = ["factory-aman"]
+            if role:
+                d["humans"][role].append("factory-aman")
+            if where:
+                d.setdefault("regulated", {}).setdefault("domainApprovers", {})["all"] = ["factory-aman"]
         for role in ("releaseApprovers", "controlOwners", "ecab", "techLeads", "developers"):
-            raw = self._mutated(lambda d: d["humans"][role].append("factory-ryan-lauderback"))
+            raw = self._mutated(lambda d: never(d, role=role))
             with self.assertRaises(PolicyError, msg=role) as cm:
                 Policy(raw)
             self.assertIn("neverApprovers", str(cm.exception))
-        raw = self._mutated(lambda d: d.setdefault("regulated", {}).setdefault(
-            "domainApprovers", {}).__setitem__("all", ["factory-ryan-lauderback"]))
         with self.assertRaises(PolicyError):
-            Policy(raw)
-        # platformAdmins legitimately names the owner
-        Policy(self._mutated(lambda d: None))
+            Policy(self._mutated(lambda d: never(d, where=True)))
+        # platformAdmins legitimately names the owner, who is also the approver (sodShortcut)
+        Policy(self._mutated(lambda d: never(d)))
 
     def test_rejects_repo_mismatch(self):
         raw = self._mutated(lambda d: d["predicates"]["qa-result"].__setitem__("repositoryId", 1))

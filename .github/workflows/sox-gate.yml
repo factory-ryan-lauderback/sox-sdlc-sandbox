@@ -26,6 +26,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read
       id-token: write
       attestations: write
     outputs:
@@ -45,6 +46,7 @@ jobs:
       - id: run
         env:
           SOX_GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          SOX_ACTIONS_TOKEN: ${{ github.token }}
           PR: ${{ inputs.pr }}
         run: python3 .sox/gate.py run --pr "$PR" --out "$RUNNER_TEMP/gate"
       - id: gate-decision
@@ -90,6 +92,7 @@ jobs:
       - id: finish
         env:
           SOX_GITHUB_TOKEN: ${{ steps.app.outputs.token }}
+          SOX_ACTIONS_TOKEN: ${{ github.token }}
           GATE_DECISION_URL: ${{ steps.gate-decision.outputs.attestation-url }}
           MERGE_RECORD_BUNDLE: ${{ steps.merge-record.outputs.bundle-path }}
         run: python3 .sox/gate.py finish --out "$RUNNER_TEMP/gate"

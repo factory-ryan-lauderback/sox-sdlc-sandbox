@@ -416,52 +416,72 @@
     }
   },
   "apps": {
-    "$comment": "App IDs filled in when the Platform builder creates the Apps. A null id fails every check that needs it (fail closed).",
+    "$comment": "App IDs from the Platform builder (sandbox-status.md, app-inventory run 44015048531). A null id fails every check that needs it (fail closed).",
     "dev": {
       "slug": "acme-dev-agent",
-      "id": null,
+      "id": 5702161,
       "botLogin": "acme-dev-agent[bot]"
     },
     "qa": {
       "slug": "acme-qa-agent",
-      "id": null,
+      "id": 5702164,
       "botLogin": "acme-qa-agent[bot]"
     },
     "review": {
       "slug": "acme-review-agent",
-      "id": null,
+      "id": 5702162,
       "botLogin": "acme-review-agent[bot]"
     },
     "techlead": {
       "slug": "acme-techlead-agent",
-      "id": null,
+      "id": 5702158,
       "botLogin": "acme-techlead-agent[bot]"
     },
     "bundler": {
       "slug": "acme-release-bundler",
-      "id": null,
+      "id": 5702160,
       "botLogin": "acme-release-bundler[bot]"
     },
     "gate": {
       "slug": "acme-sox-gate",
-      "id": null,
+      "id": 5702165,
       "botLogin": "acme-sox-gate[bot]"
     },
     "reconciler": {
       "slug": "acme-sox-reconciler",
-      "id": null,
+      "id": 5702166,
       "botLogin": "acme-sox-reconciler[bot]"
     },
     "evidenceWriter": {
       "slug": "acme-sox-evidence-writer",
-      "id": null,
+      "id": 5702823,
       "botLogin": "acme-sox-evidence-writer[bot]"
+    },
+    "jiraAttestor": {
+      "slug": "acme-jira-attestor",
+      "id": 5702824,
+      "botLogin": "acme-jira-attestor[bot]"
     }
   },
   "requiredChecks": {
     "sox/review-agent": "review",
     "sox/qa-agent": "qa",
     "sox/evidence-gate": "gate"
+  },
+  "judgingWorkflows": {
+    "$comment": "F17: every run of these workflows whose judging step started on the current head must have attested its predicate from the same run attempt (cert Run Invocation URI), else unattested-judging-run blocks the head. The judging job is '<job> (<pr>)', or '<job>' tied to the PR by a 'pr=<n>' run-name or by a check run on the head whose external_id is the run id; step null means the job itself.",
+    "review": {
+      "workflow": ".github/workflows/sox-review-agent.yml",
+      "job": "review",
+      "step": "Review (droid exec, read-only)",
+      "predicate": "review-verdict"
+    },
+    "qa": {
+      "workflow": ".github/workflows/sox-qa-agent.yml",
+      "job": "test",
+      "step": "Run the plan-required tests",
+      "predicate": "qa-result"
+    }
   },
   "pushers": {
     "story": [
@@ -482,29 +502,26 @@
   "humans": {
     "$comment": "Logins are pinned to numeric user IDs; a renamed or recreated account does not match.",
     "ids": {
-      "factory-aman": 320644755,
       "factory-riya-bhivare": 351550958,
       "factory-ryan-lauderback": 344896283
     },
     "releaseApprovers": [
-      "factory-aman"
+      "factory-ryan-lauderback"
     ],
     "controlOwners": [
-      "factory-aman"
+      "factory-ryan-lauderback"
     ],
-    "sodShortcut": "sandbox-only: Release Approver and Control Owner are the same person (matrix CC-08)",
+    "sodShortcut": "sandbox-only: Release Approver, Control Owner, ECAB and Tech Lead are one person, who is also the repository owner (Platform Admin); see sodShortcut",
     "developers": [
       "factory-riya-bhivare"
     ],
     "ecab": [
-      "factory-aman"
-    ],
-    "techLeads": [
-      "factory-aman"
-    ],
-    "neverApprovers": [
       "factory-ryan-lauderback"
     ],
+    "techLeads": [
+      "factory-ryan-lauderback"
+    ],
+    "neverApprovers": [],
     "platformAdmins": [
       "factory-ryan-lauderback"
     ]
@@ -535,24 +552,22 @@
       "techLeads": "frq-tech-leads",
       "ecab": "frq-ecab"
     },
-    "$commentIdentities": "Every Jira identity is an Atlassian accountId. Sandbox: one shared automation account (the owner's) acts for every agent role; it never counts as an approval and is in neverApprovers. The gate reads a human approval from the attested changelog: the latest transition to approvalStatuses[type] after the last change to contentFields, by an atlassian account listed in humanApprovers[type], never the reporter or creator. Issues the shared account creates need the acting-role property and the comment prefix and are marked jira-shared-identity.",
+    "$commentIdentities": "Every Jira identity is an Atlassian accountId. Sandbox: one shared automation account (the owner's) acts for every agent role. Under sodShortcut the same account is also the only human approver: its approvals count only through the rules sodShortcut.waives and carry sodShortcut.label. The gate reads a human approval from the attested changelog: the latest transition to approvalStatuses[type] after the last change to contentFields, by an atlassian account listed in humanApprovers[type], not in neverApprovers and not the reporter or creator unless sodShortcut waives it. Issues the shared account creates need the acting-role property and the comment prefix and are marked jira-shared-identity.",
     "sharedAutomationAccount": "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457",
-    "neverApprovers": [
-      "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
-    ],
+    "neverApprovers": [],
     "humanApprovers": {
-      "$comment": "factory-aman. Requirement, approach and ECAB transitions are also restricted to this account in Jira (FRQ-9, FRQ-10); domain approvals are enforced here only.",
+      "$comment": "factory-ryan-lauderback (the shared automation account, sodShortcut). Requirement, approach and ECAB transitions are also restricted in Jira (FRQ-9, FRQ-10); domain approvals are enforced here only.",
       "requirementApproval": [
-        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+        "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
       ],
       "approachApproval": [
-        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+        "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
       ],
       "emergencyApproval": [
-        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+        "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
       ],
       "domainApproval": [
-        "712020:ae7e6a76-96e0-4d91-a2ac-857b21c164cd"
+        "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457"
       ]
     },
     "approvalStatuses": {
@@ -569,14 +584,72 @@
     "actingRoleProperty": "sox.actingRole",
     "actingRoleCommentPrefix": "[sox:<role>]"
   },
+  "sodShortcut": {
+    "$comment": "Demo shortcut (decision 2026-11-17): the repository owner is the sole human approver on GitHub and in Jira, where the same account is the shared automation account. An approval by this identity is accepted only for the rules listed in waives; every other rule still applies, and the approval, its gate-decision and merge-record carry label.",
+    "label": "sod-shortcut-owner-approver",
+    "githubLogin": "factory-ryan-lauderback",
+    "jiraAccountId": "712020:049f9e8f-c2c3-47f9-a0d0-bd0578d23457",
+    "waives": [
+      "automation-account",
+      "reporter",
+      "creator",
+      "author-pusher",
+      "platform-admin"
+    ]
+  },
   "loops": {
     "maxReviewRounds": 10,
     "maxQaRounds": 10
   },
   "goLive": {
-    "$comment": "Set at the coordinated go-live. First-parent commits on main up to and including this SHA are labelled bootstrap by the reconciler.",
+    "$comment": "Evidence spec 7.6 (v2.7). at, mainSha and rulesetVersion are set at the coordinated go-live; first-parent commits on main up to and including mainSha are labelled bootstrap by the reconciler. appKeys pins each App's in-scope key by its role in apps (appId and public-key fingerprint only, never key material); the loader refuses a policy that lacks an entry for any App. appKeyExposure records the accepted F16 exposure: while rotated is false every in-scope merge-record (labels[]) and reconciliation item carries the label. It relaxes no check: paired evidence (spec 2.5) and reconciler P8 over every check run since the Apps were created are the compensating controls. Reconciler P5 raises app-key-changed if an environment secret's key no longer matches its pin.",
     "mainSha": null,
-    "at": null
+    "at": null,
+    "rulesetVersion": null,
+    "appKeyExposure": {
+      "window": "key creation .. 2026-11-10T20:52:00Z",
+      "rotated": false,
+      "decision": "human, 2026-11-17",
+      "label": "app-key-exposed-not-rotated"
+    },
+    "appKeys": {
+      "techlead": {
+        "appId": 5702158,
+        "keyFingerprint": "SHA256:K+Wn1dUaMB96SN2xS/eIs9wCv5twKF6xtv2aO3qg+Tg="
+      },
+      "bundler": {
+        "appId": 5702160,
+        "keyFingerprint": "SHA256:QBzi3j+2S7NLqyjmC0XjqSzj4PSZpPQanoZEgYs9K/w="
+      },
+      "dev": {
+        "appId": 5702161,
+        "keyFingerprint": "SHA256:qzK4+DD0QqyQR9aj1Ws8ZQfSvhV3DZymyVFwZbFtpnk="
+      },
+      "review": {
+        "appId": 5702162,
+        "keyFingerprint": "SHA256:G6VL8y2Gp+/CXwNhL6318S+VH2OCeoM1nX6mD0gnHRY="
+      },
+      "qa": {
+        "appId": 5702164,
+        "keyFingerprint": "SHA256:mfCasoTIMuj38RRRgPRPNvLiiLHunIXFt51E5Zt5qP4="
+      },
+      "gate": {
+        "appId": 5702165,
+        "keyFingerprint": "SHA256:EPnB07C6MEwN55cP3JI4bz7wkcDPlA8Lu6jzl2fQXds="
+      },
+      "reconciler": {
+        "appId": 5702166,
+        "keyFingerprint": "SHA256:xO9mFuZc9UqGXiCmRD/0fxvbuBa8kszCeqYq7tFQOJY="
+      },
+      "evidenceWriter": {
+        "appId": 5702823,
+        "keyFingerprint": "SHA256:NXHfOL7KylmvyvyECRRe4nXNTcT5i+NqbLFkhk5EOGA="
+      },
+      "jiraAttestor": {
+        "appId": 5702824,
+        "keyFingerprint": "SHA256:ZIUvzehdfDu+/OY0Q2ZQoW71wCX6nmQw0G2tixAHOQU="
+      }
+    }
   },
   "evidenceStore": {
     "repo": "factory-ryan-lauderback/sox-sdlc-evidence",

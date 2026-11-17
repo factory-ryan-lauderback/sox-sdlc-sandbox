@@ -10,7 +10,7 @@ import re
 import time
 import urllib.parse
 
-from . import jcs
+from . import jcs, pairing
 from .scope import ScopeMap, norm_digest
 from .verify import parse_time
 
@@ -24,6 +24,25 @@ PASSED = {"passed", "pass"}
 STORY_TYPES = ("dev", "qa")
 MAX_COMMITS = 250
 MAX_FILES = 3000
+# A judging run can be queued (concurrency groups) for a while before its judging step starts on
+# the current head; list runs created this long before the head was pushed.
+JUDGING_QUEUE_MARGIN = 6 * 3600
+
+
+def _judging_started(job, step):
+    """Epoch at which the judging step (or the job, if step is None) started, or None if it never
+    ran (queued, skipped)."""
+    node = job
+    if step:
+        node = next((s for s in job.get("steps") or [] if s.get("name") == step), None)
+        if node is None:
+            return None
+    if node.get("status") not in ("in_progress", "completed") or node.get("conclusion") == "skipped":
+        return None
+    try:
+        return parse_time(node.get("started_at"))
+    except (TypeError, ValueError):
+        return None
 
 
 def iso(epoch):
@@ -89,7 +108,12 @@ class Context:
         self._story_results = {}
         self._release_slugs = None
         self.participants = set()
-
+        # The gate's own in-progress check run in this workflow run; gate-decision pairs with it.
+        self.check_run_id = None
+        self._wf_runs = {}
+        self._jobs = {}
+        # Actions API reads (workflow runs, jobs) may use a different read-only token.
+        self.actions_api = api
     def prdata(self, n):
         if n not in self._prs:
             self._prs[n] = PRData(self, n)
@@ -127,6 +151,32 @@ class Context:
                                "refusing a partial list")
         return runs
 
+    def workflow_runs(self, workflow, since):
+        """Runs of one workflow file created at or after `since` (epoch)."""
+        k = (workflow, int(since))
+        if k not in self._wf_runs:
+            name = workflow.rsplit("/", 1)[-1]
+            q = urllib.parse.quote(">=" + iso(max(0, since)), safe="")
+            path = f"/repos/{self.repo}/actions/workflows/{name}/runs?created={q}&per_page=100"
+            try:
+                # The API caps filtered listings at 1000 runs; more fails closed in paginate.
+                runs = self.actions_api.paginate(path, key="workflow_runs", limit=1000)
+            except Exception as e:
+                # A workflow file that is not on main yet has no runs (404). Only trust that 404
+                # once the repository itself is readable with this token.
+                if getattr(e, "status", None) != 404 or not hasattr(self.actions_api, "require_repo"):
+                    raise
+                self.actions_api.require_repo(self.repo)
+                runs = []
+            self._wf_runs[k] = [r for r in runs if (r.get("path") or workflow) == workflow]
+        return self._wf_runs[k]
+
+    def run_jobs(self, run_id):
+        if run_id not in self._jobs:
+            self._jobs[run_id] = self.actions_api.paginate(
+                f"/repos/{self.repo}/actions/runs/{int(run_id)}/jobs?filter=all&per_page=100", key="jobs")
+        return self._jobs[run_id]
+
 
 def _jira_time(s):
     try:
@@ -135,11 +185,12 @@ def _jira_time(s):
         return None
 
 
-def jira_human_approval(policy, pred, kind):
+def jira_human_approval(policy, pred, kind, waived=None):
     """(ok, detail) for a human Jira approval, re-derived from the attested changelog: the latest
     transition into approvalStatuses[kind] after the last change to a content field (a later edit
     reopens the approval), by an atlassian account in humanApprovers[kind] that is not an
-    automation or never-approver account, the reporter, or the creator."""
+    automation or never-approver account, the reporter, or the creator. The sodShortcut account
+    may skip only the rules sodShortcut.waives; the skipped rules are appended to waived."""
     j = policy.jira
     status = (j.get("approvalStatuses") or {}).get(kind)
     allowed = set((j.get("humanApprovers") or {}).get(kind) or [])
@@ -164,17 +215,30 @@ def jira_human_approval(policy, pred, kind):
     h = max(moves, key=lambda h: (_jira_time(h.get("created")), str(h.get("id"))))
     author = h.get("author") or {}
     acct = author.get("accountId")
-    why = []
+    why, skipped = [], []
+
+    def rule(name, broken, reason):
+        if not broken:
+            return
+        if policy.sod_waives(name, jira_account=acct):
+            skipped.append(name)
+        else:
+            why.append(reason)
     if author.get("accountType") != "atlassian":
         why.append(f"author accountType {author.get('accountType')!r} is not atlassian")
-    if acct in set(j.get("neverApprovers") or []) or acct == j.get("sharedAutomationAccount"):
-        why.append("author is an automation identity (jira.neverApprovers)")
+    if acct in set(j.get("neverApprovers") or []):
+        why.append("author is in jira.neverApprovers")
+    rule("automation-account", acct == j.get("sharedAutomationAccount"),
+         "author is the shared automation account")
     if acct not in allowed:
         why.append(f"author is not in jira.humanApprovers.{kind}")
-    if acct in (pred.get("reporter"), pred.get("creator")):
-        why.append("author is the issue's reporter or creator")
+    rule("reporter", acct == pred.get("reporter"), "author is the issue's reporter")
+    rule("creator", acct == pred.get("creator"), "author is the issue's creator")
+    if skipped and not why and waived is not None:
+        waived.extend(skipped)
+    note = f"; waived {skipped} ({policy.sod_shortcut.get('label')})" if skipped and not why else ""
     return not why, (f"changelog entry {h.get('id')} moved to status {status} at {h.get('created')} "
-                     f"by {acct}" + ("; " + "; ".join(why) if why else ""))
+                     f"by {acct}" + ("; " + "; ".join(why) if why else "") + note)
 
 
 def classify(pd, policy):
@@ -252,6 +316,7 @@ class Evaluation:
                      f"{pd.head_ref!r} -> {pd.base_ref!r} is not story/qa-fix -> release/<slug>")
             return self
         self.check_agent_approvals()
+        self.gate_checks()
         if self.kind == "story":
             self.eval_story()
         else:
@@ -346,7 +411,8 @@ class Evaluation:
             self.req(f"SDLC-01.req{t}", "SDLC-01", False,
                      f"missing: requirement-approval {rk} with content digest {rdig}")
         else:
-            a_ok, a_detail = jira_human_approval(pol, ra.predicate, "requirementApproval")
+            a_ok, a_detail = jira_human_approval(pol, ra.predicate, "requirementApproval",
+                                                 self.sod_waived(f"requirement-approval:{rk}"))
             in_order = ra.integrated_time <= pm.integrated_time
             self.req(f"SDLC-01.req{t}", "SDLC-01", a_ok and in_order,
                      f"{rk}: {a_detail}; attested {ra.time_iso}"
@@ -354,7 +420,8 @@ class Evaluation:
         if "risk-high" in (p.get("epicLabels") or []):
             aa = self.get("jira", epic, "approach-approval",
                           where=lambda a: a.predicate.get("planDigest") == p.get("planDigest"))
-            a_ok, a_detail = (jira_human_approval(pol, aa.predicate, "approachApproval") if aa else
+            a_ok, a_detail = (jira_human_approval(pol, aa.predicate, "approachApproval",
+                                                  self.sod_waived(f"approach-approval:{epic}")) if aa else
                               (False, "missing: approach-approval of the current plan digest"))
             self.req(f"SDLC-03b.approach{t}", "SDLC-03", a_ok,
                      f"risk-high epic {epic} needs approach-approval of plan {p.get('planDigest')}: "
@@ -439,10 +506,27 @@ class Evaluation:
                  [a.digest for a in ([latest] if latest else []) + fails])
         return latest
 
+    def _pair_all(self, sha, name, role, runs):
+        """facts.checks[name] entries; returns {check id: attestation or None} for completed success."""
+        pred = pairing.PREDICATE_FOR_CHECK[name]
+        cands = self.all("commit", sha, pred)
+        out, entries = {}, []
+        for c in runs:
+            att = None
+            why = "not a success"
+            if c.get("status") == "completed" and c.get("conclusion") == "success":
+                att, why = pairing.pair(c, sha, cands, self.policy.repo)
+                out[c.get("id")] = att
+            entries.append(dict(pairing.record(c, self.policy.app_id(role), att), headSha=sha,
+                                startedAt=c.get("started_at"), detail=why))
+        self.facts.setdefault("checks", {}).setdefault(name, []).extend(entries)
+        return out
+
     def required_check(self, sha, name, role):
         """Every run of the check by the role's App on this head binds it (F13, BP-41d): a run
         still in progress, cancelled, or failed before its verdict was attested is not cleared by
-        a newer passing run, so re-dispatching the agent cannot re-roll the result."""
+        a newer passing run, so re-dispatching the agent cannot re-roll the result. Every success
+        must pair with a verified attestation from the same workflow run (F16, spec 2.5)."""
         app_id = self.policy.app_id(role)
         slug = self.policy.app(role).get("slug")
         runs = [c for c in self.ctx.check_runs(sha) if c.get("name") == name]
@@ -453,6 +537,7 @@ class Evaluation:
             mine = [c for c in mine if not c.get("started_at")
                     or parse_time(c["started_at"]) <= self.as_of]
         mine.sort(key=lambda c: (c.get("started_at") or "", c.get("id") or 0))
+        post = mine
 
         def state(c):
             done = c.get("completed_at")
@@ -461,14 +546,116 @@ class Evaluation:
             if self.as_of is not None and parse_time(done) > self.as_of:
                 return "not completed at merge"
             return c.get("conclusion")
-        bad = [f"run {c.get('id')}: {state(c)}" for c in mine if state(c) != "success"]
+        bad = [f"run {c.get('id')}: {state(c)}" for c in post if state(c) != "success"]
         others = sorted({(c.get("app") or {}).get("slug") for c in runs} - {slug})
-        ok = bool(mine) and not bad
+        ok = bool(post) and not bad
         self.req(f"CC-02.check:{name}", "CC-02", ok,
-                 (f"{len(mine)} {name} run(s) from {slug} on {sha[:12]}"
+                 (f"{len(post)} {name} run(s) from {slug} on {sha[:12]}"
                   + (f"; not success (every run on the head binds it): {bad}" if bad else
-                     ", all completed success" if mine else ": missing"))
+                     ", all completed success" if post else ": missing"))
                  + (f"; same-named checks from other sources ignored: {others}" if others else ""))
+        paired = self._pair_all(sha, name, role, mine)
+        unpaired = [cid for c in post for cid in [c.get("id")] if cid in paired and paired[cid] is None]
+        if any(cid in paired for cid in (c.get("id") for c in post)):
+            self.req(f"CC-02.check-without-evidence:{name}", "CC-02", not unpaired,
+                     (f"check-without-evidence: {name} success run(s) {unpaired} on {sha[:12]} have no "
+                      "verified attestation from the same workflow run (possible App key misuse)")
+                     if unpaired else f"every {name} success on {sha[:12]} is paired",
+                     [a.digest for a in paired.values() if a is not None])
+
+    def gate_checks(self):
+        """The gate's own sox/evidence-gate runs on this head. Open PR: every success must be paired
+        (an App key cannot sign a gate-decision). As of merge: the last run completed before the
+        merge, which the ruleset relied on, must be a paired success."""
+        pd, name, role = self.pd, "sox/evidence-gate", "gate"
+        app_id = self.policy.app_id(role)
+        if not app_id:
+            self.req(f"CC-02.check:{name}", "CC-02", False, "gate App id not pinned in the trust policy")
+            return
+        runs = [c for c in self.ctx.check_runs(pd.head)
+                if c.get("name") == name and (c.get("app") or {}).get("id") == app_id
+                and c.get("status") == "completed" and c.get("completed_at")]
+        if self.as_of is not None:
+            runs = [c for c in runs if parse_time(c["completed_at"]) <= self.as_of]
+        runs.sort(key=lambda c: (c.get("completed_at") or "", c.get("id") or 0))
+        post = runs
+        self.facts["gateCheckRuns"] = len(runs)
+        paired = self._pair_all(pd.head, name, role, runs)
+        unpaired = [c.get("id") for c in post if c.get("id") in paired and paired[c.get("id")] is None]
+        self.req(f"CC-02.check-without-evidence:{name}", "CC-02", not unpaired,
+                 (f"check-without-evidence: {name} success run(s) {unpaired} on {pd.head[:12]} have no "
+                  "verified gate-decision from the same workflow run (possible Gate App key misuse)")
+                 if unpaired else f"{len(post)} completed {name} run(s) on {pd.head[:12]}; every success paired")
+        if self.as_of is not None:
+            last = post[-1] if post else None
+            ok = last is not None and paired.get(last.get("id")) is not None
+            self.req(f"CC-02.check:{name}", "CC-02", ok,
+                     f"last {name} run before the merge: "
+                     + (f"{last.get('id')} {last.get('conclusion')}, "
+                        f"{'paired' if ok else 'not a paired success'}" if last else "none"))
+
+    def judging_runs(self, pd, role, rid, control):
+        """F17: every run of the role's judging workflow whose judging step started on this head
+        must have attested its predicate from the same run attempt; otherwise the verdict was
+        readable and could be discarded and re-rolled (unattested-judging-run)."""
+        cfg = self.policy.judging(role)
+        if not cfg:
+            self.req(rid, control, False, f"judgingWorkflows.{role} not configured in the trust policy")
+            return
+        since = self.head_pushed_at(pd)
+        runs = self.ctx.workflow_runs(cfg["workflow"], since - JUDGING_QUEUE_MARGIN)
+        job_re = re.compile(re.escape(cfg["job"]) + r" \(([0-9]+)(?:, [^)]*)?\)")
+        # A dispatched single-PR run names neither the PR in its job nor (without run-name) in its
+        # title; its check run on the head carries external_id = run id, which ties it to this head.
+        on_head = {str(c.get("external_id")) for c in self.ctx.check_runs(pd.head)
+                   if str(c.get("external_id") or "").isdigit()}
+        hits, by_head = [], set()
+        for run in runs:
+            if self.as_of is not None and (parse_time(run.get("created_at")) or 0) > self.as_of:
+                continue
+            for job in self.ctx.run_jobs(run["id"]):
+                m = job_re.fullmatch(job.get("name") or "")
+                if m:
+                    mine = int(m.group(1)) == pd.number
+                elif job.get("name") == cfg["job"]:
+                    # Titles are free text (a commit subject can say "pr 12"), so a title alone
+                    # never clears a run that left a check on this head.
+                    t = re.search(r"\bpr[=#: ]?([0-9]+)\b", run.get("display_title") or "", re.I)
+                    mine = bool(t) and int(t.group(1)) == pd.number
+                    if str(run["id"]) in on_head:
+                        mine = True
+                        by_head.add(str(run["id"]))
+                else:
+                    continue
+                if not mine:
+                    continue
+                at = _judging_started(job, cfg.get("step"))
+                if at is None or at < since or (self.as_of is not None and at > self.as_of):
+                    continue
+                hits.append((str(run["id"]), int(job.get("run_attempt") or run.get("run_attempt") or 1), at))
+        attested = {pairing.run_of(a, self.policy.repo) for a in self.all("pr", pd.number, cfg["predicate"])
+                    if a.predicate.get("prNumber") == pd.number}
+        # Head-attributed runs may have judged another PR sharing this head; any attestation of the
+        # predicate from that run attempt shows the verdict was signed.
+        if by_head:
+            attested |= {pairing.run_of(a, self.policy.repo) for a in self.all("commit", pd.head, cfg["predicate"])}
+        missing = sorted({(r, n) for r, n, _ in hits if (r, n) not in attested})
+        self.facts.setdefault("judgingRuns", {})[f"{role}#{pd.number}"] = [
+            {"runId": r, "attempt": n, "judgingStartedAt": iso(t), "attested": (r, n) in attested}
+            for r, n, t in sorted(set(hits))]
+        self.req(rid, control, not missing,
+                 (f"unattested-judging-run: {cfg['workflow']} run(s) {[f'{r}/attempt {n}' for r, n in missing]} "
+                  f"judged PR #{pd.number} at head {pd.head[:12]} without attesting {cfg['predicate']} "
+                  "from the same run; the head is blocked") if missing else
+                 f"{len(hits)} judging run(s) of {cfg['workflow']} on head {pd.head[:12]}, all attested")
+
+    def head_pushed_at(self, pd):
+        """Earliest push that made pd.head the branch tip; PR creation time if none is recorded."""
+        ts = [parse_time(a["timestamp"]) for a in pd.pushes()
+              if a.get("after") == pd.head and a.get("timestamp")]
+        if ts:
+            return min(ts)
+        return parse_time(pd.pr.get("created_at")) if pd.pr.get("created_at") else 0
 
     def loop_review(self, story):
         pol = self.policy
@@ -515,6 +702,7 @@ class Evaluation:
                      else f"dependencies merged: {[m['storyKey'] for m in merges]}")
         self.review_verdict(pd)
         self.required_check(pd.head, "sox/review-agent", "review")
+        self.judging_runs(pd, "review", f"SDLC-06.unattested-judging-run#{pd.number}", "SDLC-06")
         self.loop_review(story)
 
     # ---------- release / emergency PR ----------
@@ -527,7 +715,8 @@ class Evaluation:
             self.facts.update({"emergency": key, "stories": [key]})
             ec = self.get("jira", key, "emergency-change")
             self.use(f"emergency-change:{key}", ec)
-            e_ok, e_detail = (jira_human_approval(pol, ec.predicate, "emergencyApproval") if ec else
+            e_ok, e_detail = (jira_human_approval(pol, ec.predicate, "emergencyApproval",
+                                                  self.sod_waived(f"emergency-change:{key}")) if ec else
                               (False, f"missing: emergency-change for {key}"))
             self.req("CC-04.ecab", "CC-04", e_ok, f"emergency-change {key}: {e_detail}",
                      [ec.digest] if ec else [])
@@ -542,6 +731,8 @@ class Evaluation:
         self.review_verdict(pd)
         self.required_check(pd.head, "sox/review-agent", "review")
         self.required_check(pd.head, "sox/qa-agent", "qa")
+        self.judging_runs(pd, "review", f"SDLC-06.unattested-judging-run#{pd.number}", "SDLC-06")
+        self.judging_runs(pd, "qa", f"SDLC-08.unattested-judging-run#{pd.number}", "SDLC-08")
         env = self.get("commit", pd.head, "env-deploy",
                        where=lambda a: a.predicate.get("headSha") == pd.head
                        and a.predicate.get("environment") == "qa")
@@ -749,6 +940,18 @@ class Evaluation:
         self.req("LOOP-Q", "LOOP-Q", n < mx, f"{n} heads with a verified failing qa-result"
                  + (" (loop-exhausted)" if n >= mx else ""))
 
+    def sod_waived(self, where):
+        """List to collect the rules the sodShortcut identity skipped for one approval. Any entry
+        stamps the shortcut label on this evaluation's gate-decision and merge-record."""
+        return self.facts.setdefault("sodWaived", {}).setdefault(where, [])
+
+    def labels(self):
+        """Known-exception labels this evaluation carries (spec 7.6 key exposure, sodShortcut)."""
+        out = list(self.policy.key_labels)
+        if any((getattr(self, "facts", None) or {}).get("sodWaived", {}).values()):
+            out.append(self.policy.sod_shortcut.get("label"))
+        return out
+
     def participants(self):
         pd = self.pd
         out = set()
@@ -813,7 +1016,9 @@ class Evaluation:
                 latest[(r.get("user") or {}).get("login")] = r
         approvers = set(pol.humans("releaseApprovers"))
         owners = set(pol.humans("controlOwners"))
-        never = set(pol.humans("neverApprovers")) | set(pol.humans("platformAdmins"))
+        never = set(pol.humans("neverApprovers"))
+        admins = set(pol.humans("platformAdmins"))
+        skipped = {}
         participants = self.participants() | ctx.participants
         self.facts["participants"] = sorted(participants)
         base_changes = [parse_time(e.get("created_at")) for e in pd.timeline
@@ -836,8 +1041,13 @@ class Evaluation:
                 why.append("not an authorized approver (login and user id)")
             if login in never:
                 why.append("in neverApprovers")
-            if login in participants:
-                why.append("participated in the change")
+            for rule, broken, reason in (("platform-admin", login in admins, "is a Platform Admin"),
+                                         ("author-pusher", login in participants,
+                                          "participated in the change")):
+                if broken and pol.sod_waives(rule, login=login):
+                    skipped.setdefault(login, []).append(rule)
+                elif broken:
+                    why.append(reason)
             if presented_at is None or sub is None or sub <= presented_at:
                 prior = [a for a in older if sub is not None and a.integrated_time < sub]
                 if prior:
@@ -872,6 +1082,9 @@ class Evaluation:
                   ("" if presented_at else " (packet presented in this evaluation)"))
                  + (f"; outstanding changes requested by {blocking}" if blocking else ""))
         self.facts["approval"] = good[-1] if good else None
+        if good and skipped.get(good[-1]["user"]["login"]):
+            self.sod_waived(f"human-approval:{good[-1]['user']['login']}").extend(
+                skipped[good[-1]["user"]["login"]])
         if self.control_change():
             co = [r for r in good if r["user"]["login"] in owners]
             self.facts["sodShortcut"] = bool(co) and any(r["user"]["login"] in approvers for r in co)
